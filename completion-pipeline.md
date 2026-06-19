@@ -332,7 +332,7 @@ if !multiple_exact_matches && let Some(built) = exact_match {
 
 ### 4.6 配置项对性能的影响
 
-在 [completions.rs#L103-L125](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nushell-protocol/src/config/completions.rs#L103-L125) 中：
+在 [completions.rs#L103-L125](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-protocol/src/config/completions.rs#L103-L125) 中：
 
 | 配置项 | 性能影响 | 默认值 |
 |--------|----------|--------|
@@ -507,6 +507,82 @@ RUST_LOG=nu_cli::completions=debug nu
 | 文件补全通用 | [completion_common.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/completion_common.rs) | ~450 |
 | 作用域数据 | [scope.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-engine/src/scope.rs) | ~600 |
 | 配置定义 | [completions.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-protocol/src/config/completions.rs) | ~150 |
+
+---
+
+## 附录：源码引用复核说明
+
+### 复核日期：2026-06-19
+
+### 复核方法
+1. 使用 `Glob` 工具验证所有引用的文件路径在仓库中存在
+2. 使用 `Grep` 工具验证关键代码段的行号范围
+3. 交叉验证代码逻辑与文档描述的一致性
+
+### 配置模块位置核准
+| 描述 | 文档引用 | 实际路径 | 状态 |
+|------|----------|----------|------|
+| 补全配置定义 | `crates/nu-protocol/src/config/completions.rs` | [completions.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-protocol/src/config/completions.rs) | ✅ 已修正（原文档错误地写为 `nushell-protocol`） |
+| 补全配置行号范围 | L103-L125 | `CompletionConfig` 结构体定义 | ✅ 正确 |
+| `max_results` 字段 | L60, L68 | `ExternalCompleterConfig.max_results | ✅ 正确 |
+| 默认值 100 | L68 | `max_results: 100` | ✅ 正确 |
+
+### 作用域数据引用复核
+
+#### 3.2 变量补全的作用域遍历
+| 文档描述 | 代码位置 | 复核结果 |
+|----------|----------|----------|
+| 内置变量 `$nu`, `$in`, `$env` | [variable_completions.rs#L32-L34](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/variable_completions.rs#L32-L34) | ✅ 正确 |
+| Delta 作用域反向遍历 | [variable_completions.rs#L40-L50](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/variable_completions.rs#L40-L50) | ✅ 正确 |
+| Permanent 作用域遍历 | [variable_completions.rs#L53-L64](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/variable_completions.rs#L53-L64) | ✅ 正确 |
+| `stack.parent_deletions` 检查 | [variable_completions.rs#L43](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/variable_completions.rs#L43) | ✅ 正确 |
+| `stack.deletions` 检查 | [variable_completions.rs#L59](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/variable_completions.rs#L59) | ✅ 正确 |
+
+#### 3.3 命令补全的作用域遍历
+| 文档描述 | 代码位置 | 复核结果 |
+|----------|----------|----------|
+| `traverse_commands` 调用 | [command_completions.rs#L207](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/command_completions.rs#L207) | ✅ 正确 |
+| `traverse_commands` StateWorkingSet 实现 | [state_working_set.rs#L752-L766](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-protocol/src/engine/state_working_set.rs#L752-L766) | ✅ 正确 |
+| Delta 作用域先遍历 | [state_working_set.rs#L753-L763](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-protocol/src/engine/state_working_set.rs#L753-L763) | ✅ 正确 |
+| Permanent 作用域后遍历 | [state_working_set.rs#L765](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-protocol/src/engine/state_working_set.rs#L765) | ✅ 正确 |
+| `is_decl_id_visible` 可见性检查 | [state_working_set.rs#L758](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-protocol/src/engine/state_working_set.rs#L758) | ✅ 正确 |
+| EngineState 实现 | [engine_state.rs#L762-L770](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-protocol/src/engine/engine_state.rs#L762-L770) | ✅ 正确 |
+
+### 性能取舍引用复核
+
+#### 4.1 匹配算法
+| 文档描述 | 代码位置 | 复核结果 |
+|----------|----------|----------|
+| `MatchAlgorithm` 枚举 | [completion_options.rs#L14-L32](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/completion_options.rs#L14-L32) | ✅ 正确 |
+| Prefix/Substring 无 scoring | [completion_options.rs#L80-L91](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/completion_options.rs#L80-L91) | ✅ 正确 |
+| Fuzzy 使用 nucleo_matcher | [completion_options.rs#L93-L119](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/completion_options.rs#L93-L119) | ✅ 正确 |
+| `check_match` 快速路径 | [completion_options.rs#L203-L205](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/completion_options.rs#L203-L205) | ✅ 正确 |
+
+#### 4.2 外部命令补全
+| 文档描述 | 代码位置 | 复核结果 |
+|----------|----------|----------|
+| `max_results` 限制 | [command_completions.rs#L89-L93](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/command_completions.rs#L89-L93) | ✅ 正确 |
+| `check_match` 先于 `is_executable` | [command_completions.rs#L111-L113](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/command_completions.rs#L111-L113) | ✅ 正确 |
+
+#### 4.3 文件系统补全
+| 文档描述 | 代码位置 | 复核结果 |
+|----------|----------|----------|
+| 单精确匹配优化 | [completion_common.rs#L125-L134](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/completion_common.rs#L125-L134) | ✅ 正确 |
+| `enable_exact_match` 参数 | [completion_common.rs#L45](file:///d:/fz/0601-2/solo-dogfeeding/code/63-nushell/crates/nu-cli/src/completions/completion_common.rs#L45) | ✅ 正确 |
+
+### 修正记录
+
+#### 已修正的错误
+1. **配置模块路径错误**：原文档中 `crates/nushell-protocol/src/config/completions.rs` 修正为 `crates/nu-protocol/src/config/completions.rs`
+   - 原因：Nushell 的 protocol crate 名称是 `nu-protocol`，而非 `nushell-protocol`
+
+#### 无需修正但需注意
+1. 所有行号范围均为近似值，实际代码可能因版本更新而略有偏移
+2. 部分代码段描述基于当前仓库版本验证通过
+
+### 复核结论
+
+所有关键代码引用均已验证，除一处路径错误已修正。文档中描述的作用域遍历顺序、性能优化策略、补全优先级等核心逻辑与源码实现完全一致。
 
 ---
 
