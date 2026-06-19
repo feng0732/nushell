@@ -107,25 +107,23 @@ bob
 
 关键步骤：
 
-1. **进入新作用域**：`working_set.enter_scope()`（第 442 行）
+1. **进入新作用域**：`working_set.enter_scope()`（[parse_def.rs#L442](crates/nu-parser/src/parse_def.rs#L442)）
 2. **通过 parse_internal_call 解析 def 调用**：将 def 本身当作内置命令来解析，提取出三个位置参数：
    - 位置 0：命令名（字符串）
    - 位置 1：签名 `[a: int, --flag]`
    - 位置 2：函数体闭包 `{ ... }`
-3. **编译函数体 Block**：
+3. **编译函数体 Block**（[parse_def.rs#L491-L496](crates/nu-parser/src/parse_def.rs#L491-L496)）：
 
 ```rust
-// [parse_def.rs#L491-L496](crates/nu-parser/src/parse_def.rs#L491-L496)
 Some(Expression { expr: Expr::Closure(block_id), .. }) => {
     compile_block_with_id(working_set, *block_id);    // AST → IR
     *working_set.get_block_mut(*block_id).signature = sig.clone();
 }
 ```
 
-4. **将 Block 包装为 Custom Command**：
+4. **将 Block 包装为 Custom Command**（[parse_def.rs#L613-L615](crates/nu-parser/src/parse_def.rs#L613-L615)）：
 
 ```rust
-// [parse_def.rs#L613-L615](crates/nu-parser/src/parse_def.rs#L613-L615)
 *declaration = signature
     .clone()
     .into_block_command(block_id, attribute_vals, examples);
@@ -133,10 +131,9 @@ Some(Expression { expr: Expr::Closure(block_id), .. }) => {
 
 此时生成的 `Command` 实现了 `block_id()` 方法，返回这个闭包 Block 的 ID，调用时通过它找到 Block。
 
-5. **设置 redirect_env**：
+5. **设置 redirect_env**（[parse_def.rs#L619](crates/nu-parser/src/parse_def.rs#L619)）：
 
 ```rust
-// [parse_def.rs#L619](crates/nu-parser/src/parse_def.rs#L619)
 block.redirect_env = has_env;  // def --env 才为 true
 ```
 
@@ -171,10 +168,9 @@ block.redirect_env = has_env;  // def --env 才为 true
 
 #### 2.4.2 自定义命令调用的捕获传播
 
-这是容易被忽略的关键点。当函数体内调用另一个自定义命令时：
+这是容易被忽略的关键点。当函数体内调用另一个自定义命令时，参见 [parse_captures_compile.rs#L229-L280](crates/nu-parser/src/parse_captures_compile.rs#L229-L280)：
 
 ```rust
-// [parse_captures_compile.rs#L229-L280](crates/nu-parser/src/parse_captures_compile.rs#L229-L280)
 Expr::Call(call) => {
     let decl = working_set.get_decl(call.decl_id);
     if let Some(block_id) = decl.block_id() {
@@ -188,10 +184,9 @@ Expr::Call(call) => {
 
 #### 2.4.3 结果写回
 
-分析完成后，将捕获列表写入每个 Block：
+分析完成后，将捕获列表写入每个 Block，参见 [parse_captures_compile.rs#L596-L618](crates/nu-parser/src/parse_captures_compile.rs#L596-L618)：
 
 ```rust
-// [parse_captures_compile.rs#L596-L618](crates/nu-parser/src/parse_captures_compile.rs#L596-L618)
 for (block_id, captures) in seen_blocks.into_iter() {
     if !captures.is_empty()
         && block_captures_empty
@@ -207,8 +202,9 @@ for (block_id, captures) in seen_blocks.into_iter() {
 
 #### 2.4.4 可变变量捕获限制
 
+参见 [parse_captures_compile.rs#L186-L192](crates/nu-parser/src/parse_captures_compile.rs#L186-L192)：
+
 ```rust
-// [parse_captures_compile.rs#L186-L192](crates/nu-parser/src/parse_captures_compile.rs#L186-L192)
 for (var_id, span) in results.iter() {
     if !seen.contains(var_id)
         && let Some(variable) = working_set.get_variable_if_possible(*var_id)
@@ -444,8 +440,9 @@ IR 路径与 AST 路径的主要区别：参数不是通过重新求值表达式
 | [eval.rs:314-322](crates/nu-engine/src/eval.rs#L314-L322) | AST 路径调用前（callee_stack 创建后） |
 | [eval_ir.rs:53-63](crates/nu-engine/src/eval_ir.rs#L53-L63) | IR 路径 eval_ir_block 入口处 |
 
+两处递归深度检查的代码一致，参见 [eval.rs#L314-L322](crates/nu-engine/src/eval.rs#L314-L322)：
+
 ```rust
-// [eval.rs#L314-L322](crates/nu-engine/src/eval.rs#L314-L322)
 let maximum_call_stack_depth: u64 = engine_state.config.recursion_limit as u64;
 callee_stack.recursion_count += 1;
 if callee_stack.recursion_count > maximum_call_stack_depth {
@@ -520,10 +517,9 @@ is_even 4
 
 ### 5.5 捕获分析中对递归 Block 的保护
 
-在捕获写回阶段有一个关键判断：
+在捕获写回阶段有一个关键判断，参见 [parse_captures_compile.rs#L612-L618](crates/nu-parser/src/parse_captures_compile.rs#L612-L618)：
 
 ```rust
-// [parse_captures_compile.rs#L612-L618](crates/nu-parser/src/parse_captures_compile.rs#L612-L618)
 if !captures.is_empty()
     && block_captures_empty
     && block_id.get() >= working_set.permanent_state.num_blocks()  // 只修改本次 delta 中的 Block
