@@ -477,7 +477,126 @@ StreamManager (InterfaceManager 持有)
 
 ---
 
-## 6. 边界速查表：什么归哪层管？
+## 6. 自定义值释放通知：包装析构、引用计数与 Dropped 消息
+
+这是最容易误解的路径：**Dropped 通知与 PluginCall 状态释放无关**，它由 `PluginCustomValueWithSource` 的 Drop 析构触发，结合 `SharedCow` 的引用计数和 `notify_on_drop` 标记共同决定。
+
+### 6.1 四层包装结构
+
+```
+PluginCustomValueWithSource  (引擎侧，实现 Drop trait)
+  ├─ inner: PluginCustomValue  (可跨边界序列化，不含 source)
+  │   └─ SharedCow<SharedContent>  (Arc 引用计数 + Clone-on-write)
+  │       ├─ name: String
+  │       ├─ data: Vec<u8>  (bincode 序列化后的实际自定义值)
+  │       └─ notify_on_drop: bool  (来自 CustomValue::notify_plugin_on_drop())
+  └─ source: Arc<PluginSource>  (指向哪个插件，不跨边界)
+```
+
+关键代码位置：
+- `PluginCustomValue` 定义：`crates/nu-plugin-protocol/src/plugin_custom_value/mod.rs` 第 11-41 行
+- `PluginCustomValueWithSource` 定义：`crates/nu-plugin-engine/src/plugin_custom_value_with_source/mod.rs` 第 16-25 行
+- `SharedCow` 实现：`crates/nu-utils/src/shared_cow.rs` 第 4-44 行
+
+### 6.2 标记的来源：notify_plugin_on_drop()
+
+`notify_on_drop` 标记在**插件侧**序列化时确定，来自 `CustomValue` trait 的方法：
+
+```rust
+// 插件侧代码
+pub trait CustomValue {
+    /// True if the plugin should be notified when this value is dropped by the engine.
+    fn notify_plugin_on_drop(&self) -> bool { false }  // 默认 false
+}
+```
+
+序列化时被捕获：
+```rust
+// PluginCustomValue::serialize_from_custom_value()
+pub fn serialize_from_custom_value(custom_value: &dyn CustomValue, span: Span) -> Result<PluginCustomValue, ShellError> {
+    let notify_on_drop = custom_value.notify_plugin_on_drop();
+    // ... rmp_serde::to_vec(custom_value) ...
+    Ok(PluginCustomValue::new(name, data, notify_on_drop))
+}
+```
+
+序列化优化：`notify_on_drop` 字段加了 `#[serde(default, skip_serializing_if = "is_false")]`，**为 false 时不序列化**，节省带宽。
+
+### 6.3 引用计数：SharedCow<Arc<T>>
+
+`SharedCow` 内部就是 `Arc<T>`，引用计数由 `Arc::strong_count()` 提供：
+
+```rust
+pub fn ref_count(value: &SharedCow<T>) -> usize {
+    Arc::strong_count(&value.0)
+}
+```
+
+每当 `PluginCustomValue` 被 `clone()`，引用计数 +1。每当一个克隆被 drop，引用计数 -1。
+
+### 6.4 Drop 析构的触发条件（三者同时满足）
+
+**唯一触发点**是 `PluginCustomValueWithSource::drop()`，位于 `crates/nu-plugin-engine/src/plugin_custom_value_with_source/mod.rs` 第 277-292 行：
+
+```rust
+impl Drop for PluginCustomValueWithSource {
+    fn drop(&mut self) {
+        // 条件 1: notify_on_drop == true （插件在序列化时设置）
+        // 条件 2: ref_count() == 1 （这是最后一个持有 SharedContent 的对象）
+        if self.notify_on_drop() && self.inner.ref_count() == 1 {
+            // 条件 3: 能成功获取到 PluginInterface（插件进程还活着）
+            self.get_plugin(None, "drop")
+                .and_then(|plugin| plugin.custom_value_dropped(self.inner.clone()))
+                .unwrap_or_else(|err| {
+                    log::warn!("Failed to notify drop of custom value ({name}): {err}")
+                });
+        }
+    }
+}
+```
+
+> **关键纠正**：这与 `PluginCallState` 的释放**完全无关**。即使 PluginCall 早已完成，只要自定义值还在引擎中被传递、被克隆、被使用，ref_count > 1，就不会触发 Dropped 通知。
+
+### 6.5 Dropped 消息的完整链路
+
+```
+插件侧 (创建自定义值)                          引擎侧 (持有并使用)                         插件侧 (收到通知)
+  │                                              │                                             │
+  │ 1. CustomValue::notify_plugin_on_drop()=true  │                                             │
+  │    serialize_from_custom_value()              │                                             │
+  │    → PluginCustomValue { notify_on_drop: true }│                                             │
+  │                                              │                                             │
+  │ ── PluginOutput::Data/CallResponse ─────────► │ 2. 接收后 add_source()                     │
+  │                                              │    → PluginCustomValueWithSource            │
+  │                                              │      ref_count = 1                          │
+  │                                              │                                             │
+  │                                              │ 3. clone() → 传入 pipeline → 存入变量       │
+  │                                              │    ref_count = 2, 3, ... N                  │
+  │                                              │                                             │
+  │                                              │ 4. 各种 drop()，逐个 ref_count--           │
+  │                                              │                                             │
+  │                                              │ 5. 最后一个 WithSource drop()               │
+  │                                              │    ref_count() == 1                        │
+  │                                              │    notify_on_drop() == true                │
+  │                                              │    → PluginInterface::custom_value_dropped()│
+  │                                              │      PluginCall::CustomValueOp(Dropped) ────│──►
+  │                                              │                                             │ 6. 接收并调用
+  │                                              │                                             │    Plugin::custom_value_dropped()
+```
+
+### 6.6 Dropped 消息的特殊性
+
+`CustomValueOp::Dropped` 与其他 CustomValueOp 有三个关键不同：
+
+1. **无响应预期**：`dont_send_response = true`，不创建响应订阅，fire-and-forget
+2. **无 span**：使用 `Span::unknown()`，因为 Drop 中无上下文
+3. **发送方不阻塞**：`drop(self.write_plugin_call(...))`，忽略 JoinHandle
+
+见 `crates/nu-plugin-engine/src/interface/mod.rs` 第 752-763 行、1142-1154 行。
+
+---
+
+## 7. 边界速查表：什么归哪层管？
 
 | 问题 | 归哪层 | 关键代码位置 |
 |---|---|---|
@@ -487,11 +606,11 @@ StreamManager (InterfaceManager 持有)
 | "插件死掉了调用者会卡吗？" | 异常隔离（读线程屏障） | `PluginInterfaceManager::consume_all` |
 | "什么时候会自动关掉空闲插件？" | 生命周期（GC） | `PluginGcState::next_timeout` |
 | "一条流发太快会 OOM 吗？" | 流复用层（背压） | `StreamWriterSignal HIGH_PRESSURE` |
-| "PluginCustomValue 什么时候通知 Dropped？" | 生命周期 + 协议帧边界 | `PluginCallState::drop` + `CustomValueOp::Dropped` |
+| "PluginCustomValue 什么时候通知 Dropped？" | 生命周期 + 协议帧边界 | `PluginCustomValueWithSource::drop` + `SharedCow::ref_count() == 1` + `notify_on_drop == true` |
 
 ---
 
-## 7. 完整调用时序（Run 一个带流的命令）
+## 8. 完整调用时序（Run 一个带流的命令）
 
 ```
 引擎线程 A (调用 .run())                读线程 (reader loop)             插件子进程
@@ -536,4 +655,6 @@ StreamManager (InterfaceManager 持有)
 
 ---
 
-**总结**：协议帧 = "说什么"（枚举 + Serde），序列化 = "怎么把话编成字节"（Encoder），I/O层 = "字节从哪走"（Stdio/Socket），生命周期 = "谁启动/停止/出错时怎么办"（PersistentPlugin + GC + 读线程屏障）。四层通过清晰的 trait 边界（Encoder / PluginRead / PluginWrite / InterfaceManager / Interface）解耦，任何一层的改变不影响其他层。
+## 9. 总结
+
+**协议帧** = "说什么"（枚举 + Serde），**序列化** = "怎么把话编成字节"（Encoder），**I/O层** = "字节从哪走"（Stdio/Socket），**生命周期** = "谁启动/停止/出错时怎么办"（PersistentPlugin + GC + 读线程屏障）。四层通过清晰的 trait 边界（Encoder / PluginRead / PluginWrite / InterfaceManager / Interface）解耦，任何一层的改变不影响其他层。
