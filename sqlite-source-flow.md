@@ -5,11 +5,11 @@
 ## 目录
 
 - [整体架构](#整体架构)
-- [连接建立与管理](#连接建立与管理)
+- [三种连接方式详解](#三种连接方式详解)
 - [查询执行流程](#查询执行流程)
-- [参数绑定机制](#参数绑定机制)
+- [参数绑定机制与限制](#参数绑定机制与限制)
 - [结果映射：SQLite → Nu Value](#结果映射sqlite--nu-value)
-- [大结果集处理](#大结果集处理)
+- [大结果集处理与限制](#大结果集处理与限制)
 - [懒查询构建器与 SQL 下推优化](#懒查询构建器与-sql-下推优化)
 - [数据流全景图](#数据流全景图)
 
@@ -21,11 +21,11 @@ SQLite 功能主要位于 `crates/nu-command/src/database/` 目录下，基于 `
 
 | 组件 | 文件 | 职责 |
 |------|------|------|
-| `SQLiteDatabase` | [sqlite.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L27-L36) | 数据库自定义值，封装路径与信号 |
-| `SQLiteQueryBuilder` | [sqlite.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L809-L821) | 懒查询构建器，支持 SQL 下推优化 |
-| `query db` 命令 | [query_db.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/commands/query_db.rs) | 执行任意 SQL 查询 |
-| `into sqlite` 命令 | [into_sqlite.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/commands/into_sqlite.rs) | 将 Nu 数据写入 SQLite |
-| `schema` 命令 | [schema.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/commands/schema.rs) | 查看数据库结构 |
+| `SQLiteDatabase` | `database/values/sqlite.rs` | 数据库自定义值，封装路径与信号 |
+| `SQLiteQueryBuilder` | `database/values/sqlite.rs` | 懒查询构建器，支持 SQL 下推优化 |
+| `query db` 命令 | `database/commands/query_db.rs` | 执行任意 SQL 查询 |
+| `into sqlite` 命令 | `database/commands/into_sqlite.rs` | 将 Nu 数据写入 SQLite |
+| `schema` 命令 | `database/commands/schema.rs` | 查看数据库结构 |
 
 ### 入口点
 
@@ -35,69 +35,151 @@ SQLite 功能主要位于 `crates/nu-command/src/database/` 目录下，基于 `
 
 ---
 
-## 连接建立与管理
+## 三种连接方式详解
 
-### 连接创建函数
+代码中存在三种创建 SQLite 连接的路径，它们在 **rusqlite 调用方式**、**busy handler 设置**、**错误报告风格** 和 **使用场景** 上都有明显差异。理解这些差异是读懂连接重试逻辑的关键。
 
-连接通过多个层次的函数创建，形成清晰的调用链：
+### 方式 1：`open_sqlite_db` — 通用文件查询连接
+
+**定义位置**：`database/values/sqlite.rs` `open_sqlite_db` 函数
+
+**调用者**：
+- `SQLiteDatabase::query()` — `query db` 命令的核心
+- `SQLiteQueryBuilder::execute()` — 懒查询最终执行
+- `SQLiteQueryBuilder::count()` — 懒查询计数
+- `into_sqlite::Table::new()` — 写入数据库
+
+**逻辑流程**：
 
 ```
-open_sqlite_db(path, span)
-    └─→ Connection::open(path) 或 open_connection_in_memory_custom()
-        └─→ 设置 busy_handler (sleeper)
+open_sqlite_db(path, call_span)
+  │
+  ├─ path == MEMORY_DB ?
+  │     YES → open_connection_in_memory_custom()
+  │             (共享内存连接 + busy_handler)
+  │
+  │     NO  → Connection::open(path)
+  │             (普通文件连接, 无 busy_handler!)
+  │
+  └─ 错误: ShellError::Generic (附带用户可见的 call_span)
 ```
 
-### 关键函数
+**关键特征**：
+- 文件数据库**不设置 busy_handler**，遇到 SQLITE_BUSY 直接返回错误
+- 内存数据库会委托给 `open_connection_in_memory_custom()`，自动获得 busy_handler
+- 错误使用 `GenericError::new` 附带用户调用位置 span，便于报错定位
 
-#### `open_sqlite_db` — 通用入口
+### 方式 2：`open_connection_in_memory_custom` — 共享内存连接
 
-[sqlite.rs:410-423](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L410-L423)
+**定义位置**：`database/values/sqlite.rs` `open_connection_in_memory_custom` 函数
 
-```rust
-pub fn open_sqlite_db(path: &Path, call_span: Span) -> Result<Connection, ShellError>
+**调用者**：
+- `open_sqlite_db` 当路径为 MEMORY_DB 时
+- `SQLiteDatabase::open_connection` 当路径为 MEMORY_DB 时
+
+**逻辑流程**：
+
+```
+open_connection_in_memory_custom()
+  │
+  ├─ Connection::open_with_flags(MEMORY_DB, OpenFlags::default())
+  │     URI: "file:memdb1?mode=memory&cache=shared"
+  │
+  ├─ conn.busy_handler(Some(SQLiteDatabase::sleeper))
+  │     设置重试处理器
+  │
+  └─ 错误: ShellError::Generic (使用 Span::test_data(), 非用户调用位置)
 ```
 
-**逻辑**：
-- 内存数据库（`MEMORY_DB`）→ 调用 `open_connection_in_memory_custom()`
-- 文件数据库 → `Connection::open(path)`
-- 错误转换为 `ShellError::Generic` 附带调用 span
+**关键特征**：
+- 使用 `open_with_flags` + 共享缓存 URI，不是 `Connection::open_in_memory()`
+- **始终设置 busy_handler**，因为共享内存数据库可能被多个连接并发访问
+- 错误 span 使用 `Span::test_data()`，是一个固定测试 span，不反映用户调用位置
 
-#### `open_connection_in_memory_custom` — 带标志的内存连接
+### 方式 3：`SQLiteDatabase::open_connection` — 实例级连接
 
-[sqlite.rs:776-794](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L776-L794)
+**定义位置**：`database/values/sqlite.rs` `SQLiteDatabase::open_connection` 方法
 
-- 使用 `OpenFlags::default()` 打开共享内存数据库
-- URI: `file:memdb1?mode=memory&cache=shared`
-- 设置 `busy_handler` 处理并发
+**调用者**：
+- `schema` 命令 — 查看数据库结构
+- `stor` 操作 — 内存数据库的 CRUD
+- 备份/恢复操作
 
-#### `SQLiteDatabase::open_connection` — 实例方法
+**逻辑流程**：
 
-[sqlite.rs:112-131](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L112-L131)
+```
+self.open_connection()
+  │
+  ├─ path == MEMORY_DB ?
+  │     YES → open_connection_in_memory_custom()
+  │             (委托给方式 2)
+  │
+  │     NO  → Connection::open(&self.path)
+  │           + conn.busy_handler(Some(SQLiteDatabase::sleeper))
+  │           (文件连接 + busy_handler!)
+  │
+  └─ 错误: GenericError::new_internal (内部错误, 不含用户 span)
+```
 
-实例级连接方法，与 `open_sqlite_db` 类似但属于实例方法。
+**关键特征**：
+- 文件数据库**也设置 busy_handler**（与方式 1 的关键区别！）
+- 错误使用 `GenericError::new_internal`，标记为内部错误而非用户错误
+- 适用于需要持连接做多次操作的场景（schema 查询需要多次 prepare）
 
-### 并发处理：Busy Handler
+### 三种方式对比总表
 
-[sqlite.rs:133-137](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L133-L137)
+| 特性 | `open_sqlite_db` | `open_connection_in_memory_custom` | `open_connection` |
+|------|------------------|-----------------------------------|-------------------|
+| **文件连接** | `Connection::open` | — | `Connection::open` |
+| **内存连接** | 委托 → 方式2 | `open_with_flags` + 共享URI | 委托 → 方式2 |
+| **busy_handler** | ❌ 文件连接不设置 | ✅ 始终设置 | ✅ 始终设置 |
+| **错误风格** | 用户可见 span | `Span::test_data()` | `new_internal` |
+| **典型场景** | 一次性查询 | 共享内存数据库 | 持连接多操作 |
+| **SQLITE_BUSY 行为** | 直接报错 | 250ms 重试，无限 | 250ms 重试，无限 |
+
+### Busy Handler 详解
+
+`SQLiteDatabase::sleeper` 是连接重试的核心，仅在被设置了 busy_handler 的连接上生效：
 
 ```rust
 fn sleeper(attempts: i32) -> bool {
     log::warn!("SQLITE_BUSY, retrying after 250ms (attempt {attempts})");
     std::thread::sleep(std::time::Duration::from_millis(250));
-    true
+    true  // true = 继续重试; false = 停止重试并返回 SQLITE_BUSY 错误
 }
 ```
 
-**设计特点**：
-- 遇到 `SQLITE_BUSY` 时，每 250ms 重试一次
-- 无限重试（返回 `true` 表示继续等待）
-- 通过警告日志提示用户
+**工作原理**：
+- 当 SQLite 返回 `SQLITE_BUSY` 时，rusqlite 不会立即抛错，而是调用注册的 busy_handler
+- `sleeper` 每次等待 250ms 后返回 `true`，表示"请继续重试"
+- 由于始终返回 `true`，这构成**无限重试**，直到获取锁为止
+- `attempts` 参数由 rusqlite 递增传入，目前代码中仅用于日志，未做上限判断
+
+**哪些场景会触发**：
+- 方式 1（`open_sqlite_db`）打开文件数据库 → **不设置** → 遇 BUSY 直接报错
+- 方式 2（内存连接）→ **设置** → 遇 BUSY 自动重试
+- 方式 3（`open_connection`）→ **设置** → 遇 BUSY 自动重试
+
+**潜在问题**：方式 1 中 `query db` 对文件数据库不设 busy_handler。如果文件被其他进程锁定，查询会立即失败而非等待重试。而 `schema` 命令（使用方式 3）则能自动重试。
+
+### 第四种变体：`open_connection_in_memory` — 私有内存连接
+
+```rust
+pub fn open_connection_in_memory() -> Result<Connection, ShellError> {
+    Connection::open_in_memory().map_err(...)
+}
+```
+
+- 使用 `Connection::open_in_memory()`，创建**非共享**的私有内存数据库
+- **不设置 busy_handler**
+- **仅在单元测试中使用**
+- 与 `open_connection_in_memory_custom` 的区别：后者用共享 URI 可跨连接访问同一内存库
 
 ### 连接生命周期
 
 **重要设计决策**：`SQLiteDatabase` **不存储连接对象**，只存储路径。每次查询都新建连接。
 
-[sqlite.rs:28-30](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L28-L30) 注释说明了原因：
+源码注释（`SQLiteDatabase` 结构体定义处）说明了原因：
 1. YAGNI 原则
 2. 连接克隆语义不明确
 3. 状态管理复杂
@@ -131,7 +213,7 @@ query db 命令
   └─ SQLiteDatabase::query(sql, params, call_span)
        │
        ├─ open_sqlite_db(&self.path, call_span)
-       │    └─ 创建 rusqlite::Connection
+       │    └─ 创建 rusqlite::Connection (方式1, 无 busy_handler)
        │
        └─ run_sql_query(conn, sql, params, signals, None)
             │
@@ -151,7 +233,7 @@ query db 命令
 
 #### `run_sql_query` — 执行 SQL 查询
 
-[sqlite.rs:425-434](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L425-L434)
+**定义位置**：`database/values/sqlite.rs` `run_sql_query` 函数
 
 ```rust
 fn run_sql_query(
@@ -164,7 +246,7 @@ fn run_sql_query(
 ```
 
 **参数**：
-- `conn`: 已打开的数据库连接
+- `conn`: 已打开的数据库连接（所有权转移，查询后连接被消耗）
 - `sql`: 带 span 信息的 SQL 语句
 - `params`: 查询参数（位置或命名）
 - `signals`: 取消信号
@@ -172,7 +254,7 @@ fn run_sql_query(
 
 #### `prepared_statement_to_nu_list` — 语句结果转 Nu 列表
 
-[sqlite.rs:595-663](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L595-L663)
+**定义位置**：`database/values/sqlite.rs` `prepared_statement_to_nu_list` 函数
 
 这是结果处理的核心函数，步骤如下：
 
@@ -183,16 +265,16 @@ fn run_sql_query(
 
 ---
 
-## 参数绑定机制
+## 参数绑定机制与限制
 
 ### 参数类型枚举
 
-[sqlite.rs:480-489](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L480-L489)
+**定义位置**：`database/values/sqlite.rs` `NuSqlParams` 枚举
 
 ```rust
 pub enum NuSqlParams {
-    List(Vec<Box<dyn ToSql>>),      // 位置参数
-    Named(Vec<(String, Box<dyn ToSql>)>),  // 命名参数
+    List(Vec<Box<dyn ToSql>>),              // 位置参数
+    Named(Vec<(String, Box<dyn ToSql>)>),   // 命名参数
 }
 ```
 
@@ -200,7 +282,7 @@ pub enum NuSqlParams {
 
 #### `nu_value_to_params` — 入口函数
 
-[sqlite.rs:491-532](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L491-L532)
+**定义位置**：`database/values/sqlite.rs` `nu_value_to_params` 函数
 
 根据输入值类型分派：
 
@@ -215,7 +297,7 @@ pub enum NuSqlParams {
 
 #### `value_to_sql` — 单值转换
 
-[sqlite.rs:437-467](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L437-L467)
+**定义位置**：`database/values/sqlite.rs` `value_to_sql` 函数
 
 Nu 值类型到 SQLite 参数的映射：
 
@@ -234,7 +316,7 @@ Nu 值类型到 SQLite 参数的映射：
 
 ### 参数绑定执行
 
-[sqlite.rs:628-660](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L628-L660)
+**定义位置**：`database/values/sqlite.rs` `prepared_statement_to_nu_list` 函数
 
 **位置参数**：
 ```rust
@@ -254,13 +336,58 @@ stmt.query_map(refs.as_slice(), |row| { ... })
 - 两种参数风格需要分开调用 `query_map`，因为 rusqlite 对位置和命名参数使用不同的引用类型
 - 行处理逻辑通过 `collect_row_values` 函数共享
 
+### 参数绑定限制
+
+#### 1. 懒查询构建器不传递参数
+
+`SQLiteQueryBuilder::execute()` 中存在已知问题：
+
+```rust
+let params = NuSqlParams::List(Vec::new()); // FIXME: handle params properly
+```
+
+虽然 `SQLiteQueryBuilder` 有 `sql_params` 字段和 `with_where` 方法可以设置 WHERE 参数，但 `execute()` 始终传入空参数列表。这意味着：
+
+- 通过懒查询路径执行的查询**无法正确绑定 WHERE 参数**
+- `count()` 方法使用 `sql_params` 但将所有参数转为 `String` 类型（丢失原始类型信息）
+- 懒查询的 WHERE 子句如果含占位符 `?`，运行时将因参数数量不匹配而报错
+
+#### 2. count() 参数类型丢失
+
+```rust
+let params: Vec<Box<dyn ToSql>> = self
+    .sql_params
+    .iter()
+    .map(|s| Box::new(s.clone()) as Box<dyn ToSql>)
+    .collect();
+```
+
+`sql_params` 是 `Vec<String>`，所有参数都被当作文本字符串传入，整数/浮点数等类型信息丢失。SQLite 的类型亲和性机制通常能缓解此问题，但在严格类型比较场景下可能产生意外结果（如 `WHERE id = ?` 传入字符串 `"1"` 与整数 `1` 的比较行为不同）。
+
+#### 3. 命名参数前缀策略单一
+
+`nu_value_to_params` 自动补 `:` 前缀，但 SQLite 原生支持三种命名参数前缀：
+- `:name` — 冒号前缀（Nu 默认使用）
+- `@name` — at 前缀
+- `$name` — 美元前缀
+
+Nu 只在不以这三种字符开头时自动补 `:`，但如果用户 SQL 中使用 `@` 或 `$` 前缀参数，需要手动在 Record key 中写明前缀，否则参数名不匹配。
+
+#### 4. 复杂类型的 JSON 序列化回读依赖列声明
+
+`value_to_sql` 将 List/Record 序列化为 JSON 字符串存储。但读回时，`convert_sqlite_value_to_nu_value` 只有在列声明类型为 `JSON` 或 `JSONB` 时才会自动反序列化。如果列声明为 `TEXT`，读回的将是原始 JSON 字符串而非 Nu 结构化值。
+
+#### 5. --params 的编译期类型检查缺失
+
+`query db` 命令的 `--params` 参数使用 `SyntaxShape::Any`，在解析阶段不检查参数是否为 Record 或 List，错误延迟到运行时才报告。
+
 ---
 
 ## 结果映射：SQLite → Nu Value
 
 ### 行转换：`convert_sqlite_row_to_nu_value`
 
-[sqlite.rs:693-719](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L693-L719)
+**定义位置**：`database/values/sqlite.rs` `convert_sqlite_row_to_nu_value` 函数
 
 将 SQLite 行转换为 Nu Record：
 
@@ -281,7 +408,7 @@ pub fn convert_sqlite_row_to_nu_value(
 
 ### 列类型感知：`TypedColumn`
 
-[sqlite.rs:581-593](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L581-L593)
+**定义位置**：`database/values/sqlite.rs` `TypedColumn` 结构体
 
 ```rust
 pub struct TypedColumn {
@@ -294,7 +421,7 @@ pub struct TypedColumn {
 
 ### 值转换：`convert_sqlite_value_to_nu_value`
 
-[sqlite.rs:753-774](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L753-L774)
+**定义位置**：`database/values/sqlite.rs` `convert_sqlite_value_to_nu_value` 函数
 
 SQLite 值类型到 Nu 值的映射：
 
@@ -324,7 +451,7 @@ ValueRef::Text(buf) => match (std::str::from_utf8(buf), decl_type) {
 
 ### 列适配器：`SQLiteColumnAdapter`
 
-[sqlite.rs:721-728](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L721-L728)
+**定义位置**：`database/values/sqlite.rs` `SQLiteColumnAdapter` 枚举
 
 适配器用于对特定列进行语义转换：
 
@@ -333,20 +460,19 @@ ValueRef::Text(buf) => match (std::str::from_utf8(buf), decl_type) {
 | `UnixMillisToDate` | 整数列（Unix 时间戳毫秒）→ `Value::Date` |
 | `MillisToDuration` | 整数列（毫秒数）→ `Value::Duration` |
 
-转换逻辑在 `convert_sqlite_value_to_nu_value_with_adapter` 中实现：
-[sqlite.rs:729-751](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L729-L751)
+转换逻辑在 `convert_sqlite_value_to_nu_value_with_adapter` 中实现。
 
-**注意**：只对 `Integer` 类型应用适配器，其他类型回退到普通转换。
+**注意**：只对 `Integer` 类型应用适配器，其他类型回退到普通转换。若适配器返回值转换失败（如时间戳超出 `chrono::DateTime::from_timestamp_millis` 范围），回退为原始 `Int` 值而非报错。
 
 ---
 
-## 大结果集处理
+## 大结果集处理与限制
 
 ### 当前实现：全量加载
 
 **现状**：当前实现使用 `collect_row_values` 将所有行一次性收集到 `Vec<Value>` 中。
 
-[sqlite.rs:608-623](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L608-L623)
+**定义位置**：`database/values/sqlite.rs` `collect_row_values` 函数
 
 ```rust
 fn collect_row_values(
@@ -382,11 +508,40 @@ signals.check(&call_span)?;
 
 ### 历史命令的懒加载模式
 
-`history` 命令返回 `SQLiteQueryBuilder` 而不是立即执行查询：
+`history` 命令返回 `SQLiteQueryBuilder` 而不是立即执行查询，这样用户可以通过管道操作（如 `first`、`where` 等）触发 SQL 下推优化，避免全量加载。
 
-[history_.rs:156-185](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-cli/src/commands/history/history_.rs#L156-L185)
+### 大结果集限制
 
-这样用户可以通过管道操作（如 `first`、`where` 等）触发 SQL 下推优化，避免全量加载。
+#### 1. 全量物化，无流式输出
+
+所有查询结果都被完整加载到内存中的 `Vec<Value>`。对于大表（百万行级），这意味着：
+- 内存占用与结果集大小成正比
+- 用户必须等待所有行处理完毕才能看到任何输出
+- 没有分页或游标机制
+
+相比之下，Nu 的 `ListStream` 可以逐项产生输出，但 SQLite 查询路径未使用此能力。
+
+#### 2. 错误行被静默跳过
+
+```rust
+if let Ok(row_value) = row_result {
+    row_values.push(row_value);
+}
+```
+
+如果某行转换失败（`row_result` 为 `Err`），该行会被静默丢弃，不报错也不记录。在大结果集中，这可能导致数据悄然丢失而不易察觉。
+
+#### 3. `read_entire_sqlite_db` 读取全部表全部行
+
+`open foo.db` 在不指定表名时会调用 `read_entire_sqlite_db`，遍历 `sqlite_master` 中的所有表并对每张表执行 `SELECT *`。对于包含多张大表的数据库，这可能消耗大量内存和时间。
+
+#### 4. 无行数限制
+
+`query db` 命令本身没有 `--limit` 参数，用户必须自行在 SQL 中加 `LIMIT` 子句来控制结果大小。没有安全阀防止用户执行 `SELECT * FROM huge_table` 导致内存溢出。
+
+#### 5. 连接不复用
+
+由于 `SQLiteDatabase` 不持有连接，每次操作（包括 `to_base_value`、`follow_path_int` 等）都重新打开连接。对于频繁访问同一数据库的场景，连接创建开销会累积。
 
 ---
 
@@ -394,16 +549,16 @@ signals.check(&call_span)?;
 
 ### `SQLiteQueryBuilder` 结构
 
-[sqlite.rs:808-821](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L808-L821)
+**定义位置**：`database/values/sqlite.rs` `SQLiteQueryBuilder` 结构体
 
 ```rust
 pub struct SQLiteQueryBuilder {
     pub db_path: PathBuf,
     pub table_name: String,
-    pub sql_select: Option<String>,
-    pub sql_where: Option<String>,
-    pub sql_params: Vec<String>,
-    pub sql_order_by: Option<String>,
+    pub sql_select: Option<String>,      // e.g. "column1, column2" or "*"
+    pub sql_where: Option<String>,       // e.g. "column = ?"
+    pub sql_params: Vec<String>,         // parameters for the where clause
+    pub sql_order_by: Option<String>,    // e.g. "id DESC"
     pub sql_limit: Option<i64>,
     pub column_adapters: BTreeMap<String, SQLiteColumnAdapter>,
     signals: Signals,
@@ -425,7 +580,7 @@ table
 
 #### 2. SQL 生成
 
-[sqlite.rs:923-940](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L923-L940)
+**定义位置**：`database/values/sqlite.rs` `SQLiteQueryBuilder::build_sql` 方法
 
 ```rust
 pub fn build_sql(&self) -> String {
@@ -437,7 +592,7 @@ pub fn build_sql(&self) -> String {
 
 #### 3. 列投影下推
 
-[sqlite.rs:894-921](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs#L894-L921)
+**定义位置**：`database/values/sqlite.rs` `SQLiteQueryBuilder::project_output_columns` 方法
 
 `project_output_columns` 方法支持在已有 SELECT 投影上进一步选择列，保持别名不变。
 
@@ -464,7 +619,7 @@ pub fn build_sql(&self) -> String {
 | 方法 | 行为 |
 |------|------|
 | `to_base_value` | 执行查询并返回完整结果 |
-| `follow_path_int` | 执行后按索引访问（未优化） |
+| `follow_path_int` | 执行后按索引访问（未优化，无 LIMIT 下推） |
 | `follow_path_string` | 执行后按列名访问（未优化） |
 | `is_iterable` | 返回 `true`，支持迭代 |
 
@@ -497,6 +652,7 @@ pub fn build_sql(&self) -> String {
 ┌─────────────────────────────────────────────────────┐
 │ SQLiteDatabase::query                               │
 │   ├─ open_sqlite_db(path) → Connection              │
+│   │   ⚠ 文件连接: 无 busy_handler                   │
 │   └─ run_sql_query(conn, sql, params, signals)     │
 └──────────────────────┬──────────────────────────────┘
                        │
@@ -507,6 +663,7 @@ pub fn build_sql(&self) -> String {
 │   └─ prepared_statement_to_nu_list(stmt, params)    │
 │      ├─ 获取列信息 (TypedColumn)                    │
 │      ├─ query_map 绑定参数并执行                    │
+│      ├─ ⚠ 全量加载到 Vec<Value>                     │
 │      └─ 逐行 convert_sqlite_row_to_nu_value        │
 └──────────────────────┬──────────────────────────────┘
                        │ Value::List
@@ -514,7 +671,35 @@ pub fn build_sql(&self) -> String {
                   输出结果
 ```
 
-### 场景 2：写入数据
+### 场景 2：查看数据库结构
+
+```
+用户: open foo.db | schema
+      │
+      ▼
+┌─────────────────────────────────────────────────────┐
+│ open 命令 → SQLiteDatabase CustomValue              │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│ schema 命令                                         │
+│   ├─ SQLiteDatabase::try_from_pipeline(input, span)  │
+│   ├─ db.open_connection()                           │
+│   │   ✅ 文件连接: 有 busy_handler (方式3)           │
+│   ├─ db.get_tables(&conn)                           │
+│   ├─ db.get_columns(&conn, &table)                  │
+│   ├─ db.get_constraints(&conn, &table)              │
+│   ├─ db.get_foreign_keys(&conn, &table)             │
+│   └─ db.get_indexes(&conn, &table)                  │
+│      (同一连接执行多次查询)                          │
+└──────────────────────┬──────────────────────────────┘
+                       │ Value::Record (schema 信息)
+                       ▼
+                  输出结果
+```
+
+### 场景 3：写入数据
 
 ```
 用户: [[a b]; [1 2] [3 4]] | into sqlite test.db -t my_table
@@ -522,7 +707,8 @@ pub fn build_sql(&self) -> String {
       ▼
 ┌─────────────────────────────────────────────────────┐
 │ into sqlite 命令                                    │
-│   ├─ 打开/创建数据库连接                            │
+│   ├─ open_sqlite_db(path) → Connection (方式1)      │
+│   │   ⚠ 文件连接: 无 busy_handler                   │
 │   ├─ 首行推断表结构 (nu_value_to_sqlite_type)       │
 │   ├─ CREATE TABLE IF NOT EXISTS                     │
 │   └─ 开启事务                                       │
@@ -541,7 +727,7 @@ pub fn build_sql(&self) -> String {
                   提交事务
 ```
 
-### 场景 3：懒查询与下推优化
+### 场景 4：懒查询与下推优化
 
 ```
 用户: history | where command =~ "cargo" | first 5
@@ -592,16 +778,19 @@ pub fn build_sql(&self) -> String {
 ### 7. 信号检查
 每行检查一次取消信号，保证用户可以中断大查询。
 
+### 8. 连接策略差异
+文件查询（`open_sqlite_db`）不设 busy_handler，遇锁直接报错；实例连接（`open_connection`）设 busy_handler 自动重试。这导致 `query db` 和 `schema` 对同一文件在并发场景下行为不同。
+
 ---
 
 ## 相关文件索引
 
 | 文件路径 | 主要内容 |
 |---------|---------|
-| [database/values/sqlite.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/values/sqlite.rs) | 核心实现：连接、查询、转换、构建器 |
-| [database/commands/query_db.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/commands/query_db.rs) | query db 命令 |
-| [database/commands/into_sqlite.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/commands/into_sqlite.rs) | into sqlite 命令 |
-| [database/commands/schema.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/database/commands/schema.rs) | schema 命令 |
-| [filesystem/open.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/filesystem/open.rs) | open 命令（SQLite 检测入口） |
-| [stor/open.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-command/src/stor/open.rs) | stor open 命令（内存数据库入口） |
-| [commands/history/history_.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/73-nushell/crates/nu-cli/src/commands/history/history_.rs) | history 命令（懒查询示例） |
+| `database/values/sqlite.rs` | 核心实现：连接、查询、转换、构建器 |
+| `database/commands/query_db.rs` | query db 命令 |
+| `database/commands/into_sqlite.rs` | into sqlite 命令 |
+| `database/commands/schema.rs` | schema 命令 |
+| `filesystem/open.rs` | open 命令（SQLite 检测入口） |
+| `stor/open.rs` | stor open 命令（内存数据库入口） |
+| `commands/history/history_.rs` | history 命令（懒查询示例） |
