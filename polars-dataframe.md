@@ -6,7 +6,7 @@ Polars 插件通过 **CustomValue** 机制将 Polars 的数据结构集成到 Nu
 
 ### 1.1 自定义值类型体系
 
-在 [crates/nu_plugin_polars/src/dataframe/values/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/mod.rs) 中定义了完整的 Polars 插件对象类型枚举 `PolarsPluginObject`：
+在 [crates/nu_plugin_polars/src/dataframe/values/mod.rs](crates/nu_plugin_polars/src/dataframe/values/mod.rs) 中定义了完整的 Polars 插件对象类型枚举 `PolarsPluginObject`：
 
 | 类型 | 枚举变体 | 说明 |
 |------|----------|------|
@@ -19,7 +19,7 @@ Polars 插件通过 **CustomValue** 机制将 Polars 的数据结构集成到 Nu
 | `NuSchema` | `PolarsPluginObject::NuSchema` | 数据模式对象 |
 | `NuSelector` | `PolarsPluginObject::NuSelector` | 选择器对象 |
 
-所有这些类型都通过 `CustomValueSupport` trait 统一管理转换逻辑，该 trait 定义在 [crates/nu_plugin_polars/src/dataframe/values/mod.rs#L360-L468](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/mod.rs#L360-L468)。
+所有这些类型都通过 `CustomValueSupport` trait 统一管理转换逻辑，该 trait 定义在 [crates/nu_plugin_polars/src/dataframe/values/mod.rs#L360-L468](crates/nu_plugin_polars/src/dataframe/values/mod.rs#L360-L468)。
 
 ---
 
@@ -27,7 +27,7 @@ Polars 插件通过 **CustomValue** 机制将 Polars 的数据结构集成到 Nu
 
 ### 2.1 数据结构
 
-在 [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs#L104-L109](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs#L104-L109) 中定义了 `NuDataFrame`：
+在 [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs#L104-L109](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs#L104-L109) 中定义了 `NuDataFrame`：
 
 ```rust
 pub struct NuDataFrame {
@@ -44,7 +44,7 @@ pub struct NuDataFrame {
 
 ### 2.2 CustomValue 封装
 
-在 [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/custom_value.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/custom_value.rs) 中，`NuDataFrameCustomValue` 实现了 `CustomValue` trait：
+在 [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/custom_value.rs](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/custom_value.rs) 中，`NuDataFrameCustomValue` 实现了 `CustomValue` trait：
 
 ```rust
 pub struct NuDataFrameCustomValue {
@@ -63,7 +63,7 @@ pub struct NuDataFrameCustomValue {
 
 #### 2.3.1 从迭代器创建（最常用路径）
 
-[try_from_iter](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs#L158-L200) 方法是从 Nushell 值列表创建数据帧的核心入口：
+[try_from_iter](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs#L158-L200) 方法是从 Nushell 值列表创建数据帧的核心入口：
 
 ```rust
 pub fn try_from_iter<T>(
@@ -85,7 +85,7 @@ pub fn try_from_iter<T>(
 
 #### 2.3.2 列值累积与类型推断
 
-转换过程中使用 `ColumnMap`（即 `IndexMap<PlSmallStr, TypedColumn>`）累积列数据。[insert_value](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L205-L244) 函数处理类型推断逻辑：
+转换过程中使用 `ColumnMap`（即 `IndexMap<PlSmallStr, TypedColumn>`）累积列数据。[insert_value](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L205-L244) 函数处理类型推断逻辑：
 
 1. **有 schema 时**：直接使用 schema 指定的列类型
 2. **无 schema 时**：
@@ -95,7 +95,7 @@ pub fn try_from_iter<T>(
 
 #### 2.3.3 value_to_data_type 映射
 
-[value_to_data_type](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L246-L278) 定义了默认类型映射：
+[value_to_data_type](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L246-L278) 定义了默认类型映射：
 
 | Nushell Value 类型 | Polars DataType |
 |-------------------|-----------------|
@@ -110,34 +110,47 @@ pub fn try_from_iter<T>(
 | `Value::List` | `DataType::List(inner_type)` |
 | 其他 | `None` → 最终为 Object 类型 |
 
-#### 2.3.4 列表列类型推断（深度分析）
+#### 2.3.4 列表列类型推断（深度分析 · 已复核）
 
-`Value::List` 的类型推断是整个类型系统中最复杂的分支之一，代码位于 [conversion.rs#L259-L275](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L259-L275)：
+`Value::List` 的类型推断是整个类型系统中最复杂的分支之一，代码位于 [conversion.rs#L259-L275](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L259-L275)：
 
 ```rust
 Value::List { vals, .. } => {
     let list_type = vals
         .iter()
-        .filter(|v| !matches!(v, Value::Nothing { .. }))   // 1. 先过滤掉 Nothing
+        .filter(|v| !matches!(v, Value::Nothing { .. }))   // 步骤 1：先过滤掉 Nothing
         .map(value_to_data_type)
-        .nth(1)                                            // 2. 取第 2 个非空元素的类型！
+        .nth(1)                                            // 步骤 2：取下标为 1 的元素（即第 2 个有效值）
         .flatten()
-        .unwrap_or(DataType::Object("Value"));             // 3. 兜底为 Object
+        .unwrap_or(DataType::Object("Value"));             // 步骤 3：兜底为 Object
 
     Some(DataType::List(Box::new(list_type)))
 }
 ```
 
-**关键设计细节**：
+**关键设计细节（逐行复核源码）**：
 
-1. **取第 2 个元素而非第 1 个**：代码使用 `.nth(1)`（索引从 0 开始，即第 2 个元素）而非 `.nth(0)`。这是一个启发式策略——如果列表中只有 1 个有效值，或者前几个元素中有 null，则样本不可靠。但这也意味着：
-   - 单元素列表：`[1]` → 会退化为 `Object("Value")` 列表
-   - 空列表：`[]` → `Object("Value")` 列表
-   - 两元素列表（第一个是 null）：`[nothing, 42]` → `List(Int64)`
+1. **`.nth(1)` 的真实含义**：`nth(n)` 从 0 开始计数，`nth(1)` 即**第 2 个非 Nothing 元素**。这意味着过滤后必须至少有 **≥2 个非 Nothing 元素**，才能成功取样；否则 `nth(1)` 返回 `None`，直接走到 `unwrap_or`。
 
-2. **只检查类型本身，不检查一致性**：`value_to_data_type` 是对单个列表内的元素推断，而**列级别**的 List 类型一致性由 `insert_value` 的外层逻辑负责。若第一行是 `List(Int64)`、第二行是 `List(String)`，外层比较 `DataType !=` 不相等，整列直接降级为 `Object`。
+   结合源码手工推演以下案例（可直接对照代码验证）：
 
-3. **构建 Series 时的二次回退**：即使类型推断通过，实际构建时仍可能失败。[typed_column_to_series 中 DataType::List 分支](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L442-L451)：
+   | 输入列表 | filter 后结果 | `.nth(1)` 返回 | `unwrap_or` 结果 | 最终列类型 |
+   |----------|--------------|----------------|-----------------|-----------|
+   | `[]` 空 | `[]`（0 个） | `None` | `Object("Value")` | `List(Object("Value"))` |
+   | `[1]` 单元素 | `[Int(1)]`（1 个） | `None`（越界） | `Object("Value")` | `List(Object("Value"))` |
+   | `[nothing, 42]` 一空调试 | `[Int(42)]`（1 个） | `None`（越界） | `Object("Value")` | `List(Object("Value"))` |
+   | `[1, 2]` 两元素全值 | `[Int(1), Int(2)]`（2 个） | `Some(Some(Int64))` | — | `List(Int64)` |
+   | `[nothing, 42, 99]` 三元素一空调试 | `[Int(42), Int(99)]`（2 个） | `Some(Some(Int64))` | — | `List(Int64)` |
+   | `["a", nothing, nothing, "b"]` 两有效值间隔 | `[Str("a"), Str("b")]`（2 个） | `Some(Some(String))` | — | `List(String)` |
+
+   > **注意**：此前版本文档中"`[nothing, 42]` → `List(Int64)`"的结论与源码不符——过滤后仅有 1 个元素，`nth(1)` 越界返回 `None`，实际应退化为 `List(Object("Value"))`。现予以更正。
+
+2. **只检查列表自身类型，不检查列级别一致性**：`value_to_data_type` 只对**当前行**的列表内元素取样。列级别（不同行之间）的 List 类型一致性由 `insert_value` 外层逻辑负责。例如：
+   - 第 1 行列值 `[1, 2]` → 推断 `List(Int64)` → 作为列的初始 `column_type`
+   - 第 2 行列值 `["a", "b"]` → 推断 `List(String)`
+   - 外层比较：`List(Int64) != List(String)` → **整列降级为 Object("Value")**
+
+3. **构建 Series 时的二次回退**：即使列类型标记通过，实际构建 List Series 时仍可能因元素不一致失败。[typed_column_to_series 中 DataType::List 分支](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L442-L451)：
 
 ```rust
 DataType::List(list_type) => {
@@ -151,48 +164,57 @@ DataType::List(list_type) => {
 }
 ```
 
-[input_type_list_to_series](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L679-L759) 针对不同内部类型使用专门的 ChunkedBuilder：
+[input_type_list_to_series](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L679-L759) 针对不同内部类型使用专门的 ChunkedBuilder：
 - 布尔值 → `ListBooleanChunkedBuilder`
 - 数值类型 → `ListPrimitiveChunkedBuilder<T>`（宏统一处理）
 - 字符串 → `ListStringChunkedBuilder`
 
-任何元素的 `value_to_primitive!` / `as_list()` / `coerce_string()` 失败都会触发 `inconsistent_error`，进而导致外层回退为 Object 列表。
+任何元素的 `value_to_primitive!` / `as_list()` / `coerce_string()` 失败都会触发 `inconsistent_error`，进而导致外层用 `Object("unknown")` 作为子类型重新构建一次 List。
 
-#### 2.3.5 对象列降级机制（深度分析）
+#### 2.3.5 对象列降级机制（深度分析 · 已复核）
 
-对象列降级发生在**两个层级**，形成"双重保险"的兜底策略：
+对象列降级发生在**两个层级**，形成"双重保险"的兜底策略。以下逐段对照源码验证：
 
-**第一级：列插入时的类型不匹配（insert_value）**
+**第一级：列插入时的类型标签降级（insert_value）**
 
-代码位于 [conversion.rs#L232-L241](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L232-L241)：
+代码位于 [conversion.rs#L232-L244](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L232-L244)：
 
 ```rust
+// 如果有 schema：类型完全由 schema 决定，不走推断路径
+if let Some(schema) = maybe_schema
+    && let Some(field) = schema.schema.get_field(&key)
+{
+    col_val.column_type = Some(field.dtype().clone());
+    col_val.values.push(value);
+    return Ok(());
+}
+
+// 无 schema：推断路径
 let current_data_type = value_to_data_type(&value);
 if col_val.column_type.is_none() {
-    // 首个值：设置列的初始类型
+    // 首个值：设置列的初始类型标签
     col_val.column_type = value_to_data_type(&value);
 } else if let Some(current_data_type) = current_data_type
     && col_val.column_type.as_ref() != Some(&current_data_type)
 {
-    // 后续值：类型不一致 → 标记为 Object
+    // 后续值：外层 DataType != 不相等 → 标签改为 Object("Value")
     col_val.column_type = Some(DataType::Object("Value"));
 }
-col_val.values.push(value);  // 原始 Value 始终保留
+col_val.values.push(value);  // 原始 Value 始终完整保留
 ```
 
-关键点：
-- `TypedColumn` 内部同时保存 `column: Column`（原始 Nushell Values 列表）和 `column_type: Option<DataType>`（推断的 Polars 类型标签）
-- 降级只改变 `column_type` 标签，**不改变已存储的 values**——原始 Value 始终完整保留
-- 这是一个"单向棘轮"：只能从具体类型 → Object，不能反向回退
-- `DataType::Object("Value")` 和 `DataType::Object("other")` 在 `!=` 比较下是**不相等的不同类型**，但最终都会走 Object 路径
+逐点复核：
+- **TypedColumn 双字段结构**：[conversion.rs#L122-L135](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L122-L135) 中 `TypedColumn { column: Column, column_type: Option<DataType> }`——`column.values` 存原始 Nushell Values，`column_type` 仅作**类型标签**，降级只改标签不动值。
+- **单向棘轮**：`column_type` 从 `Some(List(Int64))` → `Some(Object("Value"))` 后，后续所有值再匹配 `!=` 恒真，但标签已是 Object，不改变方向；**无法反向恢复**。
+- **首值为 None 的情形**：当首行是 `Value::Closure` 等无映射类型，`value_to_data_type` 返回 `None` → `column_type` 保持 `None`。后续行即使出现可识别类型（如 `Int`），`else if let Some(current_data_type)` 分支要求 `col_val.column_type` 为 `Some` 才会进入比较，因此类型比较**被跳过**，`column_type` 始终为 `None`。最终到构建阶段由 `unwrap_or(Object("Value"))` 兜底。
+- **Object 名称差异**：`Object("Value")` 和 `Object("other")` 是两个**不相等**的 `DataType`，但所有 `DataType::Object(_)` 分支在 `typed_column_to_series` 中都会走到同一条 `value_to_series` 路径，语义无差别。
 
 **第二级：构建 Series 时的构建失败回退**
 
-即使列已标记为 Object，[value_to_series](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L650-L666) 仍会做一次"乐观尝试"：
+即使列已标记为 Object，[value_to_series](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L650-L666) 仍会做一次"乐观尝试"——根据首个值的具体类型尝试原生构建：
 
 ```rust
 pub fn value_to_series(name: PlSmallStr, values: &[Value]) -> Result<Series, ShellError> {
-    // 尝试根据第一个值的类型做 typed_column_to_series
     if let Some(data_type) = values.first().and_then(value_to_data_type) {
         let column = TypedColumn {
             column: Column::new(name.clone(), values.to_owned()),
@@ -200,24 +222,24 @@ pub fn value_to_series(name: PlSmallStr, values: &[Value]) -> Result<Series, She
         };
         typed_column_to_series(name.clone(), column)
             .or_else(|e| {
-                // 打印调试信息后，兜底为 Object series
-                eprintln!("Error converting... Falling back to object type.");
+                // 构建失败 → eprintln 调试信息后兜底为 Object series
+                eprintln!("Error converting list to series with type {data_type:?}: {e}. Falling back to object type.");
                 value_to_object_series(name, values)
             })
     } else {
-        // 直接走 Object 路径
+        // 首个值无法推断类型 → 直接走 Object 路径
         value_to_object_series(name, values)
     }
 }
 ```
 
-最终的 Object series 构建使用 `ObjectChunkedBuilder`，定义在 [value_to_object_series](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L668-L677)：
+最终兜底构建使用 [value_to_object_series](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L668-L677)：
 
 ```rust
 fn value_to_object_series(name: PlSmallStr, values: &[Value]) -> Result<Series, ShellError> {
     let mut builder = ObjectChunkedBuilder::<DataFrameValue>::new(name, values.len());
     for v in values {
-        builder.append_value(DataFrameValue::new(v.clone()));  // 每个值包装为 DataFrameValue
+        builder.append_value(DataFrameValue::new(v.clone()));  // 每个值独立包装
     }
     let res = builder.finish();
     Ok(res.into_series())
@@ -227,30 +249,40 @@ fn value_to_object_series(name: PlSmallStr, values: &[Value]) -> Result<Series, 
 **完整降级路径图示**：
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  插入阶段 (insert_value)                                             │
-│                                                                     │
-│  第 1 行值 → value_to_data_type() → 设置 column_type                 │
-│  第 2+ 行值 → 当前类型 ≠ column_type → column_type = Object("Value") │
-│                        ↓                                            │
-│  typed_column_to_series() 分发到 DataType::Object(_) 分支            │
-└───────────────────────────┬─────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  构建阶段 (value_to_series)                                          │
-│                                                                     │
-│  尝试 typed_column_to_series(按首个值的具体类型)                     │
-│           ↓ 成功         ↓ 失败                                      │
-│      返回 Series    value_to_object_series() → ObjectChunkedBuilder  │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  插入阶段 (insert_value)                                                  │
+│                                                                          │
+│  首行值 value_to_data_type() → Some(T) / None                            │
+│         ↓                              ↓                                  │
+│  column_type = Some(T)          column_type = None                       │
+│         ↓                              ↓                                  │
+│  后续行值:                                                               │
+│   DataType == → 不改标签   DataType != → column_type = Object("Value")   │
+│                        column_type 保持 None（跳过比较）                  │
+│                    ↓                                                     │
+│  typed_column_to_series() 分发：                                          │
+│   具体 T → 对应构建分支    Object(_) → value_to_series()    None →       │
+│                                            ↓              unwrap_or       │
+│                                            ↓                ↓             │
+│                                    乐观 typed 构建   → Object("Value")    │
+└────────────────────┬──────────────────────────────────────────┬──────────┘
+                     │                                          │
+                     ▼                                          ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  构建阶段 (typed_column_to_series / value_to_series)                      │
+│                                                                          │
+│  typed 构建成功 → 原生 Polars 类型 Series                                │
+│  typed 构建失败 → or_else → value_to_object_series() → ObjectChunked     │
+│                                                                          │
+│  *List 类型附加回退：input_type_list_to_series 失败 → 重试用 Object 子类型│
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.4 NuDataFrame → Value 的转换
 
 #### 2.4.1 基础值转换
 
-[base_value](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs#L554-L557) 方法将数据帧转换为 Nushell 列表：
+[base_value](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs#L554-L557) 方法将数据帧转换为 Nushell 列表：
 
 ```rust
 fn base_value(self, span: Span) -> Result<Value, ShellError> {
@@ -263,7 +295,7 @@ fn base_value(self, span: Span) -> Result<Value, ShellError> {
 
 #### 2.4.2 to_rows：逐行转换
 
-[to_rows](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs#L387-L436) 是核心转换函数，将数据帧的指定行范围转换为 Nushell 值列表。
+[to_rows](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs#L387-L436) 是核心转换函数，将数据帧的指定行范围转换为 Nushell 值列表。
 
 转换流程：
 1. 对每列调用 `create_column` → `create_column_from_series` → `series_to_values`
@@ -272,7 +304,7 @@ fn base_value(self, span: Span) -> Result<Value, ShellError> {
 
 #### 2.4.3 series_to_values：Series → Vec\<Value\>
 
-[series_to_values](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L798-L1347) 是最庞大的转换函数，按 Polars 数据类型分别处理：
+[series_to_values](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs#L798-L1347) 是最庞大的转换函数，按 Polars 数据类型分别处理：
 
 | Polars 类型 | Nushell Value 类型 | 注意事项 |
 |-------------|-------------------|----------|
@@ -298,7 +330,7 @@ fn base_value(self, span: Span) -> Result<Value, ShellError> {
 
 ### 3.1 NuLazyFrame 结构
 
-在 [crates/nu_plugin_polars/src/dataframe/values/nu_lazyframe/mod.rs#L21-L26](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_lazyframe/mod.rs#L21-L26) 中定义：
+在 [crates/nu_plugin_polars/src/dataframe/values/nu_lazyframe/mod.rs#L21-L26](crates/nu_plugin_polars/src/dataframe/values/nu_lazyframe/mod.rs#L21-L26) 中定义：
 
 ```rust
 pub struct NuLazyFrame {
@@ -312,7 +344,7 @@ pub struct NuLazyFrame {
 
 ### 3.2 Lazy → Eager 的转换（收集）
 
-[collect](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_lazyframe/mod.rs#L58-L74) 方法触发实际计算：
+[collect](crates/nu_plugin_polars/src/dataframe/values/nu_lazyframe/mod.rs#L58-L74) 方法触发实际计算：
 
 ```rust
 pub fn collect(self, span: Span) -> Result<NuDataFrame, ShellError> {
@@ -334,7 +366,7 @@ pub fn collect(self, span: Span) -> Result<NuDataFrame, ShellError> {
 
 ### 3.3 Eager → Lazy 的转换
 
-[lazy()](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs#L143-L145) 方法：
+[lazy()](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs#L143-L145) 方法：
 
 ```rust
 pub fn lazy(&self) -> NuLazyFrame {
@@ -346,7 +378,7 @@ pub fn lazy(&self) -> NuLazyFrame {
 
 ### 3.4 自动类型回退
 
-`CustomValueSupport` trait 的 [cache_and_to_value](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/mod.rs#L433-L452) 方法实现了智能类型回退：
+`CustomValueSupport` trait 的 [cache_and_to_value](crates/nu_plugin_polars/src/dataframe/values/mod.rs#L433-L452) 方法实现了智能类型回退：
 
 ```rust
 fn cache_and_to_value(self, plugin, engine, span) -> Result<Value, ShellError> {
@@ -389,7 +421,7 @@ pub fn schema(&mut self) -> Result<NuSchema, ShellError> {
 
 ### 4.1 NuDataType 封装
 
-在 [crates/nu_plugin_polars/src/dataframe/values/nu_dtype/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dtype/mod.rs) 中定义了 `NuDataType`，包装 Polars 的 `DataType`：
+在 [crates/nu_plugin_polars/src/dataframe/values/nu_dtype/mod.rs](crates/nu_plugin_polars/src/dataframe/values/nu_dtype/mod.rs) 中定义了 `NuDataType`，包装 Polars 的 `DataType`：
 
 ```rust
 pub struct NuDataType {
@@ -400,7 +432,7 @@ pub struct NuDataType {
 
 ### 4.2 字符串 → DataType 解析
 
-[str_to_dtype](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dtype/mod.rs#L147-L286) 函数支持以下类型字符串的解析：
+[str_to_dtype](crates/nu_plugin_polars/src/dataframe/values/nu_dtype/mod.rs#L147-L286) 函数支持以下类型字符串的解析：
 
 | 类型字符串 | Polars 类型 |
 |-----------|-------------|
@@ -422,7 +454,7 @@ pub struct NuDataType {
 
 ### 4.3 Schema 的作用
 
-NuSchema 定义在 [crates/nu_plugin_polars/src/dataframe/values/nu_schema/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_schema/mod.rs)：
+NuSchema 定义在 [crates/nu_plugin_polars/src/dataframe/values/nu_schema/mod.rs](crates/nu_plugin_polars/src/dataframe/values/nu_schema/mod.rs)：
 
 ```rust
 pub struct NuSchema {
@@ -442,7 +474,7 @@ Schema 在转换中的作用：
 
 ### 5.1 Save 命令总览
 
-`polars save` 命令定义在 [crates/nu_plugin_polars/src/dataframe/command/core/save/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/save/mod.rs)，支持多种文件格式：
+`polars save` 命令定义在 [crates/nu_plugin_polars/src/dataframe/command/core/save/mod.rs](crates/nu_plugin_polars/src/dataframe/command/core/save/mod.rs)，支持多种文件格式：
 
 | 格式 | Eager 模式 | Lazy 模式（Sink） | 云存储 |
 |------|-----------|-------------------|--------|
@@ -456,7 +488,7 @@ Schema 在转换中的作用：
 
 #### 5.2.1 Eager 模式（即时数据帧）
 
-以 CSV 为例，[command_eager (csv.rs#L56-L110)](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/save/csv.rs#L56-L110)：
+以 CSV 为例，[command_eager (csv.rs#L56-L110)](crates/nu_plugin_polars/src/dataframe/command/core/save/csv.rs#L56-L110)：
 
 ```rust
 pub(crate) fn command_eager(call, df, resource) -> Result<(), ShellError> {
@@ -475,7 +507,7 @@ pub(crate) fn command_eager(call, df, resource) -> Result<(), ShellError> {
 
 #### 5.2.2 Lazy 模式（Sink 流式保存）
 
-以 CSV 为例，[command_lazy (csv.rs#L16-L54)](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/save/csv.rs#L16-L54)：
+以 CSV 为例，[command_lazy (csv.rs#L16-L54)](crates/nu_plugin_polars/src/dataframe/command/core/save/csv.rs#L16-L54)：
 
 ```rust
 pub(crate) fn command_lazy(call, lazy, resource) -> Result<(), ShellError> {
@@ -500,7 +532,7 @@ pub(crate) fn command_lazy(call, lazy, resource) -> Result<(), ShellError> {
 
 ### 5.3 Cloud URL 特殊处理
 
-在保存逻辑中，有一个重要的分支：如果是云存储 URL，即使是 Eager DataFrame 也会转为 Lazy 模式保存。以 Parquet 为例 [save/mod.rs#L164-L172](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/save/mod.rs#L164-L172)：
+在保存逻辑中，有一个重要的分支：如果是云存储 URL，即使是 Eager DataFrame 也会转为 Lazy 模式保存。以 Parquet 为例 [save/mod.rs#L164-L172](crates/nu_plugin_polars/src/dataframe/command/core/save/mod.rs#L164-L172)：
 
 ```rust
 PolarsFileType::Parquet => match polars_object {
@@ -517,27 +549,27 @@ PolarsFileType::Parquet => match polars_object {
 
 这是因为云存储写入（S3、GCS 等）**只能通过 Polars 的 Unified Sink API 完成**，本地 `File::create()` + Writer 不支持远程对象存储。该模式适用于 Parquet、Arrow、CSV、NDJSON。
 
-### 5.4 云端 Avro 保存与 Lazy 导出的差异（深度分析）
+### 5.4 云端 Avro 保存与 Lazy 导出的差异（深度分析 · 已复核）
 
-Avro 是唯一的"二等公民"，其处理路径与其他格式存在本质差异。代码位于 [save/mod.rs#L194-L213](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/save/mod.rs#L194-L213) 和 [save/avro.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/save/avro.rs)。
+Avro 是唯一的"二等公民"，其处理路径与其他格式存在本质差异。代码位于 [save/mod.rs#L194-L213](crates/nu_plugin_polars/src/dataframe/command/core/save/mod.rs#L194-L213) 和 [save/avro.rs](crates/nu_plugin_polars/src/dataframe/command/core/save/avro.rs)。
 
 #### 5.4.1 Avro 的分支处理
 
 ```rust
 PolarsFileType::Avro => match polars_object {
-    // 情况 1：任何云 URL → 直接报错
+    // 情况 1：任何云 URL → 直接报错（与其他格式的 Eager 转 Lazy 路径不同）
     _ if resource.cloud_options.is_some() => {
         let error = GenericError::new(
             "Cloud URLS are not supported with Avro", "", span
         ).with_help("Remove flag");
         Err(ShellError::Generic(error))
     }
-    // 情况 2：LazyFrame → 先 collect 为 DataFrame，再调用 eager
+    // 情况 2：LazyFrame → 先 collect 全量物化为 DataFrame，再调用 eager 写
     PolarsPluginObject::NuLazyFrame(lazy) => {
-        let df = lazy.collect(call.head)?;       // 必须完全物化！
-        avro::command_eager(call, &df, resource)  // 走本地文件写入
+        let df = lazy.collect(call.head)?;       // 必须完全物化！无 Sink 节点
+        avro::command_eager(call, &df, resource)  // 走本地 File::create 路径
     }
-    // 情况 3：DataFrame → 直接 eager 写
+    // 情况 3：DataFrame → 直接 eager 写本地文件
     PolarsPluginObject::NuDataFrame(ref df) => avro::command_eager(call, df, resource),
     _ => Err(unknown_file_save_error(resource.span)),
 },
@@ -545,13 +577,13 @@ PolarsFileType::Avro => match polars_object {
 
 #### 5.4.2 Avro command_eager 实现
 
-[avro.rs#L32-L60](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/save/avro.rs#L32-L60)：
+[avro.rs#L32-L60](crates/nu_plugin_polars/src/dataframe/command/core/save/avro.rs#L32-L60)：
 
 ```rust
 pub(crate) fn command_eager(call, df, resource) -> Result<(), ShellError> {
     let compression = get_compression(call)?;
-    let path: PathBuf = resource.as_path_buf();      // 只能是本地路径
-    let file = File::create(&path)?;                 // 标准 File::create
+    let path: PathBuf = resource.as_path_buf();      // 只能是本地路径（as_path_buf）
+    let file = File::create(&path)?;                 // 标准 std::fs::File
 
     AvroWriter::new(file)
         .with_compression(compression)               // snappy 或 deflate
@@ -560,35 +592,35 @@ pub(crate) fn command_eager(call, df, resource) -> Result<(), ShellError> {
 }
 ```
 
-关键观察：avro.rs **没有定义 command_lazy 函数**——这与其他格式（csv、parquet、arrow、ndjson）都不同。
+关键观察：avro.rs **没有定义 `command_lazy` 函数**——对照同目录 [parquet.rs](crates/nu_plugin_polars/src/dataframe/command/core/save/parquet.rs)、[csv.rs](crates/nu_plugin_polars/src/dataframe/command/core/save/csv.rs)、[arrow.rs](crates/nu_plugin_polars/src/dataframe/command/core/save/arrow.rs)、[ndjson.rs](crates/nu_plugin_polars/src/dataframe/command/core/save/ndjson.rs) 均实现了 `command_lazy`，Avro 是唯一缺失的。
 
 #### 5.4.3 差异对比表
 
 | 维度 | Parquet/CSV/Arrow/NDJSON | Avro |
 |------|--------------------------|------|
-| **Lazy Sink 支持** | ✅ 直接加入 Logical Plan | ❌ Polars 上游不支持 Avro Sink |
-| **云存储支持** | ✅ UnifiedSinkArgs.cloud_options | ❌ 直接报错 "Cloud URLS are not supported with Avro" |
-| **Eager + 云存储** | Eager → Lazy → sink() | ❌ 云路径直接被拦截，不进入此分支 |
-| **Lazy → 存储** | `lazy.sink(...).collect()`（流式处理） | `lazy.collect()` → 全量物化 → 本地 File 写 |
-| **内存占用** | Lazy sink：流式，常量级内存 | 始终：全量数据在内存 + 序列化缓冲 |
-| **写入 API** | Lazy: `FileWriteFormat::*` 枚举统一调度 | Eager: `AvroWriter::new(file).finish()` 本地专属 |
-| **数据源追踪** | 同样受 `check_writing_into_source_file` 保护 | 同样受保护 |
+| **Lazy Sink 支持** | ✅ `sink()` 加入 Logical Plan | ❌ Polars 上游 `FileWriteFormat` 枚举无 Avro 变体 |
+| **云存储支持** | ✅ `UnifiedSinkArgs.cloud_options` 透传 | ❌ save/mod.rs 分支直接拦截报错 |
+| **Eager + 云存储路径** | Eager → `df.lazy()` → sink() | ❌ 云路径被 `resource.cloud_options.is_some()` 守卫拦截，无法进入 |
+| **Lazy → 存储内存特征** | `lazy.sink(...).collect()`：流式，常量级内存 | 强制 `lazy.collect()` → 全量物化 → 本地 File 写，内存 = 数据量 + 序列化缓冲 |
+| **写入 API 层** | Lazy: `FileWriteFormat::*` 枚举统一调度；Eager: 各 `SerWriter` | 单层：仅 `AvroWriter::new(std::fs::File).finish()` |
+| **上游 polars-io 能力** | SerWriter + Async Sink（object_store 集成） | 仅实现 `SerWriter<W: std::io::Write>`，无 Sink 节点 |
+| **数据源追踪** | 受 `check_writing_into_source_file` 保护 | 同样受保护（所有格式共享同一 command 外层逻辑） |
 
 #### 5.4.4 为什么 Avro 特殊？
 
-根本原因是 **Polars 上游（polars-io crate）的能力差异**：
-- `FileWriteFormat` 枚举包含 `Parquet / Ipc / Csv / NDJson`，**没有 `Avro` 变体**
-- `AvroWriter` 只实现了 `SerWriter` trait（面向 `std::io::Write`），没有对应的 Sink 节点
-- 云存储写入依赖 object_store crate 集成的异步 Sink 管道，Avro 未接入该管道
+根本原因追踪到 **Polars 上游（polars-io crate）的能力差异**：
+- `FileWriteFormat` 枚举只包含 `Parquet / Ipc / Csv / NDJson`，**没有 `Avro` 变体**——意味着 Polars 核心的 Sink 执行器根本没有 Avro 的实现路径
+- `AvroWriter` 只实现了 `SerWriter` trait（面向阻塞式 `std::io::Write`），没有对应的异步 Sink Plan 节点
+- 云存储写入依赖 `object_store` crate 集成的异步 Sink 管道（HTTP PUT 多段上传等），Avro 未接入该管道
 
-实际影响：
-- 对小型数据集（< 内存 50%）：差异可忽略
-- 对超大型数据集：Avro 需 **2× 内存**（数据 + 序列化），Parquet Sink 仅需常量内存
-- 对云端流水线：Avro 无法直接写 S3，必须先存本地再用对象存储工具上传
+实际工程影响：
+- 对小型数据集（< 内存 50%）：差异可忽略，Avro 压缩率尚可（snappy/deflate）
+- 对超大型数据集（> 内存）：Avro 流程需要 **≈ 2× 内存**（数据全集 + Avro 序列化块缓冲），Parquet Sink 仅需常量内存（批次处理）
+- 对云端流水线：Avro 无法直接写 S3/GCS/Azure Blob，必须先落本地磁盘，再用对象存储 CLI/SDK 二次上传
 
 ### 5.5 源文件保护
 
-[check_writing_into_source_file](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/save/mod.rs#L247-L260) 防止将数据写回源文件：
+[check_writing_into_source_file](crates/nu_plugin_polars/src/dataframe/command/core/save/mod.rs#L247-L260) 防止将数据写回源文件：
 
 ```rust
 fn check_writing_into_source_file(metadata, dest) -> Result<(), ShellError> {
@@ -610,7 +642,7 @@ fn check_writing_into_source_file(metadata, dest) -> Result<(), ShellError> {
 
 ### 6.1 数据帧与普通值的运算
 
-`compute_with_value` 方法（定义在 [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/operations.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/operations.rs)）处理数据帧与右侧值的运算：
+`compute_with_value` 方法（定义在 [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/operations.rs](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/operations.rs)）处理数据帧与右侧值的运算：
 
 | 右侧值类型 | 处理方式 |
 |-----------|----------|
@@ -619,7 +651,7 @@ fn check_writing_into_source_file(metadata, dest) -> Result<(), ShellError> {
 
 ### 6.2 标量与 Series 的运算
 
-[compute_series_single_value](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/between_values.rs#L207-L453) 处理单列与标量的运算，支持：
+[compute_series_single_value](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/between_values.rs#L207-L453) 处理单列与标量的运算，支持：
 
 - **数学运算**：Add、Subtract、Multiply、Divide
 - **比较运算**：Equal、NotEqual、LessThan、GreaterThan 等
@@ -649,11 +681,11 @@ fn check_writing_into_source_file(metadata, dest) -> Result<(), ShellError> {
 ┌────────────────────────────────────────────────────────────────────────────┐
 │                        Conversion 层                                        │
 │                                                                            │
-│  value_to_data_type()      →  类型推断 / List 子类型启发式                 │
-│  insert_value()           →  列类型不一致 → 标记 Object("Value")           │
-│  typed_column_to_series() →  List 失败 → 回退 Object 列表                 │
-│  value_to_series()        →  乐观 typed → 失败 → ObjectChunkedBuilder     │
-│  series_to_values()       ←  15+ 种 DataType 的精细映射                   │
+│  value_to_data_type()      →  List 子类型启发式(.nth(1) 第2个有效值)       │
+│  insert_value()           →  外层 DataType != → 标记 Object("Value")      │
+│  typed_column_to_series() →  List 构建失败 → 回退 Object 子类型            │
+│  value_to_series()        →  乐观 typed 构建 → 失败 → ObjectChunkedBuilder│
+│  series_to_values()       ←  15+ 种 DataType 精细映射                      │
 │  DataFrameValue (Object)  ↔  原始 Value 无损保留                           │
 └───────────────────────┬────────────────────────┬──────────────────────────┘
                         │                        │
@@ -669,29 +701,30 @@ fn check_writing_into_source_file(metadata, dest) -> Result<(), ShellError> {
 │      to_polars().lazy() ───────┘                                           │
 │                                                                            │
 │  导出:                                                                     │
-│   Parquet/CSV/Arrow/NDJSON  →  sink()/SerWriter + 可选 Cloud              │
-│   Avro                     →  SerWriter 本地文件 ONLY                      │
+│   Parquet/CSV/Arrow/NDJSON  →  sink() / SerWriter + 可选 Cloud            │
+│   Avro                     →  SerWriter 本地文件 ONLY (强制 collect)       │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 7.2 关键边界原则
 
-1. **CustomValue 是黑盒边界**：Nushell 引擎将 Polars 对象视为不透明自定义值，只有插件能理解其内部结构。序列化时仅传递 Uuid，实际数据通过插件内缓存共享。
+1. **CustomValue 是黑盒边界**：Nushell 引擎将 Polars 对象视为不透明自定义值，只有插件能理解其内部结构。序列化时仅传递 Uuid，实际数据通过插件内 `Arc` 共享 + `DashMap` 缓存实现进程间共享。
 
-2. **类型降级策略（双重棘轮）**：
-   - 列级：`insert_value` 中 `column_type` 一旦标记为 Object 即不可恢复
-   - 构建级：`typed_column_to_series` 失败时再兜底为 ObjectChunkedBuilder
-   - **核心原则**：不做隐式类型强转（如 Int→Float），只做"向 Object 降级"，保证数据无损
+2. **类型降级策略（双重棘轮 + List 附加回退）**：
+   - 列级（insert_value）：`column_type` 标签一旦被设为 Object 即不可恢复；首值为 `None` 时后续跳过比较，最终由 `unwrap_or` 兜底
+   - 构建级（typed_column_to_series）：具体类型构建失败再兜底 `ObjectChunkedBuilder`
+   - List 附加（`DataType::List` 分支内）：内部子类型构建失败 → 用 `Object("unknown")` 重新构建
+   - **核心原则**：不做隐式类型强转（如 Int→Float），只做"向 Object 降级"，保证原始值无损
 
-3. **List 类型的脆弱性**：推断 List 内部类型时只取样第 2 个非 Nothing 元素；列中不同行的 List 子类型不一致会导致整列降级为 Object。
+3. **List 类型的脆弱边界**：推断列表内部类型时要求**过滤 Nothing 后至少有 2 个元素**；任何 1 元素列表、空列表、含单个非 Nothing 的列表都直接退化为 `List(Object)`；不同行之间的 List 子类型不一致触发整列降级。
 
-4. **Schema 优先原则**：显式指定的 schema 覆盖类型推断，决定列的最终类型；同时起到"列白名单"和"缺失列补 null"的作用。
+4. **Schema 优先原则**：显式指定的 schema 完全覆盖推断路径（`insert_value` 开头的 early return），决定列的最终类型；同时起到"列白名单"（schema 中不存在的列被跳过）和"缺失列补 null"的作用。
 
-5. **Lazy/Eager 透明转换**：`try_from_value_coerce` 按需将 DataFrame 转为 LazyFrame；`cache_and_to_value` 根据 `from_lazy` / `from_eager` 标记自动回退原始类型。
+5. **Lazy/Eager 透明转换**：`try_from_value_coerce` 按需将 DataFrame 转为 LazyFrame（用于 Sink 场景）；`cache_and_to_value` 根据 `from_lazy` / `from_eager` 布尔标记自动回退用户原始输入的类型。
 
-6. **Object 类型兜底**：所有无法映射到 Polars 原生类型的值都通过 `DataFrameValue` 包装存储，但失去 Polars 的向量化操作能力——Object 列上的计算会退化为逐值的 Rust 方法调用。
+6. **Object 类型兜底**：所有无法映射到 Polars 原生类型的值通过 `DataFrameValue` 包装存储，但失去 Polars 的 SIMD 向量化能力——Object 列上的计算退化为逐值的 Rust trait object 方法调用。
 
-7. **导出即物化（Avro 尤甚）**：Parquet/CSV/Arrow/NDJSON 的 Lazy 导出走 sink 流式管道，常量内存；Avro 无 sink 支持，Lazy 导出前必须 full collect，且完全不支持云存储。
+7. **导出即物化（Avro 尤甚）**：Parquet/CSV/Arrow/NDJSON 的 Lazy 导出走 sink 流式管道，内存常量级；Avro 无 sink 支持，Lazy 导出前必须 `full collect`，且因缺少 `FileWriteFormat` 变体完全不支持云存储。
 
 ### 7.3 常见转换场景
 
@@ -708,26 +741,26 @@ fn check_writing_into_source_file(metadata, dest) -> Result<(), ShellError> {
 
 ---
 
-## 八、代码参考索引
+## 八、代码参考索引（仓库根相对路径 · 可复核）
 
 | 模块 | 仓库相对路径 | 主要内容 |
 |------|-------------|----------|
-| 数据帧核心 | [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs) | NuDataFrame 结构及方法 |
-| 自定义值封装 | [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/custom_value.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/custom_value.rs) | CustomValue trait 实现 |
-| 类型转换（核心） | [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs) | Value ↔ Series 转换、List 推断、Object 降级 |
-| 值间运算 | [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/between_values.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/between_values.rs) | 数据帧运算及标量运算逻辑 |
-| 列运算 | [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/operations.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/operations.rs) | `compute_with_value` 等运算入口 |
-| LazyFrame | [crates/nu_plugin_polars/src/dataframe/values/nu_lazyframe/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_lazyframe/mod.rs) | NuLazyFrame 结构、collect、lazy() |
-| 数据类型 | [crates/nu_plugin_polars/src/dataframe/values/nu_dtype/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dtype/mod.rs) | NuDataType 及 `str_to_dtype` 解析 |
-| 数据模式 | [crates/nu_plugin_polars/src/dataframe/values/nu_schema/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/nu_schema/mod.rs) | NuSchema 及转换 |
-| 统一值类型 / Trait | [crates/nu_plugin_polars/src/dataframe/values/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/mod.rs) | PolarsPluginObject、CustomValueSupport |
-| 文件类型枚举 | [crates/nu_plugin_polars/src/dataframe/values/file_type.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/values/file_type.rs) | PolarsFileType 及 From<&str> |
-| 保存命令主逻辑 | [crates/nu_plugin_polars/src/dataframe/command/core/save/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/save/mod.rs) | SaveDF 命令、格式分支、云 URL 处理、Avro 拦截 |
-| CSV 保存 | [crates/nu_plugin_polars/src/dataframe/command/core/save/csv.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/save/csv.rs) | CSV eager / lazy sink 保存 |
-| Parquet 保存 | [crates/nu_plugin_polars/src/dataframe/command/core/save/parquet.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/save/parquet.rs) | Parquet eager / lazy sink 保存 |
-| Arrow/IPC 保存 | [crates/nu_plugin_polars/src/dataframe/command/core/save/arrow.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/save/arrow.rs) | Ipc eager / lazy sink 保存 |
-| NDJSON 保存 | [crates/nu_plugin_polars/src/dataframe/command/core/save/ndjson.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/save/ndjson.rs) | NDJson eager / lazy sink 保存 |
-| Avro 保存 | [crates/nu_plugin_polars/src/dataframe/command/core/save/avro.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/save/avro.rs) | Avro 仅本地 eager 保存（无 lazy、无云） |
-| 转 Nushell 值命令 | [crates/nu_plugin_polars/src/dataframe/command/core/to_nu.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/to_nu.rs) | `polars into-nu` 命令实现 |
-| 转 Lazy 命令 | [crates/nu_plugin_polars/src/dataframe/command/core/to_lazy.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/to_lazy.rs) | `polars into-lazy` 命令实现 |
-| Resource 抽象 | [crates/nu_plugin_polars/src/dataframe/command/core/resource.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/74-nushell/crates/nu_plugin_polars/src/dataframe/command/core/resource.rs) | 本地路径 / 云 URL 统一封装、cloud_options |
+| 数据帧核心 | [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/mod.rs) | NuDataFrame 结构、try_from_iter、lazy()、to_rows、print |
+| 自定义值封装 | [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/custom_value.rs](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/custom_value.rs) | CustomValue trait 实现、Uuid 缓存恢复、drop 通知 |
+| 类型转换（核心） | [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs) | insert_value、value_to_data_type、typed_column_to_series、value_to_series、ObjectChunkedBuilder、input_type_list_to_series、series_to_values |
+| 值间运算 | [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/between_values.rs](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/between_values.rs) | compute_series_single_value：数值/比较/布尔/字符串标量运算 & cast |
+| 列运算 | [crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/operations.rs](crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/operations.rs) | compute_with_value 运算入口、append、drop_nulls 等 |
+| LazyFrame | [crates/nu_plugin_polars/src/dataframe/values/nu_lazyframe/mod.rs](crates/nu_plugin_polars/src/dataframe/values/nu_lazyframe/mod.rs) | NuLazyFrame 结构、collect()、schema()、from_eager 标记 |
+| 数据类型 | [crates/nu_plugin_polars/src/dataframe/values/nu_dtype/mod.rs](crates/nu_plugin_polars/src/dataframe/values/nu_dtype/mod.rs) | NuDataType、str_to_dtype（15+ 种字符串解析）、dtype_to_value |
+| 数据模式 | [crates/nu_plugin_polars/src/dataframe/values/nu_schema/mod.rs](crates/nu_plugin_polars/src/dataframe/values/nu_schema/mod.rs) | NuSchema、add_missing_columns、与 IndexMap 互转 |
+| 统一值类型 / Trait | [crates/nu_plugin_polars/src/dataframe/values/mod.rs](crates/nu_plugin_polars/src/dataframe/values/mod.rs) | PolarsPluginObject（8 种变体）、CustomValueSupport、cache_and_to_value 自动回退 |
+| 文件类型枚举 | [crates/nu_plugin_polars/src/dataframe/values/file_type.rs](crates/nu_plugin_polars/src/dataframe/values/file_type.rs) | PolarsFileType、From<&str> 扩展名映射 |
+| 保存命令主逻辑 | [crates/nu_plugin_polars/src/dataframe/command/core/save/mod.rs](crates/nu_plugin_polars/src/dataframe/command/core/save/mod.rs) | SaveDF PluginCommand、全格式 match 分支、云 URL 处理、Avro 拦截、check_writing_into_source_file |
+| CSV 保存 | [crates/nu_plugin_polars/src/dataframe/command/core/save/csv.rs](crates/nu_plugin_polars/src/dataframe/command/core/save/csv.rs) | CSV CsvWriter eager / sink lazy 双模式 |
+| Parquet 保存 | [crates/nu_plugin_polars/src/dataframe/command/core/save/parquet.rs](crates/nu_plugin_polars/src/dataframe/command/core/save/parquet.rs) | ParquetWriter eager / sink lazy 双模式 |
+| Arrow/IPC 保存 | [crates/nu_plugin_polars/src/dataframe/command/core/save/arrow.rs](crates/nu_plugin_polars/src/dataframe/command/core/save/arrow.rs) | IpcWriter eager / sink lazy 双模式 |
+| NDJSON 保存 | [crates/nu_plugin_polars/src/dataframe/command/core/save/ndjson.rs](crates/nu_plugin_polars/src/dataframe/command/core/save/ndjson.rs) | JsonWriter eager / sink lazy 双模式 |
+| Avro 保存 | [crates/nu_plugin_polars/src/dataframe/command/core/save/avro.rs](crates/nu_plugin_polars/src/dataframe/command/core/save/avro.rs) | AvroWriter 仅本地 eager（无 command_lazy、无云支持） |
+| 转 Nushell 值命令 | [crates/nu_plugin_polars/src/dataframe/command/core/to_nu.rs](crates/nu_plugin_polars/src/dataframe/command/core/to_nu.rs) | `polars into-nu`：DataFrame/LazyFrame(collect) → Value::List |
+| 转 Lazy 命令 | [crates/nu_plugin_polars/src/dataframe/command/core/to_lazy.rs](crates/nu_plugin_polars/src/dataframe/command/core/to_lazy.rs) | `polars into-lazy`：DataFrame → NuLazyFrame |
+| Resource 抽象 | [crates/nu_plugin_polars/src/dataframe/command/core/resource.rs](crates/nu_plugin_polars/src/dataframe/command/core/resource.rs) | 本地路径 / 云 URL 统一封装、cloud_options、as_path_buf / as_string |
