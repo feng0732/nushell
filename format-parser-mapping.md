@@ -52,13 +52,13 @@
 | 浮点数 / 科学计数 | `Value::F64(f64)` | `Value::Float(f64)` | f64 原生精度 |
 | 字符串 | `Value::String(String)` | `Value::String(String)` | — |
 | 数组 | `Value::Array(Vec<Value>)` | `Value::List(Vec<Value>)` | 递归转换 |
-| 对象 | `Value::Object(Map<String, Value>)` | `Value::Record(Record)` | 键必须为字符串；保持插入顺序（`preserve_order` feature 启用 `LinkedHashMap`，否则 `BTreeMap` 按字典序） |
+| 对象 | `Value::Object(Map<String, Value>)` | `Value::Record(Record)` | 键必须为字符串；默认启用 `preserve_order` feature，使用 `LinkedHashMap` 保持插入顺序 |
 
 ### 2.4 关键策略
 
 1. **U64 溢出降级**：`u64 > i64::MAX`（即 ≥ 9223372036854775808）时强制转为 `f64`，大整数高位可能丢失。见 [nu_value.rs#L17-L20](crates/nu-json/src/nu_value.rs#L17-L20)。
 2. **NDJSON 支持**：`--objects` 逐行解析，空行跳过，每行错误包装为 `Value::Error`。
-3. **对象键顺序**：取决于是否启用 `preserve_order` feature。
+3. **对象键顺序**：[`nu-json/Cargo.toml#L21`](crates/nu-json/Cargo.toml#L21-L21) 中 `default = ["preserve_order"]`，默认启用，使用 `LinkedHashMap` 保持插入顺序。
 
 ---
 
@@ -263,7 +263,7 @@ XML 被统一转换为三列 Record 结构，所有节点都是 `{tag, attrs, co
 1. **无上下文推断**：不做跨列/跨行的一致性分析，每行独立解析。
 2. **精度**：整数走 i64，浮点走 f64，与 JSON 相同。
 3. **空字符串**：`""` 既不匹配 Int 也不匹配 Float，最终为 String（非 Nothing）。
-4. **前导零**：`"0123"` 通常 `parse::<i64>` 成功（Rust 允许前导零），会被解析为 Int(123)。
+4. **前导零**：`"0123"` 会被解析为 **Float(123.0)**。因为 Rust 的 `i64::from_str` **不允许前导零**，`"0123".parse::<i64>()` 返回 `Err(InvalidDigit)`，回退到 `parse::<f64>()` 成功。
 
 ---
 
@@ -367,8 +367,8 @@ KDL 采用**固定的四列 Record** 表示每个节点（顶层为 List，因�
 | **CellPath** | — | — | — | — | CellPath* | — | — | — | — |
 | **注释** | 支持 | 不支持 | 支持 | 支持 | 支持 | 可选 | 可选 | 支持 | — |
 | **尾随逗号** | 支持 | 不支持 | — | — | 不支持 | — | — | — | — |
-| **数字溢出策略** | 降级 f64 | 降级 f64 | 失败 | 无此情况 | 失败(CheckedMul) | — | String (不溢出) | 失败 | 失败 |
-| **列/键顺序** | 依赖 feature | 依赖 feature | IndexMap 顺序 | 插入顺序 | 插入顺序 | 文档顺序 | 行/列顺序 | 出现顺序 | 插入顺序 |
+| **数字溢出策略** | 降级 f64 | 降级 f64 | 失败 | 无此情况 | 失败(CheckedMul) | — | 降级 f64 | 失败 | 失败 |
+| **列/键顺序** | 插入顺序（默认 preserve_order） | 插入顺序（默认 preserve_order） | IndexMap 顺序 | 插入顺序 | 插入顺序 | 文档顺序 | 行/列顺序 | 出现顺序 | 插入顺序 |
 | **推断型解析** | 否 | 否 | 否 | 否 | 否 | 否 | **是(层级:Int→Float→String)** | 否 | 否 |
 
 > * 标注：
@@ -392,7 +392,7 @@ KDL 采用**固定的四列 Record** 表示每个节点（顶层为 List，因�
 | KDL (i128) | `Error`（`to_i64()` 失败） | `Error` |
 | MessagePack U64 | `Error`（`try_into` i64 失败） | `Error` |
 | CSV `--no-infer` | `String("9223372036854775808")` | `String("18446744073709551615")` |
-| CSV 默认 | `Float(9.223e18)`（**丢失精度**） | 取决于 parse::<i64> 失败后是否可 f64 解析 → `Float`（丢失） |
+| CSV 默认 | `Float(9.223e18)`（**丢失精度**） | `Float(1.844e19)`（**丢失精度**） |
 
 ### 11.2 相同数字字符串在不同格式中的结果
 
@@ -421,8 +421,8 @@ KDL 采用**固定的四列 Record** 表示每个节点（顶层为 List，因�
 | 格式 | 键顺序保证 |
 |---|---|
 | NUON / TOML / YAML / KDL / XML | 源码/文档中出现的顺序 |
-| JSON (preserve_order feature) | 插入顺序 |
-| JSON (默认 BTreeMap) | **字典序（不是插入顺序）** |
+| JSON（默认，preserve_order 启用） | **插入顺序**（默认 feature，使用 LinkedHashMap） |
+| JSON（关闭 preserve_order） | 字典序（使用 BTreeMap，非默认） |
 | CSV (列名) | 第一行中出现的顺序 |
 | MessagePack Map | 序列化时的顺序 |
 
