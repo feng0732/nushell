@@ -68,25 +68,91 @@ let right_prompt_string = get_prompt_string(PROMPT_COMMAND_RIGHT, config, engine
 
 **渲染时**在 [render_prompt_right()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L107-L118) 中读取缓存，逻辑与左区域对称。
 
-### 2.3 右区域位置控制
+### 2.3 多行场景分类：两种「多行」概念
 
-通过配置项 `render_right_prompt_on_last_line` 控制右 prompt 渲染位置：
+在分析右 prompt 定位方式之前，必须先区分两种完全不同的「多行」场景，这是最容易混淆的地方：
+
+| 场景 | 触发原因 | 涉及的核心方法 | 配置项 |
+|------|---------|---------------|--------|
+| **场景 A：左 Prompt 本身多行** | `PROMPT_COMMAND` 返回的字符串包含 `\n` | `render_prompt_left()` / `render_prompt_right()` | `render_right_prompt_on_last_line` |
+| **场景 B：用户输入多行** | 未闭合括号、引号、或 `\` 换行 | `render_prompt_multiline_indicator()` | `PROMPT_MULTILINE_INDICATOR` 环境变量 |
+| **场景 C：A + B 组合** | 左 prompt 多行 + 用户输入多行 | 上述所有方法 | 上述所有配置 |
+
+### 2.4 场景 A：右 Prompt 在左 Prompt 多行时的定位
+
+配置项 `render_right_prompt_on_last_line` **仅在左 Prompt 本身是多行时生效**。配置文档定义在 [doc_config.nu](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-utils/src/default_files/doc_config.nu#L506-L510)：
+
+```
+# render_right_prompt_on_last_line (bool): Right prompt position with multi-line left prompt.
+# true: Right prompt appears on the last line of the left prompt.
+# false: Right prompt appears on the first line.
+# Default: false
+```
 
 - **配置定义**：[config/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-protocol/src/config/mod.rs#L74)
+- **字段存储**：[prompt.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L18) 中的 `render_right_prompt_on_last_line: bool`
 - **渲染时查询**：[right_prompt_on_last_line()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L158-L160)
 
+**定位方式图解（左 Prompt 为两行的情况）：**
+
 ```
-render_right_prompt_on_last_line = false:
+情况 1: render_right_prompt_on_last_line = false（默认值）
+右 prompt 与左 prompt 的「第一行」对齐
 
-    [left prompt]  [command input]                [right prompt]
-    /home/user>   echo "hello"                   10:30 AM
+    ┌──────────── 左 Prompt 第一行 ────────────┐    ┌─ 右 Prompt ─┐
+    │  user@host  ~/projects/nushell (main)    │    │ 10:30:45 AM │
+    ├──────────── 左 Prompt 第二行 ────────────┤    └─────────────┘
+    │ ❯ echo "hello world"                     │
+    └──────────────────────────────────────────┘
 
-render_right_prompt_on_last_line = true:
 
-    [left prompt]  [command input]
-    /home/user>   echo "hello"                    [right prompt]
-                                                 10:30 AM
+情况 2: render_right_prompt_on_last_line = true
+右 prompt 与左 prompt 的「最后一行」对齐
+
+    ┌──────────── 左 Prompt 第一行 ────────────┐
+    │  user@host  ~/projects/nushell (main)    │
+    ├──────────── 左 Prompt 第二行（最后一行）──┤    ┌─ 右 Prompt ─┐
+    │ ❯ echo "hello world"                     │    │ 10:30:45 AM │
+    └──────────────────────────────────────────┘    └─────────────┘
 ```
+
+**reedline 内部的实现原理（推断，基于 trait 方法签名）：**
+
+`Prompt` trait 提供了两个独立的方法，reedline 根据 `right_prompt_on_last_line()` 的返回值决定右 prompt 的垂直位置：
+
+```rust
+// NushellPrompt 作为 reedline::Prompt 的实现
+pub trait Prompt {
+    fn render_prompt_left(&self) -> Cow<'_, str>;    // 返回左 prompt 字符串（可能包含 \n）
+    fn render_prompt_right(&self) -> Cow<'_, str>;   // 返回右 prompt 字符串
+    fn right_prompt_on_last_line(&self) -> bool;     // 告诉 reedline：右 prompt 放哪一行
+    // ... 其他方法
+}
+```
+
+reedline 的渲染引擎逻辑：
+1. 调用 `render_prompt_left()`，按 `\n` 分割得到 N 行左 prompt
+2. 调用 `right_prompt_on_last_line()` 获取定位模式
+3. 若返回 `false` → 右 prompt 放在行号 0（第一行）的最右侧
+4. 若返回 `true` → 右 prompt 放在行号 N-1（最后一行）的最右侧
+5. 用户输入内容始终追加在左 prompt 最后一行的末尾
+
+### 2.5 换行符转换处理
+
+在 `render_prompt_left()` 和 `render_prompt_right()` 中，都会将 `\n` 替换为 `\r\n`：
+
+```rust
+prompt_string.replace('\n', "\r\n").into()
+```
+
+这确保了：
+1. 左 prompt 包含的显式换行（场景 A）在终端中正确回车换行
+2. 右 prompt 如果包含换行，同样会被正确转换为多行右 prompt
+3. 跨平台兼容（Windows 需要 `\r\n`，Unix 只需要 `\n`，但终端通常都接受 `\r\n`）
+
+**重要：** 换行符转换发生在「渲染时」而非「求值时」，这意味着：
+- 求值阶段存储在 `left_prompt: Option<String>` 中的是原始字符串（包含 `\n`）
+- 每次 `render_prompt_*()` 调用时才进行替换（虽然替换结果相同，但这是 reedline 要求的接口返回格式）
 
 ## 三、回退（Fallback）逻辑详解
 
@@ -198,38 +264,173 @@ render_prompt_*() 调用时         回退到 DefaultPrompt
       返回缓存字符串             或默认 indicator
 ```
 
-## 四、多行表现（Multiline）
+## 四、多行表现（Multiline）完整分析
 
-### 4.1 多行 Indicator 的求值
+本章节完整分析三种多行场景下的布局表现。
 
-**渲染前**在 [update_prompt()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt_update.rs#L105-L106) 中求值：
+### 4.1 场景 B：用户输入多行（Multiline Input）
+
+当用户输入未闭合的括号、引号或使用 `\` 进行续行时，**reedline 解析器检测到语法未闭合**，自动进入多行输入模式。
+
+#### 4.1.1 多行 Indicator 的求值
+
+**渲染前**在 [update_prompt()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt_update.rs#L105-L106) 中求值（与其他 prompt 组件同时求值）：
 
 ```rust
 let prompt_multiline_string =
     get_prompt_string(PROMPT_MULTILINE_INDICATOR, config, engine_state, stack);
 ```
 
-**渲染时**在 [render_prompt_multiline_indicator()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L134-L141) 中使用，默认值为 `"::: "`。
+**渲染时**在 [render_prompt_multiline_indicator()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L134-L141) 中调用，默认值为 `"::: "`：
 
-### 4.2 多行输入的显示效果
-
-当用户输入未闭合的括号、引号或使用 `\` 换行时，reedline 进入多行编辑模式：
-
-```
-# 普通单行模式
-/home/user> echo "hello world"
-           ↑
-     render_prompt_indicator() 返回 "> "
-
-# 多行模式
-/home/user> echo "hello
-::: world
-::: second line"
-           ↑
-     render_prompt_multiline_indicator() 返回 "::: "
+```rust
+fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+    let indicator = match &self.multiline_indicator {
+        Some(indicator) => indicator.as_str(),
+        None => "::: ",  // 硬编码默认回退值
+    };
+    indicator.to_string().into()
+}
 ```
 
-### 4.3 换行符处理
+#### 4.1.2 单行输入 vs 多行输入的 Indicator 切换
+
+**关键区别：** `render_prompt_indicator()` vs `render_prompt_multiline_indicator()`
+
+| 方法 | 调用时机 | 典型返回值 |
+|------|---------|-----------|
+| `render_prompt_indicator(edit_mode)` | 第一行输入，且语法未进入多行时 | `"> "` 或 `": "`（VI insert） |
+| `render_prompt_multiline_indicator()` | 第 2..=N 行输入，reedline 判定需要续行时 | `"::: "` 或用户自定义值 |
+
+**触发多行模式的条件（由 reedline 内部判定）：**
+1. 未闭合的双引号 `"` 或单引号 `'`
+2. 未闭合的括号 `()`, `[]`, `{}`
+3. 行末尾的反斜杠 `\` 续行符
+4. 管道符 `|` 出现在行末
+
+#### 4.1.3 右 Prompt 在用户输入多行时的定位
+
+当**左 Prompt 是单行**，但用户输入进入多行时，右 Prompt 的定位行为：
+
+```
+配置: render_right_prompt_on_last_line = false（默认）
+左 Prompt: 单行
+用户输入: 多行
+
+    ┌─ 左 Prompt ─┐
+    │ /home/user> │ echo "line one           ┌─ 右 Prompt ─┐
+    │             │                        │ │ 10:30:45 AM │
+    │     :::     │   line two             │ └─────────────┘
+    │     :::     │   line three"          │
+    └─────────────┘                        └───────────────┘
+                    ↑                          ↑
+            右 prompt 位置不变，始终        因为左 prompt 只有一行，
+            与左 prompt 的第一行对齐        所以 true/false 无区别
+```
+
+**结论：** 当左 Prompt 是单行时，`render_right_prompt_on_last_line` 对用户输入的多行模式**没有影响**，因为左 Prompt 只有一行，「第一行」和「最后一行」是同一行。
+
+### 4.2 场景 C：左 Prompt 多行 + 用户输入多行（组合场景）
+
+这是最复杂的场景，两种多行同时发生。下面图解两种配置下的差异：
+
+#### 4.2.1 配置 render_right_prompt_on_last_line = false（默认）
+
+```
+左 Prompt: 2 行（用户信息行 + 指示符行）
+右 Prompt: 对齐左 Prompt「第一行」
+用户输入: 3 行（未闭合字符串）
+
+    ┌──────────── 左 Prompt 第一行 ────────────┐    ┌─ 右 Prompt ─┐
+    │  user@host  ~/projects (main)            │    │ 10:30:45 AM │
+    ├──────────── 左 Prompt 第二行（最后一行）──┤    └─────────────┘
+    │ ❯ echo "This is a very long string that   │
+    │     spans across multiple                 │
+    │     lines"                                │
+    └───────────────────────────────────────────┘
+
+行 1: 左 Prompt 两行 + 用户输入第 1 行
+行 2: 无左 Prompt，只显示多行 indicator + 用户输入第 2 行
+行 3: 无左 Prompt，只显示多行 indicator + 用户输入第 3 行
+右 Prompt: 始终对齐左 Prompt 第一行（最顶部）
+```
+
+#### 4.2.2 配置 render_right_prompt_on_last_line = true
+
+```
+左 Prompt: 2 行
+右 Prompt: 对齐左 Prompt「最后一行」（即指示符所在行）
+用户输入: 3 行
+
+    ┌──────────── 左 Prompt 第一行 ────────────┐
+    │  user@host  ~/projects (main)            │
+    ├──────────── 左 Prompt 第二行（最后一行）──┤    ┌─ 右 Prompt ─┐
+    │ ❯ echo "This is a very long string that   │    │ 10:30:45 AM │
+    │     spans across multiple                 │    └─────────────┘
+    │     lines"                                │
+    └───────────────────────────────────────────┘
+
+行 1: 左 Prompt 第一行（无用户输入，无右 prompt）
+行 2: 左 Prompt 第二行 + 用户输入第 1 行 + 右 Prompt
+行 3: 多行 indicator + 用户输入第 2 行
+行 4: 多行 indicator + 用户输入第 3 行
+右 Prompt: 对齐左 Prompt 最后一行（与指示符和输入第一行同行）
+```
+
+#### 4.2.3 多行 Indicator 与左 Prompt 的对齐关系
+
+在多行输入模式中，第 2..N 行的多行 indicator **并不继承左 Prompt 的宽度**，而是独立显示：
+
+```
+左 Prompt 宽度计算（最后一行）:
+    "  user@host ~/projects (main)  \n❯ "
+                                    ↑
+                              这里是最后一行的起点，indicator 从这里开始对齐
+
+实际上 reedline 做了宽度对齐：
+    ❯ echo "hello          ← 左 prompt 最后一行的起始列: col = X
+    ::: world              ← 多行 indicator 也从 col = X 开始
+    ::: second line"       ← 多行 indicator 始终对齐到同一列
+```
+
+这意味着：
+1. `render_prompt_multiline_indicator()` 返回的字符串只负责显示内容（如 `"::: "`）
+2. 该字符串的**水平位置由 reedline 自动计算**，对齐到左 Prompt 最后一行的指示符列
+3. 用户不需要自己在 multiline indicator 中添加填充空格
+
+### 4.3 右 Prompt 本身多行（Right Prompt Contains Newlines）
+
+右 Prompt 也可以包含换行（虽然不常见），此时的行为由 reedline 处理：
+
+```
+右 prompt 返回: "10:30:45 AM\nCPU: 23%"
+
+    ┌─ 左 Prompt ─┐    ┌─ 右 Prompt 第 1 行 ─┐
+    │ /home/user> │    │     10:30:45 AM     │
+    │             │    ├─ 右 Prompt 第 2 行 ─┤
+    │             │    │       CPU: 23%      │
+    └─────────────┘    └──────────────────────┘
+```
+
+这种情况下：
+- 右 Prompt 的行锚点仍然是 `right_prompt_on_last_line()` 决定的那一行（第一行或最后一行）
+- 右 Prompt 的多行向「下方」延伸
+- 如果右 Prompt 行数过多超过终端，可能被截断或溢出
+
+### 4.4 布局叠加总结表
+
+| 场景 | 左 Prompt 行数 | 用户输入行数 | `right_prompt_on_last_line` | 右 Prompt 锚点行 |
+|------|--------------|------------|----------------------------|----------------|
+| 单行 | 1 | 1 | false | 左 Prompt 第 1 行 |
+| 单行 | 1 | 1 | true | 左 Prompt 第 1 行（同 false） |
+| 左多行 | 2 | 1 | false | 左 Prompt 第 1 行（顶部） |
+| 左多行 | 2 | 1 | true | 左 Prompt 第 2 行（底部） |
+| 单行+输入多行 | 1 | 3 | false | 左 Prompt 第 1 行（顶部） |
+| 单行+输入多行 | 1 | 3 | true | 左 Prompt 第 1 行（同 false） |
+| 左多行+输入多行 | 2 | 3 | false | 左 Prompt 第 1 行（顶部） |
+| 左多行+输入多行 | 2 | 3 | true | 左 Prompt 第 2 行（底部） |
+
+### 4.5 换行符转换处理
 
 在 `render_prompt_left()` 和 `render_prompt_right()` 中，会将 `\n` 替换为 `\r\n`：
 
@@ -237,7 +438,15 @@ let prompt_multiline_string =
 prompt_string.replace('\n', "\r\n").into()
 ```
 
-这确保了 prompt 本身包含换行时（如多行 prompt）在终端中正确显示。
+这确保了：
+1. 左 prompt 包含的显式换行（场景 A）在终端中正确回车换行
+2. 右 prompt 如果包含换行，同样会被正确转换为多行右 prompt（场景 4.3）
+3. 跨平台兼容（Windows 需要 `\r\n`，Unix 只需要 `\n`，但终端通常都接受 `\r\n`）
+
+**重要：** 换行符转换发生在「渲染时」而非「求值时」，这意味着：
+- 求值阶段存储在 `left_prompt: Option<String>` 中的是原始字符串（包含 `\n`）
+- 每次 `render_prompt_*()` 调用时才进行替换（虽然替换结果相同，但这是 reedline 要求的接口返回格式）
+- `render_prompt_multiline_indicator()` **不做** 换行符转换（multiline indicator 不应包含换行）
 
 ## 五、完整的 REPL 迭代流程
 
@@ -346,8 +555,42 @@ if let Some(s) = get_prompt_string(TRANSIENT_PROMPT_COMMAND, ...) {
 - 右 prompt 有额外的颜色重置保护（`\x1b[0m`）
 - 右 prompt 位置可配置是否显示在最后一行
 
-### 8.4 多行 vs 单行
+### 8.4 两种「多行」的本质区别
 
-- 多行 indicator 是独立求值的，可单独配置
-- 多行模式由 reedline 根据语法分析自动触发
-- 多行 indicator 仅在换行后显示
+这是最容易混淆的点，**必须明确区分：**
+
+| 对比项 | 场景 A：左 Prompt 本身多行 | 场景 B：用户输入多行 |
+|--------|--------------------------|-------------------|
+| **定义** | `PROMPT_COMMAND` 返回的字符串包含 `\n` | 用户输入语法未闭合，reedline 进入续行模式 |
+| **控制权** | 完全由用户配置决定 | 由 reedline 解析器自动判定 |
+| **右 prompt 锚点** | 由 `render_right_prompt_on_last_line` 控制：第一行 or 最后一行 | **不受配置影响**，始终与左 Prompt 第一行/最后一行对齐（同左 Prompt 行数决定） |
+| **Indicator** | 每行都有左 prompt 的完整内容 | 只有第一行有左 prompt + indicator，后续行只有 multiline indicator |
+| **水平对齐** | 各行独立渲染，reedline 负责 `\n` 换行 | multiline indicator 对齐到左 prompt 最后一行的指示符列 |
+| **配置项** | `render_right_prompt_on_last_line` | `PROMPT_MULTILINE_INDICATOR` |
+
+### 8.5 render_right_prompt_on_last_line 生效条件
+
+**口诀：只有左 Prompt 有多行，配置才有用。**
+
+| 左 Prompt 行数 | 配置值 | 实际效果 |
+|--------------|--------|---------|
+| 1 行（普通 prompt） | false | 右 prompt 在第一行 = 最后一行，无区别 |
+| 1 行（普通 prompt） | true | 右 prompt 在第一行 = 最后一行，无区别 |
+| 2+ 行（复杂 prompt） | false | 右 prompt 在最顶部第一行 |
+| 2+ 行（复杂 prompt） | true | 右 prompt 在最底部最后一行（与输入行同行） |
+
+### 8.6 换行符转换的时机
+
+- **`\n` → `\r\n` 转换在渲染时发生**，不在求值时
+- 求值阶段 `left_prompt` 字段存储的是原始字符串（含 `\n`）
+- `render_prompt_left/right()` 每次调用都执行替换（虽然结果可缓存，但接口要求每次返回 Cow）
+- `render_prompt_multiline_indicator()` **不做**此转换（multiline indicator 理论上不应有换行）
+- `render_prompt_indicator()` **也不做**此转换
+
+### 8.7 multiline indicator 的常见误解
+
+❌ **错误理解**：multiline indicator 需要自己填充空格来对齐到指示符列
+✅ **正确理解**：reedline 自动计算水平偏移，multiline indicator 只需返回显示内容（如 `"::: "`），位置由 reedline 控制
+
+❌ **错误理解**：multiline indicator 每行的内容可以不同
+✅ **正确理解**：multiline indicator 在一次 read_line() 调用期间是固定值，所有续行显示相同的 indicator
