@@ -20,7 +20,7 @@ Source bytes
 1. **词法分析** `lex()` — 字节流 → Token 流
 2. **轻量语法分析** `lite_parse()` — Token 流 → LiteBlock
 3. **语法 → AST** `parse_block()` — LiteBlock → Block（AST 顶层容器）
-4. **IR 编译** `compile_block()` — Block → IrBlock（仅无错时执行）
+4. **IR 编译** `compile_block()` — Block → IrBlock（仅无解析错误时执行）
 5. **闭包捕获分析** `discover_captures_in_closure()` — 遍历 AST 计算变量捕获
 
 ---
@@ -71,13 +71,40 @@ pub struct Token {
 
 **关键设计**：词法层不关心语法结构，只负责把字节流切成带语义标签的片段。它通过 `block_level` 跟踪嵌套来正确处理跨行表达式，但不理解"这是什么语句"。
 
-### 错误产生
+### 词法层的错误记录边界
 
-词法层产生的错误主要是结构性问题：
-- `UnexpectedEof` — 未闭合的字符串或定界符
-- `Unbalanced` — 不匹配的闭合定界符（如 `}` 遇到开 `{`）
+**错误载体**：`Option<ParseError>` — 通过函数返回值携带，**不访问 `StateWorkingSet`**。
 
-这些错误被记录到 `LexState.error` 中，但扫描不会停止——`lex_internal()` 会继续产出后续 token，这是第一层错误恢复机制。
+函数签名：
+```rust
+pub fn lex(input: &[u8], ...) -> (Vec<Token>, Option<ParseError>)
+fn lex_item(...) -> (Token, Option<ParseError>)
+```
+
+**累积方式**：只保留**第一个**错误。
+
+[lex_internal()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/lex.rs#L538-L695) 中：
+```rust
+let (token, err) = lex_item(...);
+if state.error.is_none() {  // 仅当当前无错时才更新
+    state.error = err;
+}
+```
+
+同样，`;` 处检查不完整管道时也用 `if !is_complete && state.error.is_none()` 保护，确保只记录第一个错误。
+
+**错误类型**：
+- `UnexpectedEof` — 未闭合的字符串或转义序列（文件末尾仍未闭合）
+- `Unbalanced` — 不匹配的闭合定界符（如 `}` 对应不到 `{`）
+- `ExtraTokens` — 管道不完整时遇到 `;`
+
+**与下一层的边界**：词法层的错误由 [parse()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_captures_compile.rs#L535-L538) 注入到全局错误列表：
+```rust
+let (output, err) = lex(contents, new_span.start, &[], &[], false);
+if let Some(err) = err {
+    working_set.error(err)  // 注入到 StateWorkingSet.parse_errors
+}
+```
 
 ---
 
@@ -131,16 +158,40 @@ TokenContents::OutGreaterThan 等 → 设置 file_redirection 期望态
 
 **续行机制**：当 `Eol` 之前有 `Pipe` token 时，`Eol` 不终结 pipeline，实现了跨行管道。`last_non_comment_token()` 函数跳过注释行来查找真正的管道符。
 
-### 错误恢复
+### 轻量语法层的错误记录边界
 
-lite_parse 的错误恢复策略是**记录错误但不中断**：
+**错误载体**：`Option<ParseError>` — 通过函数返回值携带。
 
-1. 重定向缺少目标 → 记录 `ParseError::Expected("redirection target")`，把重定向 span 当作普通 part 推入
-2. 多重重定向 → 记录 `ParseError::MultipleRedirections`，保留第一个重定向
-3. 管道末尾缺少后续 → 最终检查时返回 `ParseError::UnexpectedEof("pipeline missing end")`
-4. `||` → 记录 `ParseError::ShellOrOr`，但把它当作普通 part 继续解析
+函数签名：
+```rust
+pub fn lite_parse(tokens: &[Token], working_set: &StateWorkingSet) -> (LiteBlock, Option<ParseError>)
+```
 
-关键点：**即使出错，lite_parse 仍然会产出一个（可能不完整的）LiteBlock**，下游可以继续处理。
+注意：`working_set` 是 **不可变引用**（`&StateWorkingSet`），lite_parse **不修改**全局错误列表。它只用于读取（如查询内置命令信息等）。
+
+**累积方式**：也是只保留**第一个**错误，使用 `Option::or()` 语义：
+```rust
+error = error.or(Some(ParseError::Expected("redirection target", token.span)));
+error = error.or(Some(ParseError::ShellOrOr(token.span)));
+```
+
+如果已有错误（`error.is_some()`），新错误被丢弃。
+
+**错误类型**：
+- `Expected("redirection target", _)` — 重定向后缺少目标文件
+- `ShellOrOr` — 遇到 `||`（shell 风格的逻辑或，nushell 不支持）
+- `MultipleRedirections` — 同一命令出现多重重定向
+- `UnexpectedEof("pipeline missing end")` — 管道末尾缺少后续命令
+
+**恢复行为**：即使出错，也会把有问题的 span 作为普通 part 推入命令，保证 LiteBlock 结构完整。
+
+**与下一层的边界**：lite_parse 的错误由 [parse_block()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_pipelines.rs#L118-L121) 注入到全局错误列表：
+```rust
+let (lite_block, err) = lite_parse(tokens, working_set);
+if let Some(err) = err {
+    working_set.error(err);  // 注入到 StateWorkingSet.parse_errors
+}
+```
 
 ---
 
@@ -290,29 +341,57 @@ tokens → lite_parse() → LiteBlock
 
 这意味着 Nushell 的解析器不是传统的"一次性 lex 完再 parse"，而是**按需 lex**——某些复合结构会在解析时重新对子区域执行词法分析。
 
+### AST 构建层的错误记录边界
+
+**错误载体**：`StateWorkingSet.parse_errors: Vec<ParseError>` — 全局累积列表，**所有 AST 层函数共享**。
+
+全局状态定义在 [state_working_set.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-protocol/src/engine/state_working_set.rs)：
+```rust
+pub struct StateWorkingSet<'a> {
+    // ...
+    pub parse_errors: Vec<ParseError>,
+    pub parse_warnings: Vec<ParseWarning>,
+    pub compile_errors: Vec<CompileError>,
+}
+```
+
+通过方法追加：
+```rust
+pub fn error(&mut self, parse_error: ParseError) {
+    self.parse_errors.push(parse_error)
+}
+```
+
+**累积方式**：**全部追加**，不丢弃。每个解析函数都接收 `&mut StateWorkingSet`，发现错误时调用 `working_set.error(err)` 追加后继续执行。
+
+函数签名的典型模式：
+```rust
+pub fn parse_value(working_set: &mut StateWorkingSet, span: Span, shape: &SyntaxShape) -> Expression
+pub fn parse_pipeline(working_set: &mut StateWorkingSet, pipeline: &LitePipeline) -> Pipeline
+pub fn parse_block(working_set: &mut StateWorkingSet, ...) -> Block
+```
+
+**没有 `Result` 返回**——函数始终返回有效的 AST 节点，错误通过 side channel 传递。
+
 ---
 
-## 错误恢复机制
+## 错误恢复机制详解
 
-Nushell 的错误恢复贯穿三个层次，核心理念是**继续解析，不因错误中断**：
+Nushell 的错误恢复贯穿三个层次，每层有独立的错误载体和恢复策略。核心理念是**继续解析，不因错误中断**。
 
-### 1. 词法层恢复
+### 三层错误载体对比
 
-- 未闭合字符串/定界符 → 产生 `UnexpectedEof` 错误但仍产出 token
-- 不匹配的闭合符 → 产生 `Unbalanced` 错误但仍推进 offset
-- 错误仅记录第一个（`state.error`），后续错误被覆盖
+| 层次 | 错误载体 | 累积方式 | 访问 WorkingSet | 注入到全局的位置 |
+|---|---|---|---|---|
+| 词法层 | `Option<ParseError>`（返回值） | 只保留第一个 | 不访问 | `parse()` 第 536-538 行 |
+| 轻量语法层 | `Option<ParseError>`（返回值） | 只保留第一个 | 只读（`&StateWorkingSet`） | `parse_block()` 第 118-121 行 |
+| AST 构建层 | `Vec<ParseError>`（`StateWorkingSet` 字段） | 全部追加 | 可变（`&mut StateWorkingSet`） | 直接追加 |
 
-### 2. 轻量语法层恢复
+**关键区别**：词法层和轻量语法层各自独立记录错误（都只记第一个），它们的错误由上层调用方注入到全局 `parse_errors` 中。AST 层则直接操作全局列表，可以累积多个错误。
 
-- 重定向缺少目标 → 错误记录，span 作为普通 part 继续
-- 管道后缺少命令 → 最终统一检查，产出 `UnexpectedEof`
-- 始终产出完整的 `LiteBlock` 结构，即使内部有错误
+### AST 层的错误恢复策略
 
-### 3. AST 构建层恢复
-
-这是错误恢复最丰富的层次，有几种核心策略：
-
-#### a) Garbage 节点替代
+#### 策略一：Garbage 节点替代
 
 [garbage()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_helpers.rs#L5-L7) 函数产出一个 `Expr::Garbage` 表达式，类型为 `Type::Any`：
 
@@ -327,9 +406,9 @@ pub fn garbage(working_set: &mut StateWorkingSet, span: Span) -> Expression {
 - 类型不匹配的参数 → 用 `Garbage` 替换
 - 语法错误 → 整个 span 替换为 `Garbage`
 
-#### b) 错误累积，不中断
+#### 策略二：错误累积，不中断
 
-`StateWorkingSet.parse_errors` 是一个 `Vec<ParseError>`，通过 `working_set.error()` 追加错误但不返回 `Result`。解析函数的签名几乎全部返回值本身（`Expression`、`Pipeline`、`Block`），而非 `Result`：
+解析函数的签名几乎全部返回值本身（`Expression`、`Pipeline`、`Block`），而非 `Result`：
 
 ```rust
 // 典型模式
@@ -339,25 +418,103 @@ if bad_condition {
 }
 ```
 
-#### c) 试错回溯（Speculative Parsing）
+这确保了无论解析过程中遇到多少错误，最终总能产出一个结构完整的 AST。
 
-`parse_value()` 在 `SyntaxShape::Any` 模式下，对多种候选形状逐一尝试，通过 `working_set.parse_errors.len()` 快照来判断是否成功：
+#### 策略三：试错回溯（Speculative Parsing）
+
+当解析器遇到歧义（不知道该按哪种语法形状解析）时，会依次尝试多种可能性，通过 `parse_errors` 的长度快照判断哪种尝试"更成功"。
+
+**情形一：`parse_value(SyntaxShape::Any)` — 按顺序尝试，首个成功即返回**
+
+[parse_value()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L889-L928) 中的 `Any` 分支：
 
 ```rust
-let starting_error_count = working_set.parse_errors.len();
-let s = parse_value(working_set, span, shape);
-if starting_error_count == working_set.parse_errors.len() {
-    return s;  // 无新错误 → 成功
+let shapes = [Binary, Range, Filesize, Duration, DateTime, Int, Number, String];
+for shape in shapes.iter() {
+    let starting_error_count = working_set.parse_errors.len();
+    let s = parse_value(working_set, span, shape);
+
+    if starting_error_count == working_set.parse_errors.len() {
+        return s;  // 无新错误 → 成功，直接返回
+    } else {
+        match working_set.parse_errors.get(starting_error_count) {
+            // Expected 类错误 → 回溯，继续尝试下一个形状
+            Some(ParseError::Expected(_, _) | ParseError::ExpectedWithStringMsg(_, _)) => {
+                working_set.parse_errors.truncate(starting_error_count);
+                continue;
+            }
+            // 其他类型错误 → 认为是确定性错误，直接返回
+            _ => return s,
+        }
+    }
 }
-working_set.parse_errors.truncate(starting_error_count);  // 回溯错误
-continue;  // 尝试下一个形状
 ```
 
-[parse_oneof()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_calls.rs#L682-L741) 更复杂：它尝试所有候选形状，选择"走得最远"（首个错误位置最靠后）的结果。
+回溯条件：只有当新产生的错误是 `Expected` 或 `ExpectedWithStringMsg` 类型时才回溯。这是因为 Expected 类错误通常表示"形状不匹配"而非"代码有问题"，而其他类型的错误（如 `Unbalanced`、`UnexpectedEof`）即使形状不对也说明代码本身有错，应该保留。
 
-#### d) 编译门槛
+**情形二：`parse_oneof(SyntaxShape::OneOf)` — 全部尝试，选最优**
 
-`compile_block()` 只在 `parse_errors` 为空时执行：
+[parse_oneof()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_calls.rs#L682-L741) 更复杂：
+
+```rust
+for shape in possible_shapes {
+    let starting_error_count = working_set.parse_errors.len();
+    let value = parse_multispan_value(working_set, spans, spans_idx, shape);
+    
+    let new_errors = &working_set.parse_errors[starting_error_count..];
+    let Some(first_error_offset) = new_errors.iter().map(|e| e.span().start).min() else {
+        return value;  // 无新错误 → 成功，直接返回
+    };
+    
+    if first_error_offset > max_first_error_offset {
+        // 记录"走得更远"的结果
+        max_first_error_offset = first_error_offset;
+        best_guess = Some(value);
+        best_guess_errors.clear();
+        best_guess_errors.extend_from_slice(new_errors);
+    }
+    working_set.parse_errors.truncate(starting_error_count);  // 回溯
+}
+
+// 所有形状都失败 → 选择"最优猜测"的错误
+if max_first_error_offset > spans[starting_spans_idx].start || propagate_error {
+    working_set.parse_errors.extend(best_guess_errors);
+    best_guess.unwrap()
+}
+```
+
+策略：尝试所有候选形状，选择**首个错误位置最靠后**（即解析"走得最远"）的结果作为最终答案。其余尝试产生的错误通过 `truncate` 回溯掉。
+
+---
+
+## IR 编译的前置条件
+
+### compile_block() 的自我保护
+
+[compile_block()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_captures_compile.rs#L11-L26) 自身有第一道防线：
+
+```rust
+pub fn compile_block(working_set: &mut StateWorkingSet<'_>, block: &mut Block) {
+    if !working_set.parse_errors.is_empty() {
+        // This means there might be a bug in the parser, since calling this function
+        // while parse errors are present is a logic error.
+        // However, it's not fatal and it's best to continue without doing anything.
+        log::error!("compile_block called with parse errors");
+        return;
+    }
+
+    match nu_engine::compile(working_set, block) {
+        Ok(ir_block) => { block.ir_block = Some(ir_block); }
+        Err(err) => working_set.compile_errors.push(err),
+    }
+}
+```
+
+注意：这里比较的是 `parse_errors`（解析错误），而 `compile_errors` 是另一回事。即使解析成功，编译也可能产生编译错误。
+
+### 顶层编译触发点
+
+[parse() 函数第 546-548 行](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_captures_compile.rs#L546-L548)：
 
 ```rust
 if working_set.parse_errors.is_empty() {
@@ -365,21 +522,34 @@ if working_set.parse_errors.is_empty() {
 }
 ```
 
-这确保 IR 编译不会在损坏的 AST 上运行，同时允许继续收集所有解析错误。
+顶层 Block 的编译**只在零解析错误时**触发。即使 `compile_block` 自身有保护，调用方也做了检查——双重保险。
 
-### 错误流的总图
+### 闭包的立即编译
 
+闭包比较特殊，它需要在解析时就立即编译。[parse_closure_expression()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L759-L769)：
+
+```rust
+// NOTE: closures need to be compiled eagerly due to these reasons:
+//  - their `Block`s (which contains their `IrBlock`) are stored in the working_set
+//  - Ir compiler does not have mutable access to the working_set and can't attach
+//    `IrBlock`s to existing `Block`s
+// so they can't be compiled as part of their parent `Block`'s compilation
+if working_set.parse_errors.is_empty() {
+    compile_block(working_set, &mut output);
+}
 ```
-lex() / lite_parse() / parse_xxx()
-         │
-         │ working_set.error(ParseError)
-         ▼
-  StateWorkingSet.parse_errors: Vec<ParseError>
-         │
-         ├─ parse_value(Any) / parse_oneof() → truncate 回溯
-         ├─ compile_block() → 仅在 empty 时执行
-         └─ 最终返回给调用方：Arc<Block> + errors 在 working_set 中
-```
+
+原因：闭包的 `Block` 存储在 `StateWorkingSet` 的块表中，而 IR 编译器只有 `&StateWorkingSet` 不可变访问权，无法回填 `IrBlock`。因此闭包必须在解析阶段（此时 working_set 是可变的）就完成编译。
+
+### 其他编译触发点
+
+`compile_block` 和 `compile_block_with_id` 在多处被调用，包括：
+- `parse_def.rs` — 函数定义的体块
+- `parse_module.rs` — 模块体
+- `parse_signatures.rs` — 签名相关块
+- `parse_source.rs` — source 命令的块
+
+大多数调用方都会检查 `parse_errors.is_empty()`，但由于 `compile_block` 内部有保护，即使漏检查也不会崩溃（只是会打一条 error log）。
 
 ---
 
@@ -403,16 +573,69 @@ Nushell 中复合结构（列表、表、记录、闭包、块、子表达式）
 
 ## 总结：三层协作关系
 
-| 层次 | 输入 | 输出 | 核心职责 | 错误策略 |
-|---|---|---|---|---|
-| **词法层** (lex) | 字节流 | `Vec<Token>` | 分词、字符串/定界符嵌套、重定向识别 | 记录首个错误，继续扫描 |
-| **轻量语法层** (lite_parse) | `Vec<Token>` | `LiteBlock` | 组织命令/管道/重定向/注释/属性 | 记录错误，产出不完整但有效的结构 |
-| **AST 层** (parse_block 等) | `LiteBlock` | `Block` (含 AST) | 类型推断、关键字分发、优先级解析、变量作用域 | Garbage 占位 + 错误累积 + 试错回溯 |
+### 核心数据契约
 
-三层之间的**契约**是：
-1. 每层都保证产出有效的输出结构，即使存在错误
-2. 错误通过 `StateWorkingSet.parse_errors` 侧通道传递，不影响正常返回值
-3. 下层始终可以处理上层的输出（无 `Result` 传播）
-4. 编译和执行阶段通过检查 `parse_errors.is_empty()` 来决定是否继续
+| 层次 | 输入 | 输出 | 核心职责 | 错误载体 | 错误策略 |
+|---|---|---|---|---|---|
+| **词法层** (lex) | 字节流 | `(Vec<Token>, Option<ParseError>)` | 分词、字符串/定界符嵌套、重定向识别 | `Option` | 记首个错，继续扫描 |
+| **轻量语法层** (lite_parse) | `&[Token]` | `(LiteBlock, Option<ParseError>)` | 组织命令/管道/重定向/注释/属性 | `Option` | 记首个错，产出完整结构 |
+| **AST 层** (parse_block 等) | `LiteBlock` | `Block` (含完整 AST) | 类型推断、关键字分发、优先级解析、变量作用域 | `Vec<ParseError>` in StateWorkingSet | Garbage 占位 + 全量累积 + 试错回溯 |
 
-这种设计使得 Nushell 的解析器能够**一次性报告所有错误**，而非遇到首个错误就终止——这对 IDE 和 REPL 场景尤为重要。
+### 错误流总图
+
+```
+Source bytes
+    │
+    ▼
+┌───────────────────────────────────────────────────┐
+│  lex()                                            │
+│  错误: Option<ParseError> (只记第一个)             │
+└───────────────────────┬───────────────────────────┘
+                        │
+                        │ parse() 注入:
+                        │   if let Some(err) = err {
+                        │       working_set.error(err)
+                        │   }
+                        ▼
+              StateWorkingSet.parse_errors
+                        ▲
+                        │ parse_block() 注入:
+                        │   if let Some(err) = err {
+                        │       working_set.error(err)
+                        │   }
+                        │
+┌───────────────────────┴───────────────────────────┐
+│  lite_parse()                                      │
+│  错误: Option<ParseError> (只记第一个)             │
+│  working_set: 只读访问                             │
+└───────────────────────┬───────────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────────┐
+│  parse_block() / parse_expression() / ...         │
+│  错误: 直接 working_set.error(err) 追加            │
+│  working_set: 可变访问                             │
+│  Garbage 占位保证 AST 结构完整                     │
+│  parse_value(Any) / parse_oneof → truncate 回溯   │
+└───────────────────────┬───────────────────────────┘
+                        │
+                        │ 编译门槛:
+                        │   if working_set.parse_errors.is_empty()
+                        │
+                        ▼
+              ┌─────────────────────┐
+              │  compile_block()    │  双重检查：内部也会判断 parse_errors
+              │  产出: IrBlock      │
+              └─────────────────────┘
+```
+
+### 关键设计原则
+
+1. **每层独立产出有效输出**：即使存在错误，每层也保证产出结构完整的输出（token 流、LiteBlock、Block）
+2. **两层 Option + 一层 Vec**：词法和轻量语法层各自只记首个错（通过返回值 `Option`），AST 层累积所有错（通过 `StateWorkingSet` 共享的 `Vec`）
+3. **错误侧传**：错误通过返回值或全局状态的 side channel 传递，不影响函数的正常返回值路径
+4. **无 Result 传播**：解析函数几乎都返回值本身，而非 `Result`，确保下游总能拿到可用的结构
+5. **双重编译保险**：调用方检查 + `compile_block` 内部检查，确保 IR 绝不在有解析错误的 AST 上运行
+6. **闭包立即编译**：闭包在解析期就编译 IR，因为后续编译阶段没有可变访问权来回填
+
+这种设计使得 Nushell 的解析器能够**一次性报告尽可能多的错误**，而非遇到首个错误就终止——这对 IDE 智能提示和 REPL 体验尤为重要。
