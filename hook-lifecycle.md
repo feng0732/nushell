@@ -274,6 +274,92 @@ $env.config.hooks.env_change = {
 
 每个变量的 `before`/`after` 对比独立进行，互不影响。一轮循环中，可能有 0 个、1 个或多个 `env_change` 钩子被触发。
 
+### 4.6 钩子报错时 previous_env_vars 是否更新
+
+`eval_env_change_hook` 的代码顺序对缓存更新至关重要（`crates/nu-cmd-base/src/hook.rs` L18-L37）：
+
+```rust
+for (env, hooks) in env_change_hook {
+    let before = engine_state.previous_env_vars.get(env);
+    let after = stack.get_env_var(engine_state, env.as_str());
+    if before != after {
+        let before = before.cloned().unwrap_or_default();
+        let after = after.cloned().unwrap_or_default();
+
+        eval_hooks(engine_state, stack,
+            vec![("$before".into(), before), ("$after".into(), after.clone())],
+            hooks, "env_change",
+        )?;                    // ← 注意 ? 运算符
+
+        // ↓↓↓ 只有 eval_hooks 成功返回后才会执行到这里 ↓↓↓
+        Arc::make_mut(&mut engine_state.previous_env_vars)
+            .insert(env.clone(), after);
+    }
+}
+```
+
+**结论：钩子执行成功才会更新 `previous_env_vars`；一旦报错（通过 `?` 传播），后续的 `.insert()` 不会执行。**
+
+这导致一个可观察的行为：**如果 env_change 钩子链中的某个 Closure 钩子报错，下一轮 REPL 循环会再次触发同一个 env_change 钩子**（因为 `before` 仍然是旧值，`before != after` 仍然成立）。
+
+| 场景 | eval_hooks 返回值 | previous_env_vars 是否更新 | 下一轮是否再次触发 |
+|------|:-----------------:|:--------------------------:|:------------------:|
+| 所有钩子成功执行 | `Ok(())` | ✅ 更新 | ❌（因为 before==after） |
+| String 钩子运行时报错（被吞掉） | `Ok(())` | ✅ 更新 | ❌（因为最终还是 Ok） |
+| String 钩子 parse 报错 | `Err` | ❌ 不更新 | ✅（下次 before 还是旧值） |
+| Closure 钩子任何报错 | `Err` | ❌ 不更新 | ✅（下次 before 还是旧值） |
+| Record 的 condition 报错 | `Err` | ❌ 不更新 | ✅ |
+| Record 的 code Closure 报错 | `Err` | ❌ 不更新 | ✅ |
+| Record 的 code String 运行时报错 | `Ok(())` | ✅ 更新 | ❌（错误被吞，最终 Ok） |
+
+注意这里的不对称性：**String 钩子的运行时错误被 `report_shell_error` 吞掉不返回 Err，因此 eval_hooks 仍然返回 Ok，previous_env_vars 仍然会更新。但 Closure 钩子的任何错误都通过 `?` 提前返回，导致缓存不更新，下次循环再次触发。**
+
+### 4.7 隐藏/删除变量对 env_change 检测的影响
+
+`get_env_var` 的查找链（`crates/nu-protocol/src/engine/stack.rs` L531-L557）：
+
+```rust
+pub fn get_env_var(engine_state, name) {
+    // 阶段1：从栈上的 env_vars 多层级查找（栈级覆盖值）
+    for scope in self.env_vars.iter().rev() { ... }
+    // 阶段2：从 engine_state 基线查找，但先检查 is_env_hidden_in_overlay
+    for active_overlay in self.active_overlays.iter().rev() {
+        if !self.is_env_hidden_in_overlay(active_overlay, &env_name)
+            && let Some(env_vars) = engine_state.env_vars.get(active_overlay)
+            && let Some(v) = env_vars.get(&env_name)
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+```
+
+**关键结论**：`is_env_hidden_in_overlay` 返回 `true` 时，即使 `engine_state` 基线里有这个变量，`get_env_var` 也返回 `None`。
+
+#### hide_env_var vs remove_env_var 的区别
+
+| 操作 | 栈上的值 | 基线查找时的 env_hidden 标记 | `get_env_var` 返回 | 典型用途 |
+|------|----------|:--------------------------:|--------------------|----------|
+| `remove_env_var`（`crates/nu-protocol/src/engine/stack.rs` L591-L596） | 从栈上删除所有层级的值 | 若基线有值则**标记为隐藏** | `None`（若基线也被隐藏） | 临时清理（如 canary 变量） |
+| `hide_env_var`（`crates/nu-protocol/src/engine/stack.rs` L684-L707） | 从栈上删除所有层级的值 | **无论如何都标记为隐藏**，并记录 hide_history | `None` | `hide-env` 命令 / `redirect_env` |
+
+两者的关键区别：
+- `remove_env_var`：如果栈上找到了并删除了值，**不**标记 `env_hidden`（除非栈上已经没有任何 shadow 了，才会标记基线隐藏）
+- `hide_env_var`：一定会标记 `env_hidden`，并写入 `env_hide_history` 防止重复 hide 报错
+
+#### 实际场景对 env_change 的影响
+
+假设用户配置了 `env_change.FOO` 钩子，初始状态 `previous_env_vars["FOO"] = Some("bar")`：
+
+| 场景 | stack.get_env_var("FOO") | before（缓存） | after（栈上） | 是否触发 |
+|------|:------------------------:|:--------------:|:-------------:|:--------:|
+| 正常不变 | `Some("bar")` | `Some("bar")` | `Some("bar")` | ❌ |
+| `$env.FOO = "baz"` | `Some("baz")` | `Some("bar")` | `Some("baz")` | ✅ |
+| `hide-env FOO` | `None` | `Some("bar")` | `None` | ✅，`$after` = null |
+| 先 `hide-env FOO` 再 `$env.FOO = "new"` | `Some("new")` | `Some("bar")`（假设上次没触发） | `Some("new")` | ✅ |
+| 钩子中 hide-env 但报错，缓存未更新 | `None`（下次循环） | `Some("bar")`（未更新） | `None` | ✅，再次触发 |
+
 ---
 
 ## 五、求值环境（Evaluation Context）深度分析
@@ -499,9 +585,202 @@ $env.config.hooks.pre_prompt = [
 
 ---
 
-## 七、性能影响分析
+## 七、报错与环境写回的精确控制流
 
-### 7.1 String 钩子 vs Closure 钩子：数量级差异
+本章深入分析：在 `eval_hook` 和 `run_hook` 中，**当错误发生时，已经在栈上修改过的环境变量是否被写回**。这取决于：
+1. 错误发生在哪个阶段（parse vs 运行时）
+2. 钩子形式（String vs Closure）
+3. `merge_env` 与 `redirect_env` 相对于 `?` 的代码位置
+
+### 7.1 eval_hook 函数的控制流全景
+
+`crates/nu-cmd-base/src/hook.rs` L60-L282（`eval_hook` 函数）：
+
+```
+match value {
+    String { val } => {
+        parse() 编译字符串
+            └─ parse 错误 → return Err(...) ──────┐
+                                                     │ 跳过 L279 merge_env
+        engine_state.merge_delta(delta)              │
+        stack.add_var(var_id, val)                   │
+        eval_block() 执行                             │
+            ├─ Ok → output = pipeline                │
+            └─ Err → report_shell_error（不 return） │
+        stack.remove_var(var_id)                     │
+    }                                                │
+    List { vals } => {                               │
+        eval_hooks(...)?; ← ? 提前返回 ───────────────┤
+    }                                                │
+    Record { val } => {                              │
+        condition 阶段：                              │
+            run_hook(...)?; ← ? 提前返回 ─────────────┤
+            返回非 Bool → return Err(...) ────────────┤
+        code String 分支：                            │
+            parse 错误 → return Err(...) ─────────────┤
+            eval_block() 运行时错误 → report（继续）   │
+        code Closure 分支：                           │
+            run_hook(...)?; ← ? 提前返回 ─────────────┤
+        code 其他类型 → return Err(...) ──────────────┤
+    }                                                │
+    Closure { val } => {                             │
+        run_hook(...)?; ← ? 提前返回 ─────────────────┤
+    }                                                │
+    other => return Err(...) ────────────────────────┘
+}
+                                               ↓
+                      L279: engine_state.merge_env(stack)?;
+                                               ↓
+                                     Ok(output) 正常返回
+```
+
+**L279 的 `merge_env` 只有在所有 match 分支执行完（没有提前 return Err）的情况下才会执行。**
+
+### 7.2 String 钩子的环境写回
+
+String 钩子直接操作传入的 `&mut Stack`，不创建子栈。
+
+| 错误阶段 | 是否提前 return | 栈上的修改是否保留 | L279 merge_env 是否执行 | 最终效果 |
+|----------|:--------------:|:-----------------:|:----------------------:|----------|
+| parse 阶段报错 | ✅ 是 | ❌ eval_block 未执行，栈未变 | ❌ 未执行 | 无影响 |
+| merge_delta 报错 | ✅ 是（通过 `?`） | ❌ eval_block 未执行，栈未变 | ❌ 未执行 | 无影响 |
+| eval_block 运行时报错 | ❌ 否（仅 report） | ✅ **已保留**（直接在传入的 stack 上修改） | ✅ 已执行 | **栈上的环境变更被永久写入 EngineState** |
+| 正常无错误 | ❌ 否 | ✅ 已保留 | ✅ 已执行 | 正常写回 |
+
+**关键发现——String 钩子的陷阱**：即使 String 钩子的 `eval_block` 运行时报错（例如 `$env.FOO = "new"; error make {...}`），`$env.FOO = "new"` 这条赋值**已经在传入的 stack 上生效了**。由于错误没有被 return，代码继续执行到 L279 `merge_env`，这个赋值会被永久写回 EngineState。**错误发生前的副作用不会被回滚。**
+
+### 7.3 Closure 钩子的环境写回
+
+Closure 钩子在独立的 `callee_stack`（子栈）上执行，环境同步分两步：
+
+1. `run_hook` 函数内（L328）：`redirect_env(engine_state, stack, &callee_stack)`
+2. `eval_hook` 末尾（L279）：`engine_state.merge_env(stack)`
+
+**run_hook 内部控制流**（`crates/nu-cmd-base/src/hook.rs` L284-L331）：
+
+```
+captures_to_stack_preserve_out_dest() → 创建 callee_stack
+绑定参数到 callee_stack
+eval_block_with_early_return(engine_state, &mut callee_stack, ...)
+    └─ ? 提前返回 ────────────────────────────┐
+                                              │ 跳过 L328 redirect_env
+如果返回值是 Value::Error → return Err(...) ──┤
+                                              │
+                                  L328: redirect_env(engine_state, stack, &callee_stack)
+                                              │
+                                              ↓
+                                     Ok(pipeline_data) 返回
+```
+
+| 错误阶段 | 是否提前 return | callee_stack 上的修改 | redirect_env 是否执行 | merge_env（L279）是否执行 | 最终效果 |
+|----------|:--------------:|:---------------------:|:--------------------:|:------------------------:|----------|
+| 参数不匹配（位置参数过多） | ✅ 是（L307-310） | ❌ eval_block 未执行 | ❌ 未执行 | ❌ 未执行（eval_hook 内 ? 提前返回） | 无影响 |
+| eval_block_with_early_return 运行时错误 | ✅ 是（L315-321 `?`） | ✅ 已保留在 callee_stack | ❌ 未执行 | ❌ 未执行 | **callee_stack 的修改完全丢失**（子栈销毁） |
+| 返回 Value::Error | ✅ 是（L323-325） | ✅ 已保留在 callee_stack | ❌ 未执行 | ❌ 未执行 | **callee_stack 的修改完全丢失** |
+| 正常无错误 | ❌ 否 | ✅ 已保留在 callee_stack | ✅ 已执行 → 写回 caller stack | ✅ 已执行 → 写回 EngineState | 正常写回 |
+
+**关键发现——Closure 钩子的原子性**：Closure 钩子的环境变更具有"全有或全无"的特性。如果执行过程中任何时候报错，所有在 callee_stack 上进行的环境修改（`$env.VAR = value`、`hide-env` 等）**都会丢失**，不会影响调用方。这与 String 钩子「部分成功的副作用会被写回」的行为形成鲜明对比。
+
+### 7.4 redirect_env 中的双向同步语义
+
+`redirect_env`（`crates/nu-engine/src/eval.rs` L369-L384）在 Closure 成功执行后被调用，它做了两件事：
+
+```rust
+pub fn redirect_env(engine_state, caller_stack, callee_stack) {
+    // 步骤1：隐藏 caller 有但 callee 没有的环境变量
+    // （即 callee 中执行了 hide-env 的那些变量）
+    for active_overlay in caller_stack.active_overlays.iter() {
+        if let Some(hidden_env_vars) = caller_stack
+            .get_hidden_env_vars(active_overlay, callee_stack, engine_state)
+        {
+            for env in hidden_env_vars {
+                caller_stack.hide_env_var(engine_state, &env);  // ← 调用 hide_env_var
+            }
+        }
+    }
+    // 步骤2：将 callee 栈级的所有环境变量复制回 caller
+    for (env, value) in callee_stack.get_stack_env_vars() {
+        caller_stack.add_env_var(env, value);  // ← 调用 add_env_var
+    }
+}
+```
+
+注意：`get_hidden_env_vars` 的语义是「找出在 caller 中可见但在 callee 中被隐藏/缺失的变量」。这通过对比 caller 和 callee 的 `has_env_var` 来实现。
+
+#### add_env_var 的一个副作用
+
+`crates/nu-protocol/src/engine/stack.rs` L273-L296：
+
+```rust
+pub fn add_env_var(&mut self, var: String, value: Value) {
+    let env_name = EnvName::from(var);
+    self.clear_env_var_marks_in_active_overlay(&last_overlay, &env_name);
+    // ...写入 env_vars...
+}
+
+fn clear_env_var_marks_in_active_overlay(&mut self, overlay, env_name) {
+    if let Some(env_hidden) = Arc::make_mut(&mut self.env_hidden).get_mut(overlay) {
+        // Re-assigning re-activates a previously hidden env var in this overlay.
+        env_hidden.remove(env_name);  // ← 重新赋值会清除隐藏标记
+    }
+    if let Some(hide_history) = Arc::make_mut(&mut self.env_hide_history).get_mut(overlay) {
+        hide_history.remove(env_name);  // ← 同时清除 hide 历史记录
+    }
+}
+```
+
+**结论：对一个变量重新执行 `$env.VAR = value`，会自动清除之前对它执行的 `hide-env` 标记。** 这是合理的行为——如果隐藏后又显式赋值，说明需要让它重新可见。
+
+### 7.5 Record 钩子的两阶段控制流
+
+Record 形式的钩子执行 `condition` 和 `code` 两个阶段，需要分别分析：
+
+**condition 阶段**（闭包形式）：报错 → `?` 提前 return → `eval_hook` 的 L279 merge_env 不执行 → caller 栈和 callee 栈上的环境修改全部丢失。
+
+**code 阶段**（取决于 code 的类型）：
+- `code: String` → 同 7.2 String 钩子的规则
+- `code: Closure` → 同 7.3 Closure 钩子的规则
+
+**特别注意**：condition 阶段通过 `run_hook` 在独立子栈上执行，它的环境修改通过 `redirect_env` 写回 caller。如果 condition **成功执行**并返回 `true`，则 condition 阶段的环境变更已经生效。然后 code 阶段在此基础上继续修改。如果 condition 报错，则 condition 阶段的修改连同 code 阶段一起全部丢失。
+
+### 7.6 总结：环境写回 vs 错误场景的决策矩阵
+
+| 钩子形式 | 错误场景 | 执行前栈上的修改 | 执行到报错点前的修改 | 报错点之后的修改 | L279 merge_env |
+|----------|----------|:---------------:|:-------------------:|:---------------:|:--------------:|
+| **String** | parse 错误 | 未执行 | 未执行 | 未执行 | ❌ 跳过 |
+| **String** | 运行时错误（被吞） | — | ✅ 已在 stack 上（不会回滚） | 未执行 | ✅ 执行，**前面修改被永久写回** |
+| **String** | 无错误 | — | ✅ | ✅ | ✅ 执行 |
+| **Closure** | 任何错误（通过 ? 传播） | — | ❌ 在子栈上，**全部丢失** | 未执行 | ❌ 跳过 |
+| **Closure** | 无错误 | — | ✅ 通过 redirect_env 写回 caller | ✅ | ✅ 执行 |
+| **List** | 子钩子返回 Err | 前面成功的子钩子已部分写回 | 本钩子未执行 | 后续钩子未执行 | ❌ 跳过（但**之前已成功的子钩子的修改不会回滚**） |
+| **Record condition** | condition 报错 | — | ❌ condition 在子栈上，全部丢失 | code 未执行 | ❌ 跳过 |
+| **Record condition** | condition 成功，返回 true | ✅ condition 的修改已通过 redirect_env 写回 | — | — | 取决于 code 阶段 |
+| **Record code String** | String 运行时错误（被吞） | condition 已写回 | ✅ 已在 stack 上 | 未执行 | ✅ 执行 |
+| **Record code Closure** | Closure 报错 | condition 已写回 | ❌ **本阶段的修改丢失** | 未执行 | ❌ 跳过（但 condition 的修改**仍保留**） |
+
+**最容易踩坑的两种情况**：
+
+1. **String 钩子中报错前的赋值泄漏**：
+   ```nu
+   $env.config.hooks.pre_prompt = ['$env.FOO = "changed"; error make {msg: "fail"}']
+   ```
+   → **`$env.FOO` 仍然被永久改为 `"changed"`**，即使钩子打印了错误。
+
+2. **List 钩子中早期子钩子的成功修改不回滚**：
+   ```nu
+   $env.config.hooks.pre_prompt = [
+       {|| $env.HOOK1 = "done" }       # 成功执行
+       {|| error make {msg: "fail"} }  # Closure 报错，? 提前返回
+       {|| $env.HOOK3 = "never" }      # 不会执行
+   ]
+   ```
+   → **`$env.HOOK1 = "done"` 不会被回滚**，即使整个列表返回了 Err。下一轮循环中 `HOOK1` 已经是新值。但 `HOOK3` 永远不会被赋值。
+
+---
+
+## 八、性能影响分析
+
+### 8.1 String 钩子 vs Closure 钩子：数量级差异
 
 | 操作 | String 钩子 | Closure 钩子 |
 |------|:-----------:|:------------:|
@@ -515,7 +794,7 @@ $env.config.hooks.pre_prompt = [
 
 **结论：性能敏感场景下，始终使用 Closure 形式。String 钩子适合短小的一次性配置脚本。**
 
-### 7.2 REPL 循环中的性能热点
+### 8.2 REPL 循环中的性能热点
 
 在 `crates/nu-cli/src/repl.rs` 中使用 `perf!` 宏标记了关键性能点（支持 `use_ansi_coloring` 时输出到 stderr）：
 
@@ -527,7 +806,7 @@ $env.config.hooks.pre_prompt = [
 | `pre_execution_hook` | 每条命令 1 次 | 命令执行前执行 |
 | `update_prompt` | 每轮 1 次 | 渲染提示符（可能包含复杂闭包） |
 
-### 7.3 EngineState 克隆的隐性开销
+### 8.3 EngineState 克隆的隐性开销
 
 `crates/nu-cli/src/repl.rs` L193-L196：
 
@@ -548,7 +827,7 @@ let current_stack = Stack::with_parent(previous_stack_arc.clone());
 
 **String 钩子会进一步放大这个问题**：每次执行 `merge_delta` 会增加 EngineState 的大小，下一轮 clone 时开销更大。
 
-### 7.4 env_change 钩子的 O(N) 扫描
+### 8.4 env_change 钩子的 O(N) 扫描
 
 `crates/nu-cmd-base/src/hook.rs` L18-L37：
 
@@ -568,7 +847,7 @@ pub fn eval_env_change_hook(env_change_hook, engine_state, stack) {
 
 **性能注意：** `before != after` 比较的是 `Option<&Value>`，若两端均为 `Some`，则会递归比较 Value 的内容。对于包含大 list/record 的环境变量，这可能产生不可忽视的开销。
 
-### 7.5 display_output 钩子的性能影响
+### 8.5 display_output 钩子的性能影响
 
 `display_output` 钩子接收整条 PipelineData 作为管道输入，需要特别注意：
 
@@ -579,9 +858,9 @@ pub fn eval_env_change_hook(env_change_hook, engine_state, stack) {
 
 ---
 
-## 八、实用建议与最佳实践
+## 九、实用建议与最佳实践
 
-### 8.1 优先使用 Closure 而非 String
+### 9.1 优先使用 Closure 而非 String
 
 ```nu
 # ❌ 慢：每次触发都 parse
@@ -591,7 +870,7 @@ $env.config.hooks.pre_prompt = ['print "hello"']
 $env.config.hooks.pre_prompt = [{|| print "hello" }]
 ```
 
-### 8.2 列表中错误传播的注意事项
+### 9.2 列表中错误传播的注意事项
 
 如果你的钩子列表包含多个步骤，且希望一个失败不影响其他步骤：
 - 全部用 String 形式（隐式容错，不推荐，行为不透明）
@@ -604,7 +883,7 @@ $env.config.hooks.pre_prompt = [
 ]
 ```
 
-### 8.3 env_change 钩子的条件优化
+### 9.3 env_change 钩子的条件优化
 
 对频繁变化的变量，使用 condition 过滤不必要的执行：
 
@@ -627,15 +906,15 @@ condition: {|before, after|
 }
 ```
 
-### 8.4 command_not_found 钩子的防循环保护
+### 9.4 command_not_found 钩子的防循环保护
 
 代码内置了金丝雀变量 `ENTERED_COMMAND_NOT_FOUND` 防止无限递归（`crates/nu-command/src/system/run_external.rs` L536-L547）。若钩子内部再次调用不存在的命令，会收到专门的错误信息而非再次触发钩子。但你仍应避免在钩子内调用可能失败的外部命令。
 
-### 8.5 钩子修改命令行的技巧
+### 9.5 钩子修改命令行的技巧
 
 `pre_prompt` 和 `env_change` 钩子可以修改 `engine_state.repl_state.buffer`，随后 `flush_engine_state_repl_buffer` 会将内容刷入 reedline 编辑器。这是实现"钩子自动填充命令行"功能的基础。
 
-### 8.6 display_output 钩子的安全重置
+### 9.6 display_output 钩子的安全重置
 
 `display_output` 钩子对 REPL 输出有全局影响。如果配置了有问题的钩子（例如语法错误），可能导致**所有命令输出消失**。默认配置文档中的警告（`crates/nu-utils/src/default_files/doc_config.nu` L553）：
 
@@ -650,23 +929,31 @@ $env.config.hooks.display_output = ""     # 空字符串也有效
 
 ---
 
-## 九、核心代码参考索引
+## 十、核心代码参考索引
 
 | 功能模块 | 文件路径 | 关键行 |
 |----------|----------|--------|
 | Hooks 配置结构 | `crates/nu-protocol/src/config/hooks.rs` | L7-L53 |
 | 钩子分发执行入口 | `crates/nu-cmd-base/src/hook.rs` | L40-L282 |
-| 闭包钩子实际执行 | `crates/nu-cmd-base/src/hook.rs` | L284-L331 |
-| env_change 对比逻辑 | `crates/nu-cmd-base/src/hook.rs` | L13-L38 |
+| eval_hook 末尾 merge_env | `crates/nu-cmd-base/src/hook.rs` | L279 |
+| 闭包钩子实际执行 run_hook | `crates/nu-cmd-base/src/hook.rs` | L284-L331 |
+| run_hook 中 redirect_env 调用点 | `crates/nu-cmd-base/src/hook.rs` | L328 |
+| env_change 对比与缓存更新 | `crates/nu-cmd-base/src/hook.rs` | L13-L38 |
+| Stack::add_env_var（清除隐藏标记） | `crates/nu-protocol/src/engine/stack.rs` | L273-L296 |
+| Stack::get_env_var（检查 env_hidden） | `crates/nu-protocol/src/engine/stack.rs` | L531-L557 |
+| Stack::remove_env_var | `crates/nu-protocol/src/engine/stack.rs` | L591-L596 |
+| Stack::hide_env_var（含 hide_history） | `crates/nu-protocol/src/engine/stack.rs` | L684-L707 |
+| Stack::is_env_hidden_in_overlay | `crates/nu-protocol/src/engine/stack.rs` | L671-L675 |
+| Stack::captures_to_stack_preserve_out_dest | `crates/nu-protocol/src/engine/stack.rs` | L336-L357 |
+| 环境重定向 redirect_env | `crates/nu-engine/src/eval.rs` | L369-L384 |
+| EngineState::merge_env（永久写入） | `crates/nu-protocol/src/engine/engine_state.rs` | L365-L392 |
+| previous_env_vars 初始化（空 HashMap） | `crates/nu-protocol/src/engine/engine_state.rs` | L199 |
 | REPL 主循环触发点 | `crates/nu-cli/src/repl.rs` | L510-L848 |
 | pre_execution 触发 | `crates/nu-cli/src/repl.rs` | L339-L507 |
 | display_output 触发 | `crates/nu-cli/src/util.rs` | L208-L237 |
 | print 命令实现 | `crates/nu-cli/src/commands/print.rs` | L50-L97 |
-| print_table (不经过钩子) | `crates/nu-protocol/src/pipeline/pipeline_data.rs` | L725-L754 |
-| print_raw (不经过钩子) | `crates/nu-protocol/src/pipeline/pipeline_data.rs` | L763-L792 |
+| print_table（不经过钩子） | `crates/nu-protocol/src/pipeline/pipeline_data.rs` | L725-L754 |
+| print_raw（不经过钩子） | `crates/nu-protocol/src/pipeline/pipeline_data.rs` | L763-L792 |
 | drain_to_out_dests | `crates/nu-protocol/src/pipeline/pipeline_data.rs` | L302-L327 |
 | command_not_found 触发 | `crates/nu-command/src/system/run_external.rs` | L523-L639 |
-| 环境重定向逻辑 | `crates/nu-engine/src/eval.rs` | L369-L384 |
-| EngineState 合并环境 | `crates/nu-protocol/src/engine/engine_state.rs` | L365-L392 |
-| previous_env_vars 初始化 | `crates/nu-protocol/src/engine/engine_state.rs` | L199 |
 | 集成测试用例 | `tests/hooks/mod.rs` | L1-L584 |
