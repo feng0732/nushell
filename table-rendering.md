@@ -239,30 +239,37 @@ impl TableOption<...> for DimensionCtrl {
 
 **入口**：`crates/nu-command/src/viewers/table.rs` 第 697 行 → `JustTable::kv_table`（`crates/nu-table/src/types/general.rs` 第 47 行）
 
-**着色方式：直接着色路径**。颜色直接写入字符串，tabled 把它当普通文本处理。
+**两列分别采用不同策略**，不是统一路径：
 
-```
-构建阶段（kv_table 第 52–58 行 for 循环）：
-1. val.to_abbreviated_string()        → 纯文本
-2. style_computer.style_primitive()   → 拿到 nu_ansi_term::Style（样式信息）
-3. clean_charset                      → 文本规整化【仅 String 类型】
-4. color.paint(text).to_string()      → 包裹 ANSI 前缀/后缀（真正上色）
-5. colorize_space_str                 → 行首尾空格再包一层颜色【仅 String 类型】
-6. table.insert((i, 1), value)        → 直接插入带 ANSI 的字符串
-```
+**key 列（第 0 列）**（L57 `table.insert((i, 0), key)`）：
+- key 是 `&str` → `String`，**直接插入**，无任何转换
+- ❌ 没有 `clean_charset`（即使 key 含 `\t`/`\r` 也不处理）
+- ❌ 没有 `colorize_space_str`
+- ❌ 没有直接上色（颜色没写进字符串）
+- ✅ 通过 `table.set_index_style(get_key_style(&opts))`（L49）设置列级别样式，渲染时由 tabled 应用
+
+**value 列（第 1 列）**（L55 `nu_value_to_string_colored(&value, ...)`）：
+- ✅ `clean_charset`【仅 `Value::String` 类型，`is_string` 判断】
+- ✅ `color.paint(text)` 上色【所有类型】
+- ✅ `colorize_space_str`【仅 `Value::String` 类型】
+- ✅ 返回 String 直接带 ANSI
 
 **代码证据**（`nu_value_to_string_colored`，`crates/nu-table/src/common.rs` 第 42–59 行）：
 
 ```rust
+let is_string = matches!(val, Value::String { .. });
 if is_string {
-    text = clean_charset(&text);        // ← 先规整（L47）
+    text = clean_charset(&text);        // ← 仅 String 类型规整（L46-48）
 }
 if let Some(color) = style.color_style {
-    text = color.paint(text).to_string(); // ← 后上色（L51）
+    text = color.paint(text).to_string(); // ← 所有类型上色（L50-52）
+}
+if is_string {
+    colorize_space_str(&mut text, comp);   // ← 仅 String 类型空格着色（L54-56）
 }
 ```
 
-**注意**：此链路**没有**第二遍 `colorize_space` 全表扫描，因为空格着色已在步骤 5 中按单元格完成。
+**注意**：此链路**没有**第二遍 `colorize_space` 全表扫描，因为空格着色已按单元格完成。
 
 ---
 
@@ -270,28 +277,52 @@ if let Some(color) = style.color_style {
 
 **入口**：`crates/nu-command/src/viewers/table.rs` 第 704 / 740 行 → `ExpandedTable::build_map` / `build_list`（`crates/nu-table/src/types/expanded.rs` 第 41 / 46 行）
 
-**着色方式：混合链路**——叶子节点直接着色，嵌套节点渲染成子表后作为纯文本嵌入。
+**混合链路 + 多分支精细化处理**。不同递归分支采用不同的字符串转换函数，先看三个基础函数的精确边界：
 
-```
-expand_entry（L520）/ expand_value（L451）递归遍历：
+**三个字符串转换函数的对比**（`crates/nu-table/src/common.rs` 第 42–75 行）：
 
-├─ 叶子值（非 Record/List）：
-│  1. nu_value_to_string_clean        → 返回 (text, style)，clean_charset + colorize_space_str
-│  2. (或) nu_value_to_string         → 返回 (text, style)，仅文本+样式分离
-│  3. (或) nu_value_to_string_colored → 直接上色（仅 value_to_wrapped_string_clean L667）
-│  4. 存入 CellOutput.styled / CellOutput.text
-│
-└─ 嵌套值（Record/List）：
-   1. 递归调用 expanded_table_kv / expand_list → 渲染成完整子表（含主题、着色）
-   2. 子表 to_string() 得到纯文本（已带 ANSI 颜色）
-   3. 用 CellOutput.clean() 存入（无额外样式，样式已在文本里）
-```
+| 函数 | `clean_charset` | `colorize_space_str` | 上色（`color.paint`） | 适用条件 | 返回类型 |
+|------|--------------|-----------------|-------------------|---------|---------|
+| `nu_value_to_string` | ❌ 无 | ❌ 无 | ❌ 无 | 所有类型 | `NuText (text, style)` |
+| `nu_value_to_string_clean` | ✅ 所有类型 | ✅ 所有类型 | ❌ 无 | 所有类型 | `NuText (text, style)` |
+| `nu_value_to_string_colored` | ✅ 仅 `Value::String` | ✅ 仅 `Value::String` | ✅ 所有类型 | `is_string` 守卫 | `String`（带 ANSI） |
 
-**代码证据**：
-- 叶子直接着色：`crates/nu-table/src/types/expanded.rs` 第 522 行（`nu_value_to_string_clean`）、第 667 行（`nu_value_to_string_colored`）
-- 嵌套子表内嵌：`crates/nu-table/src/types/expanded.rs` 第 466–468 行（`out.table.draw_unchecked(width)` → `CellOutput::clean`）
+**`expanded_table_kv` 子表（Record 键值展示）**（L388–448）：
 
-> **⚠️ 推断**：Expanded 链路混用了三种字符串转换函数（`nu_value_to_string` / `_clean` / `_colored`），看起来是逐步叠加功能的结果，并非统一设计。不同分支选择哪个函数似乎取决于该值是否还需要进一步处理（如 wrap 换行）。
+- **key 列**（L421 `let mut key = key.to_owned()` → L431 `table.insert((i, 0), key)`）：
+  - 直接插入 `String`
+  - ❌ 没有 `clean_charset`
+  - ❌ 没有 `colorize_space_str`
+  - ❌ 没有直接上色
+  - ✅ 通过 `table.set_index_style(get_key_style(&cfg))`（L409）设置列级别样式
+  - 🔶 特殊处理（L426–429）：若 value 是展开的子表且主题有顶部边框，则在 key 前插入 `\n`，使 key 对齐到第二行
+
+- **value 列**：通过 `expand_value(value, value_width, &cfg)`（L415）分派到各分支
+
+**`expand_value` 各分支**（L451–501）：
+
+| 分支条件 | 转换函数 | clean | space_color | 上色 |
+|---------|---------|-------|-------------|------|
+| `is_limit_reached`（expand_limit=0） | `value_to_string_clean` → `nu_value_to_string_clean` | ✅ 所有类型 | ✅ 所有类型 | ❌（样式分离存 `CellOutput.style`）|
+| List 为空 | `value_to_wrapped_string` → `nu_value_to_string` | ❌ | ❌ | ❌（样式分离）|
+| List 非空 | 递归 `expand_list` → 子表 `draw_unchecked` | - | - | 子表内含 ANSI |
+| Record 为空 | `value_to_wrapped_string` → `nu_value_to_string` | ❌ | ❌ | ❌（样式分离）|
+| Record 非空 | 递归 `expanded_table_kv` → 子表 `draw_unchecked` | - | - | 子表内含 ANSI |
+| 叶子值（`_`） | `value_to_wrapped_string_clean` → `nu_value_to_string_colored` | ✅ 仅 String | ✅ 仅 String | ✅ 所有类型（ANSI 写进字符串）|
+
+**`expand_entry` 各分支**（L520–590）：
+
+| 分支条件 | 转换函数 | clean | space_color | 上色 |
+|---------|---------|-------|-------------|------|
+| `is_limit_reached` | `nu_value_to_string_clean` | ✅ 所有类型 | ✅ 所有类型 | ❌（样式分离）|
+| Record 空/渲染失败 | `nu_value_to_string` | ❌ | ❌ | ❌（样式分离）|
+| Record 非空 | 递归 `expanded_table_kv` | - | - | 子表内含 ANSI |
+| List flatten + 简单列表 | `list_to_string` → `nu_value_to_string_clean`（L622 丢弃 style） | ✅ 所有类型 | ✅ 所有类型 | ❌（style 被 `let (text, _) = ...` 丢弃）|
+| List 非空 | 递归 `expand_list` → 子表 | - | - | 子表内含 ANSI |
+| List 空/失败 | `nu_value_to_string` | ❌ | ❌ | ❌（样式分离）|
+| 叶子值（`_`） | `nu_value_to_string_clean` | ✅ 所有类型 | ✅ 所有类型 | ❌（样式分离）|
+
+> **⚠️ 推断**：Expanded 链路混用三种转换函数不是统一设计。规律大致是：需要后续 wrap 处理的值用 `_colored`（上色后再换行，避免 ANSI 干扰）；直接展示的值用 `_clean`（样式分离交给 tabled）；错误回退路径用基础版 `nu_value_to_string`（跳过规整化保证能渲染）。
 
 ---
 
@@ -299,33 +330,58 @@ expand_entry（L520）/ expand_value（L451）递归遍历：
 
 **入口**：`crates/nu-command/src/viewers/table.rs` 第 708 / 744 行 → `CollapsedTable::build`（`crates/nu-table/src/types/collapse.rs`）
 
-**着色方式：树状遍历着色**——先递归遍历整个 Value 树把颜色写进字符串，再交给 tabled 展示。
+**树状遍历 + 就地修改 Value**——把颜色写进 Value 的字符串里，再交给 `UnstructuredTable` 展示。
 
-```
-CollapsedTable::build：
-1. colorize_value(&mut value, ...)    → 递归遍历 Value 树
-│     ├─ Record：每个 key 调 colorize_text(header, style.color_style)
-│     │            每个 value 递归 colorize_value
-│     └─ List：每个元素递归 colorize_value
-│            叶子值：nu_value_to_string_clean → colorize_text(text, style.color_style)
-2. NuTable 插入已着色的文本
-3. configure_table → draw
-```
+**`colorize_value` 递归遍历**（L35–69）：
 
-**代码证据**：
-- `crates/nu-table/src/types/collapse.rs` 第 35 行（`colorize_value` 入口）
-- `crates/nu-table/src/types/collapse.rs` 第 63–64 行（叶子：`nu_value_to_string_clean` → `colorize_text`）
+- **Record key**（L50）：
+  - `header = colorize_text(&header, style.color_style).unwrap_or(header)`
+  - ✅ `colorize_text` 直接上色（所有 key，不区分类型）
+  - ❌ **没有** `clean_charset`（key 含 `\t`/`\r` 不处理）
+  - ❌ **没有** `colorize_space_str`
+  - 样式来源：L40 `get_index_style(style_computer)`（header 用索引列样式）
+
+- **Record value**（L49）：递归调用 `colorize_value`
+
+- **List 元素**（L59）：递归调用 `colorize_value`
+
+- **叶子值（非 Record/List）**（L62–67）：
+  - L63: `nu_value_to_string_clean(value, config, style_computer)` → 对**所有类型**执行 `clean_charset` + `colorize_space_str`（注意：`_clean` 没有 `is_string` 守卫）
+  - L64-66: `colorize_text(&text, style.color_style)` → 对**所有类型**上色
+  - L65: `*value = Value::string(text, value.span())` → 叶子值全部替换为带 ANSI 的 String
+
+**代码证据**（`crates/nu-table/src/types/collapse.rs` 第 38–67 行）：
+
+```rust
+Value::Record { val, .. } => {
+    let style = get_index_style(style_computer);
+    // ...
+    .map(|(mut header, mut val)| {
+        colorize_value(&mut val, config, style_computer);          // ← 先递归处理 value
+        header = colorize_text(&header, style.color_style)         // ← 再给 key 上色，无 clean
+            .unwrap_or(header);
+        (header, val)
+    })
+}
+// ...
+value => {
+    let (text, style) = nu_value_to_string_clean(value, config, style_computer); // ← 所有类型 clean
+    if let Some(text) = colorize_text(&text, style.color_style) {                 // ← 所有类型上色
+        *value = Value::string(text, value.span());                               // ← 替换为 String
+    }
+}
+```
 
 ---
 
 #### 四种链路的对比汇总
 
-| 视图模式 | 着色策略 | 文本与样式关系 | 第二遍 colorize_space | 适用场景 |
-|---------|---------|--------------|---------------------|---------|
-| General + List | **样式分离** | 分离存储，渲染阶段合并 | ✅ 有（全表扫描） | `table` 命令主路径，最常用 |
-| General + Record | **直接着色** | 颜色写进字符串 | ❌ 无 | 单个 Record 的键值展示 |
-| Expanded | **混合** | 叶子着色 + 子表内嵌文本 | ❌ 无 | `table -e` 递归展开 |
-| Collapsed | **树状遍历** | 递归着色后写进字符串 | ❌ 无 | `table -c` 紧凑折叠视图 |
+| 视图模式 | 着色策略 | Record key 处理 | 第二遍 `colorize_space` | 适用场景 |
+|---------|---------|--------------|-----------------------|---------|
+| General + List | **样式分离** | 无（不是 Record） | ✅ 有（全表扫描） | `table` 命令主路径，最常用 |
+| General + Record | **分列处理** | key 无 clean 无直接上色，value 直接着色 | ❌ 无 | 单个 Record 的键值展示 |
+| Expanded | **混合** | key 无 clean 无直接上色，value 多分支 | ❌ 无 | `table -e` 递归展开 |
+| Collapsed | **树状遍历** | key 直接上色（无 clean），叶子值所有类型 clean + 上色 | ❌ 无 | `table -c` 紧凑折叠视图 |
 
 **颜色来源汇总**（代码事实，适用于所有链路）：
 - `style_primitive()`：基础类型颜色（int/float/string/bool/...）
