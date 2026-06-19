@@ -1,14 +1,18 @@
 # Nushell 模块加载与作用域可见性深度解析
 
+> 代码路径统一使用**仓库相对路径**（以项目根为基准）。
+
+---
+
 ## 一、整体架构概览
 
 Nushell 的模块系统由三个核心 crate 协同实现：
 
 | Crate | 职责 | 关键文件 |
 |-------|------|----------|
-| `nu-parser` | 语法解析、模块/别名/导入的语法处理 | [parse_module.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_module.rs)、[parse_alias.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_alias.rs) |
-| `nu-protocol` | 核心数据结构定义、引擎状态、作用域帧 | [module.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/module.rs)、[alias.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/alias.rs)、[overlay.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/engine/overlay.rs) |
-| `nu-engine` | 运行时作用域数据收集 | [scope.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-engine/src/scope.rs) |
+| `nu-parser` | 语法解析、模块/别名/导入的语法处理 | `crates/nu-parser/src/parse_module.rs`、`crates/nu-parser/src/parse_alias.rs` |
+| `nu-protocol` | 核心数据结构定义、引擎状态、作用域帧、循环检测 | `crates/nu-protocol/src/module.rs`、`crates/nu-protocol/src/alias.rs`、`crates/nu-protocol/src/engine/overlay.rs`、`crates/nu-protocol/src/engine/state_working_set.rs` |
+| `nu-engine` | 运行时作用域数据收集 | `crates/nu-engine/src/scope.rs` |
 
 ---
 
@@ -16,7 +20,7 @@ Nushell 的模块系统由三个核心 crate 协同实现：
 
 ### 2.1 Module 结构体
 
-定义于 [module.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/module.rs#L36-L46)：
+定义于 `crates/nu-protocol/src/module.rs#L36-L46`：
 
 ```rust
 pub struct Module {
@@ -27,7 +31,7 @@ pub struct Module {
     pub env_block: Option<BlockId>,              // `export-env { ... }` 环境块
     pub main: Option<DeclId>,                    // `export def main` 主命令
     pub span: Option<Span>,
-    pub imported_modules: Vec<ModuleId>,         // 已导入的模块列表（用于变更检测）
+    pub imported_modules: Vec<ModuleId>,         // 已导入的模块列表（用于变更传播）
     pub file: Option<(ParserPath, FileId)>,      // 源文件信息
 }
 ```
@@ -35,12 +39,12 @@ pub struct Module {
 **关键点**：
 - `IndexMap` 保证导出顺序稳定
 - `main` 字段让模块可以像命令一样直接调用
-- `imported_modules` 是循环依赖和热重载检测的基础
+- `imported_modules` 是**热重载检测**的基础（不是循环检测）
 - `env_block` 支持模块级别的环境变量设置
 
 ### 2.2 可导出符号 (Exportable)
 
-定义于 [exportable.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/exportable.rs#L4-L7)：
+定义于 `crates/nu-parser/src/exportable.rs#L4-L7`：
 
 ```rust
 pub enum Exportable {
@@ -52,11 +56,11 @@ pub enum Exportable {
 
 ### 2.3 导入模式 (ImportPattern)
 
-定义于 [import_pattern.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/ast/import_pattern.rs#L48-L56)：
+定义于 `crates/nu-protocol/src/ast/import_pattern.rs#L48-L56`：
 
 ```rust
 pub struct ImportPattern {
-    pub head: ImportPatternHead,      // 模块名 + ID
+    pub head: ImportPatternHead,      // 模块名 + ID（如果已在作用域内则 ID 为 Some）
     pub members: Vec<ImportPatternMember>, // 导入成员：Glob / Name / List
     pub hidden: HashSet<Vec<u8>>,     // hide 命令隐藏的项
     pub constants: Vec<VarId>,        // 需要放入栈的常量
@@ -74,7 +78,7 @@ pub struct ImportPattern {
 
 ### 3.1 模块解析入口
 
-模块解析的主入口在 [parse_module.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_module.rs#L862-L1042) 的 `parse_module` 函数，支持两种语法：
+模块解析的主入口在 `crates/nu-parser/src/parse_module.rs#L862-L1042` 的 `parse_module` 函数，支持两种语法：
 
 **形式 1：从文件/目录加载**
 ```nu
@@ -92,7 +96,7 @@ module mymodule {
 
 调用链：`parse_module` → `parse_module_file_or_dir` → `parse_module_file` → `parse_module_block`
 
-关键步骤在 [parse_module_file_or_dir](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_module.rs#L769-L860)：
+关键步骤在 `crates/nu-parser/src/parse_module.rs#L769-L860`（`parse_module_file_or_dir`）：
 
 1. **路径解析**：通过 `find_in_dirs` 在 `$NU_LIB_DIRS` 和当前工作目录中搜索
 2. **目录模块**：如果路径是目录，必须存在 `mod.nu` 作为入口文件
@@ -100,7 +104,7 @@ module mymodule {
 
 ### 3.3 模块块解析 (parse_module_block)
 
-定义于 [parse_module.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_module.rs#L489-L664)，核心流程：
+定义于 `crates/nu-parser/src/parse_module.rs#L489-L664`，核心流程：
 
 ```
 1. enter_scope()          // 进入独立作用域
@@ -112,14 +116,14 @@ module mymodule {
    - use               → 导入其他模块
    - export-env        → 环境块
 5. 将导出项注册到 Module 结构体
-6. exit_scope()           // 退出独立作用域
+6. exit_scope()           // 退出独立作用域（非导出定义被丢弃）
 ```
 
 **预声明机制的作用**：通过 `parse_def_predecl` 在第一遍扫描时先注册所有函数名，解决模块内函数互相调用的前向引用问题。
 
 ### 3.4 模块内导出处理
 
-在 [parse_export_in_module](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_module.rs#L147-L364) 中处理各种导出：
+在 `crates/nu-parser/src/parse_module.rs#L147-L364`（`parse_export_in_module`）中处理各种导出：
 
 - **`export def main`**：特殊处理，设置 `module.main`，不进入 `decls`
 - **`export def <name>`**：调用 `module.add_decl(name, id)`
@@ -134,22 +138,26 @@ module mymodule {
 
 ### 4.1 parse_use 核心流程
 
-定义于 [parse_module.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_module.rs#L1044-L1287)：
+定义于 `crates/nu-parser/src/parse_module.rs#L1044-L1287`：
 
 ```
 1. 解析 import pattern（模块名 + 导入成员）
-2. 加载模块（优先用已解析的 ID，否则从文件系统加载）
+2. 加载模块（优先级分支）：
+   a. 若 import_pattern.head.id 是 Some → 直接使用已有 ModuleId
+   b. 否则调用 parse_module_file_or_dir() 从文件系统加载（会触发缓存+循环检测）
 3. module.resolve_import_pattern()  // 解析具体要导入哪些符号
 4. 注册到当前作用域：
    - working_set.use_decls()      // 注册命令
    - working_set.use_modules()    // 注册子模块
    - working_set.use_variables()  // 注册常量
-5. parent_module.track_imported_modules()  // 记录导入关系
+5. parent_module.track_imported_modules()  // 记录导入关系到 imported_modules
 ```
+
+**关键点**：`import_pattern.head.id` 为 Some 的情况通常出现在 `export use` 或解析器已经在之前步骤中注册过模块时，此时跳过文件系统加载。
 
 ### 4.2 导入模式解析 (resolve_import_pattern)
 
-定义于 [module.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/module.rs#L114-L339)，递归实现：
+定义于 `crates/nu-protocol/src/module.rs#L114-L339`，递归实现：
 
 **无成员（`use mymodule`）**：
 - 导入所有声明，名称带前缀 `mymodule <decl_name>`
@@ -169,7 +177,7 @@ module mymodule {
 
 ### 4.3 导入名称前缀机制
 
-`decls_with_head` 函数在 [module.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/module.rs#L352-L369) 实现：
+`decls_with_head` 函数在 `crates/nu-protocol/src/module.rs#L352-L369` 实现：
 
 ```rust
 pub fn decls_with_head(&self, head: &[u8]) -> Vec<(Vec<u8>, DeclId)> {
@@ -202,7 +210,7 @@ StateDelta（变更集）
 
 #### ScopeFrame
 
-定义于 [overlay.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/engine/overlay.rs#L47-L64)：
+定义于 `crates/nu-protocol/src/engine/overlay.rs#L47-L64`：
 
 ```rust
 pub struct ScopeFrame {
@@ -215,7 +223,7 @@ pub struct ScopeFrame {
 
 #### OverlayFrame
 
-定义于 [overlay.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/engine/overlay.rs#L180-L189)：
+定义于 `crates/nu-protocol/src/engine/overlay.rs#L180-L189`：
 
 ```rust
 pub struct OverlayFrame {
@@ -231,7 +239,7 @@ pub struct OverlayFrame {
 
 #### Visibility
 
-定义于 [overlay.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/engine/overlay.rs#L8-L44)：
+定义于 `crates/nu-protocol/src/engine/overlay.rs#L8-L44`：
 
 ```rust
 pub struct Visibility {
@@ -246,7 +254,7 @@ pub struct Visibility {
 
 ### 5.3 作用域进入与退出
 
-实现在 [state_delta.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/engine/state_delta.rs#L134-L140)：
+实现在 `crates/nu-protocol/src/engine/state_delta.rs#L134-L140`：
 
 ```rust
 pub fn enter_scope(&mut self) {
@@ -262,7 +270,7 @@ pub fn exit_scope(&mut self) {
 
 ### 5.4 声明查找算法
 
-`StateWorkingSet::find_decl` 在 [state_working_set.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/engine/state_working_set.rs#L443-L477) 中实现：
+`StateWorkingSet::find_decl` 在 `crates/nu-protocol/src/engine/state_working_set.rs#L443-L477` 中实现：
 
 ```
 查找顺序（从新到旧）：
@@ -278,7 +286,7 @@ pub fn exit_scope(&mut self) {
 
 ### 5.5 hide 机制
 
-`parse_hide` 在 [parse_module.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_module.rs#L1289-L1466) 中实现：
+`parse_hide` 在 `crates/nu-parser/src/parse_module.rs#L1289-L1466` 中实现：
 
 1. 解析 hide 的 import pattern
 2. 找到对应模块，计算要隐藏的声明名列表
@@ -292,7 +300,7 @@ pub fn exit_scope(&mut self) {
 
 ### 6.1 Alias 数据结构
 
-定义于 [alias.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/alias.rs#L13-L20)：
+定义于 `crates/nu-protocol/src/alias.rs#L13-L20`：
 
 ```rust
 pub struct Alias {
@@ -308,7 +316,7 @@ Alias 实现了 `Command` trait，本质上是一个**特殊的命令包装器**
 
 ### 6.2 别名解析流程
 
-`parse_alias` 在 [parse_alias.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_alias.rs#L62-L310) 中实现：
+`parse_alias` 在 `crates/nu-parser/src/parse_alias.rs#L62-L310` 中实现：
 
 ```
 1. 验证语法：alias <name> = <expansion>
@@ -325,43 +333,233 @@ Alias 实现了 `Command` trait，本质上是一个**特殊的命令包装器**
 
 ---
 
-## 七、循环依赖处理
+## 七、循环依赖与重复导入：两层防护机制
 
-### 7.1 模块级别的循环避免
+### 7.1 概览：检测顺序
 
-Nushell 并没有显式的循环依赖检测算法，而是通过**缓存机制**自然避免：
+Nushell 对循环导入和重复导入有**两层机制**，且执行顺序非常关键。在 `parse_module_file`（`crates/nu-parser/src/parse_module.rs#L706-L758`）中：
 
-在 [parse_module_file](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_module.rs#L706-L758) 中：
+```
+① add_file() + get_span_for_file()
+      ↓
+② find_module_by_span(new_span) + module_needs_reloading()
+      │  ├─ 命中缓存 → 直接返回 ModuleId（跳过后续所有检测）
+      │  └─ 未命中 ↓
+③ working_set.files.push(path)   ← 显式循环检测（FileStack 栈）
+      │  ├─ 检测到循环 → ParseError::CircularImport
+      │  └─ 无循环 ↓
+④ parse_module_block()           ← 实际解析
+      ↓
+⑤ working_set.files.pop()
+      ↓
+⑥ working_set.add_module()       ← 注册到全局，为后续缓存命中做准备
+```
+
+> **关键洞察**：只有当 ② 缓存**未命中**时，才会走到 ③ 的显式循环检测。两者保护的是不同场景。
+
+### 7.2 第一层：Span 缓存机制（重复导入复用）
+
+**目标**：避免同一个文件被**重复解析**。
+
+#### 7.2.1 文件内容 → Span 的映射
+
+`StateWorkingSet::add_file` 在 `crates/nu-protocol/src/engine/state_working_set.rs#L339-L359` 中：
 
 ```rust
-// 关键检查：通过 span 查找是否已解析过此文件
-if let Some(module_id) = working_set.find_module_by_span(new_span)
-    && !module_needs_reloading(working_set, module_id)
-{
-    return Some(module_id);  // 直接返回已缓存的 ID，不再重复解析
+pub fn add_file(&mut self, filename: &str, contents: &[u8]) -> FileId {
+    // 先检查：(文件名 + 文件内容) 完全一致的文件是否已存在
+    for (idx, cached_file) in self.files().enumerate() {
+        if &*cached_file.name == filename && &*cached_file.content == contents {
+            return FileId::new(idx);  // 直接复用旧 FileId → 同一个 Span
+        }
+    }
+    // 否则分配新的 covered_span
+    ...
 }
 ```
 
-**工作原理**：
-- 每个文件解析后会获得唯一的 `span`（基于文件内容偏移）
-- 当 A 导入 B，B 又导入 A 时，第二次解析 A 会命中缓存，直接返回已有的 ModuleId
-- 这样不会陷入无限递归，但可能导致**部分导入**（A 看到的是尚未完全解析完的 B）
+这意味着：**同一个物理文件（路径+内容一致）无论被导入多少次，始终获得相同的 Span**。这是缓存命中的前提。
 
-### 7.2 导入关系跟踪
+#### 7.2.2 Span → ModuleId 的查找
 
-每个 Module 维护 `imported_modules: Vec<ModuleId>`，在 `parse_use` 中通过 `track_imported_modules` 记录。这用于：
+`StateWorkingSet::find_module_by_span` 在 `crates/nu-protocol/src/engine/state_working_set.rs#L1029-L1040`：
+
+```rust
+pub fn find_module_by_span(&self, span: Span) -> Option<ModuleId> {
+    // 先在 delta.modules 中线性扫描（当前解析会话新增的模块）
+    for (id, module) in self.delta.modules.iter().enumerate() {
+        if Some(span) == module.span {
+            return Some(ModuleId::new(self.permanent_state.num_modules() + id));
+        }
+    }
+    // 再在 permanent_state.modules 中扫描（永久已合并的模块）
+    for (module_id, module) in self.permanent_state.modules.iter().enumerate() {
+        if Some(span) == module.span {
+            return Some(ModuleId::new(module_id));
+        }
+    }
+    None
+}
+```
+
+**命中条件**（两者必须同时满足）：
+1. 已有一个 Module 的 `span` 与当前文件的 Span 相等
+2. `module_needs_reloading()` 返回 false（文件内容未变、子模块也未变）
+
+#### 7.2.3 缓存生效的边界条件
+
+缓存机制能避免重复解析，但**有严格的时间边界**：
+
+| 场景 | 是否命中缓存 | 原因 |
+|------|-------------|------|
+| 同一文件在解析完成后再次被 `use` | ✅ 命中 | 已完成 ⑥ `add_module()`，span→ModuleId 映射存在 |
+| 同一文件在**解析过程中**被循环引用 | ❌ 未命中 | 还没执行到 ⑥，模块还没注册到全局表 |
+| 文件内容发生变更 | ❌ 未命中 | `module_needs_reloading()` 返回 true |
+| 同一个目录通过不同路径（软链/别名）导入 | ⚠️ 视情况 | `add_file()` 比较的是路径字符串，非物理路径 |
+
+### 7.3 第二层：FileStack 显式循环检测
+
+**目标**：捕获"解析调用栈中的循环"——即 A 解析未完成时，B 通过 `use` 链再次请求解析 A。
+
+#### 7.3.1 FileStack 数据结构
+
+定义于 `crates/nu-protocol/src/engine/state_working_set.rs#L1180-L1240`：
+
+```rust
+/// Files being evaluated, arranged as a stack.
+/// The current active file is on the top of the stack.
+/// When a file source/import another file, the new file is pushed onto the stack.
+/// Attempting to add files that are already in the stack (circular import) results in an error.
+///
+/// Note that file paths are compared without canonicalization, so the same
+/// physical file may still appear multiple times under different paths.
+/// This doesn't affect circular import detection though.
+pub struct FileStack(Vec<PathBuf>);
+```
+
+#### 7.3.2 循环检测核心算法
+
+```rust
+pub fn push(&mut self, path: PathBuf, span: Span) -> Result<(), ParseError> {
+    // 从栈顶逆序查找：找到最近一次出现该路径的位置
+    if let Some(i) = self.0.iter().rposition(|p| p == &path) {
+        // 构造错误消息，展示完整的循环链
+        let filenames: Vec<String> = self.0[i..]
+            .iter()
+            .chain(std::iter::once(&path))
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let msg = filenames.join("\nuses ");
+        // 例如："a.nu\nuses b.nu\nuses a.nu"
+        return Err(ParseError::CircularImport(msg, span));
+    }
+    self.0.push(path);
+    Ok(())
+}
+```
+
+错误类型定义于 `crates/nu-protocol/src/errors/parse_error.rs#L274-L276`：
+```rust
+CircularImport(String, #[label = "detected circular import"] Span)
+```
+
+#### 7.3.3 入栈/出栈的精确位置
+
+在文件模块解析（`parse_module_file`）中：
+- **入栈**：`crates/nu-parser/src/parse_module.rs#L743`，在缓存检查**之后**、实际解析**之前**
+- **出栈**：`crates/nu-parser/src/parse_module.rs#L751`，解析完成后立即弹出
+
+在 `source`/`source-env` 命令（`crates/nu-parser/src/parse_source.rs`）中也有相同的入栈/出栈模式：
+- 入栈：`#L119` / `#L317`
+- 出栈：`#L135` / `#L333`
+
+#### 7.3.4 FileStack 的边界
+
+| 场景 | 是否触发 CircularImport | 原因 |
+|------|------------------------|------|
+| A.nu → use B.nu → use A.nu（真正的循环） | ✅ 报错 | A 在栈中，B 解析中再次 push A 被检测 |
+| A.nu → use B.nu → use C.nu；D.nu → use B.nu | ❌ 不触发 | B 首次解析完后已 pop 出栈；D→B 走缓存命中（第二层不被执行） |
+| 内联模块 `module foo { ... }` | ❌ 不触发 | 直接调用 `parse_module_block`，绕过 `parse_module_file`，不经过 FileStack |
+| 同文件通过不同路径字符串导入（`./a.nu` vs `../dir/a.nu`） | ⚠️ 可能漏报 | `PathBuf` 比较是逐字节字符串比较，不做路径规范化 |
+| `overlay use` 一个模块 | ✅ 经过检测 | `overlay use` 内部同样调用模块解析流程 |
+
+### 7.4 典型场景推演
+
+#### 场景 1：重复导入（安全）
+
+```nu
+# main.nu
+use a
+use a   # 第二次 use 同一个文件
+```
+
+执行流程：
+1. 第一次 `use a`：缓存未命中 → files.push(a) → 解析 → files.pop() → add_module(A)
+2. 第二次 `use a`：`find_module_by_span(A_span)` **命中** → 直接返回 A 的 ModuleId
+3. **结果**：成功，无重复解析
+
+#### 场景 2：间接循环依赖（报错）
+
+```nu
+# a.nu
+use b
+def fa [] { fb }
+
+# b.nu
+use a
+def fb [] { fa }
+```
+
+执行流程（入口为 `use a`）：
+1. 解析 a.nu：缓存未命中 → files.push(a) → 进入 parse_module_block
+2. 遇到 `use b`：触发 b.nu 解析
+3. 解析 b.nu：缓存未命中 → files.push(b) → 进入 parse_module_block
+4. 遇到 `use a`：触发 a.nu 解析
+5. **缓存检查**：find_module_by_span(A_span) → **未命中**（步骤 1 还在 parse_module_block 中，未到 add_module）
+6. **files.push(a)**：检测到 a 已在栈 `[a, b]` 中 → **ParseError::CircularImport**
+
+**结果**：报错，显示循环链 `a.nu\nuses b.nu\nuses a.nu`
+
+#### 场景 3：DAG 依赖链（正确）
+
+```nu
+# lib.nu → 公共库
+# a.nu  → use lib
+# b.nu  → use lib
+# main  → use a, use b
+```
+
+执行流程：
+1. `use a` → A 未缓存 → push(a) → 解析 A 中 `use lib` → lib 未缓存 → push(lib) → 解析 lib → pop(lib) → add_module(Lib) → 继续 A → pop(a) → add_module(A)
+2. `use b` → B 未缓存 → push(b) → 解析 B 中 `use lib` → **find_module_by_span(Lib_span) 命中** → 直接返回 Lib，不 push，不重新解析 → 继续 B → pop(b) → add_module(B)
+
+**结果**：成功，lib.nu 只被解析一次
+
+### 7.5 导入关系跟踪 (imported_modules)
+
+每个 Module 维护 `imported_modules: Vec<ModuleId>`，在 `parse_use` 中通过 `track_imported_modules` 记录。**这不是循环检测用的**，而是用于：
 
 1. **热重载检测** (`module_needs_reloading`)：递归检查所有导入的子模块是否有文件变更
 2. **模块变更传播**：当依赖的模块变更时，当前模块也需要重新解析
 
-### 7.3 前向引用（模块内循环）
+实现于 `crates/nu-parser/src/parse_module.rs#L666-L704`：
 
-模块内部的函数互相调用通过**两阶段解析**解决：
+```rust
+fn module_needs_reloading(working_set: &StateWorkingSet, module_id: ModuleId) -> bool {
+    // 1. 检查所有 export submodules 是否变更
+    // 2. 递归检查 submodule_need_reloading（含 imported_modules）
+    // 任意一个变更 → 当前模块也需要重新加载
+}
+```
+
+### 7.6 前向引用（模块内循环）
+
+模块内部的函数互相调用通过**两阶段解析**解决（不属于循环导入检测范畴）：
 
 1. 第一阶段：`parse_def_predecl` 扫描所有 `def`，只注册函数名（预声明）
 2. 第二阶段：正常解析函数体，此时所有函数名已经可用
 
-实现在 [parse_module_block](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_module.rs#L510-L514)：
+实现在 `crates/nu-parser/src/parse_module.rs#L510-L514`：
 
 ```rust
 // 第一遍：预声明
@@ -378,7 +576,7 @@ for pipeline in output.block.iter() { ... }
 
 ## 八、运行时作用域数据收集
 
-`ScopeData` 在 [scope.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-engine/src/scope.rs#L9-L16) 中负责为 `scope` 系列命令收集数据：
+`ScopeData` 在 `crates/nu-engine/src/scope.rs#L9-L16` 中负责为 `scope` 系列命令收集数据：
 
 ```rust
 pub struct ScopeData<'e, 's> {
@@ -402,11 +600,13 @@ pub struct ScopeData<'e, 's> {
 
 | 设计点 | 实现方式 | 位置 |
 |--------|----------|------|
-| **模块隔离** | `enter_scope/exit_scope` 包裹模块解析，非导出定义随 ScopeFrame 丢弃 | [parse_module.rs#L494, #L661](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_module.rs#L494-L661) |
-| **名称前缀** | `decls_with_head` 将导出名包装为 `<module> <decl>` | [module.rs#L352-L369](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/module.rs#L352-L369) |
-| **可见性控制** | `Visibility` 哈希表，hide 只是标记不可见而非删除 | [overlay.rs#L8-L44](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/engine/overlay.rs#L8-L44) |
-| **前向引用** | 两阶段解析：先预声明所有 def，再解析函数体 | [parse_module.rs#L510-L514](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_module.rs#L510-L514) |
-| **循环导入** | 基于 span 的模块缓存，已解析的文件直接复用 | [parse_module.rs#L737-L741](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_module.rs#L737-L741) |
-| **别名实现** | Alias 实现 Command trait，是命令包装器而非文本替换 | [alias.rs#L22-L68](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/alias.rs#L22-L68) |
-| **热重载** | `module_needs_reloading` 递归检查文件内容哈希 | [parse_module.rs#L666-L704](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-parser/src/parse_module.rs#L666-L704) |
-| **Overlay 系统** | 每个 ScopeFrame 可有多个 Overlay，支持动态激活/移除 | [overlay.rs#L47-L177](file:///d:/fz/0601-2/solo-dogfeeding/code/66-nushell/crates/nu-protocol/src/engine/overlay.rs#L47-L177) |
+| **模块隔离** | `enter_scope/exit_scope` 包裹模块解析，非导出定义随 ScopeFrame 丢弃 | `crates/nu-parser/src/parse_module.rs#L494, #L661` |
+| **名称前缀** | `decls_with_head` 将导出名包装为 `<module> <decl>` | `crates/nu-protocol/src/module.rs#L352-L369` |
+| **可见性控制** | `Visibility` 哈希表，hide 只是标记不可见而非删除 | `crates/nu-protocol/src/engine/overlay.rs#L8-L44` |
+| **前向引用** | 两阶段解析：先预声明所有 def，再解析函数体 | `crates/nu-parser/src/parse_module.rs#L510-L514` |
+| **重复导入复用** | `add_file()` 内容哈希 + `find_module_by_span()` 线性扫描，模块注册后后续导入直接复用 | `crates/nu-protocol/src/engine/state_working_set.rs#L339-L359`、`#L1029-L1040` |
+| **循环导入检测** | `FileStack` 栈式跟踪当前解析链，`push()` 时检测重复并抛出 `CircularImport` | `crates/nu-protocol/src/engine/state_working_set.rs#L1180-L1240` |
+| **检测优先级** | 先查 span 缓存（已解析完成的模块）→ 再查 FileStack（解析中循环） | `crates/nu-parser/src/parse_module.rs#L737-L746` |
+| **别名实现** | Alias 实现 Command trait，是命令包装器而非文本替换 | `crates/nu-protocol/src/alias.rs#L22-L68` |
+| **热重载** | `module_needs_reloading` 递归检查文件内容 + imported_modules 链 | `crates/nu-parser/src/parse_module.rs#L666-L704` |
+| **Overlay 系统** | 每个 ScopeFrame 可有多个 Overlay，支持动态激活/移除 | `crates/nu-protocol/src/engine/overlay.rs#L47-L177` |
