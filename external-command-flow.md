@@ -625,6 +625,306 @@ if ctx.engine_state.get_decl(*decl_id).name() == "complete" {
 | SIGPIPE 信号退出 | ✅ 忽略 | ✅ 忽略 |
 | 其他信号退出 | ❌ 报错 | ❌ 报错 |
 
+### 4.7 pipefail 模式下 LAST_EXIT_CODE 覆盖问题
+
+**核心问题**：开启 pipefail 后，若中间命令失败，`LAST_EXIT_CODE` 是否会被错误覆盖？
+
+**答案**：**不会被错误覆盖，但设置时机取决于错误发生的位置。**
+
+#### 4.7.1 LAST_EXIT_CODE 设置的完整时机链
+
+`LAST_EXIT_CODE` 的设置发生在以下关键时刻，按执行顺序：
+
+| 时机 | 代码位置 | 设置值 | 说明 |
+|------|---------|--------|------|
+| drain 过程中 stream.drain() 出错 | [eval_ir.rs:L1725-L1727](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1725-L1727) | 错误中的退出码 | `ctx.stack.set_last_error(&err)` |
+| drain 过程中 stream.drain() 成功 | [eval_ir.rs:L1739](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1739) | 0 | `ctx.stack.set_last_exit_code(0, span)` |
+| pipefail 检查出错 | [eval_ir.rs:L1767](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1767) | 错误中的退出码 | 错误返回后由外层设置 |
+| 源执行成功 | [util.rs:L253](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-cli/src/util.rs#L253) | 0 或实际退出码 | 最终设置 |
+| 源执行出错 | [util.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-cli/src/util.rs) | 错误中的退出码 | 通过 `set_last_error` 设置 |
+
+#### 4.7.2 错误提取逻辑：external_exit_code()
+
+定义于 [shell_error/mod.rs:L1481-L1497](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/errors/shell_error/mod.rs#L1481-L1497)
+
+```rust
+pub fn external_exit_code(&self) -> Option<Spanned<i32>> {
+    let (item, span) = match *self {
+        Self::NonZeroExitCode { exit_code, span } => (exit_code.into(), span),
+        #[cfg(unix)]
+        Self::TerminatedBySignal { signal, span, .. }
+        | Self::CoreDumped { signal, span, .. } => (-signal, span),
+        _ => return None,
+    };
+    Some(Spanned { item, span })
+}
+
+pub fn exit_code(&self) -> Option<i32> {
+    match self {
+        Self::Return { .. } | Self::Break { .. } | Self::Continue { .. } => None,
+        _ => self.external_exit_code().map(|e| e.item).or(Some(1)),
+    }
+}
+```
+
+#### 4.7.3 pipefail 中间失败的覆盖分析
+
+以 `cmd1(失败) | cmd2(成功) | cmd3(成功)` 为例，pipefail 开启：
+
+```
+执行顺序:
+1. cmd1 执行 → 非零退出码 1
+   └─ exit_status 保存在 ExitStatusGuard 中
+
+2. cmd2 执行 → 成功退出码 0
+   └─ exit_status 追加到 exit 向量
+
+3. cmd3 执行 → 成功退出码 0
+   └─ exit_status 追加到 exit 向量
+
+4. drain 阶段:
+   a. ByteStream::drain(cmd3) → 成功
+      └─ set_last_exit_code(0)  ✅ 此时 LAST_EXIT_CODE=0
+
+   b. pipefail 检查（反向遍历）:
+      i.  check cmd3 → 成功
+      ii. check cmd2 → 成功
+      iii.check cmd1 → 失败（退出码 1）
+          └─ 返回 Err(ShellError::NonZeroExitCode { exit_code: 1 })
+
+   c. 错误返回后，外层调用 set_last_error(&err)
+      └─ set_last_exit_code(1)  ✅ LAST_EXIT_CODE 被更新为 1
+
+最终结果:
+LAST_EXIT_CODE = 1 (cmd1 的退出码)
+错误被抛出，指向 cmd1 的位置
+```
+
+**关键结论**：
+- ✅ `LAST_EXIT_CODE` 最终会被设置为**导致 pipefail 失败的命令**的退出码
+- ✅ 中间命令的失败不会被最后一个命令的成功覆盖
+- ✅ 错误信息会正确指向失败命令的代码位置
+
+### 4.8 赋值收集时的子进程失败检查
+
+**核心问题**：在赋值收集（如 `let x = external1 | external2`）时，是否还检查子进程的失败？
+
+**答案**：**取决于收集方式，有三种不同的行为。**
+
+#### 4.8.1 三种收集指令对比
+
+| 指令 | ignore_error | 检查 pipefail？ | 检查子进程失败？ | 场景 |
+|------|-------------|----------------|-----------------|------|
+| `collect_reg` | —（清空 exit） | ❌ | ✅（通过 into_value） | `StoreVariable`、`StoreEnv` |
+| `Collect` | `true` | ❌ | ✅（通过 into_value） | 内部收集为 Value |
+| `TryCollect` | `false` | ✅ | ✅ | `try` 块中的收集 |
+
+#### 4.8.2 collect_reg 的行为
+
+定义于 [eval_ir.rs:L208-L221](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L208-L221)
+
+```rust
+fn collect_reg(&mut self, reg_id: RegId, fallback_span: Span) -> Result<Value, ShellError> {
+    #[cfg(feature = "os")]
+    let body = {
+        let mut data = self.take_reg(reg_id);
+        data.exit.clear();  // ⚠️ 清空退出状态向量
+        data.body
+    };
+    let span = body.span().unwrap_or(fallback_span);
+    body.into_value(span)  // ⚠️ 但仍会调用 into_value()
+}
+```
+
+**关键点**：
+1. `data.exit.clear()` 清空退出状态向量 → **pipefail 不会被触发**
+2. 但 `body.into_value(span)` 仍然会检查最后一个命令的退出码
+
+#### 4.8.3 into_value 的检查路径
+
+`into_value()` → `into_bytes()` → `ChildProcess::into_bytes()`（[byte_stream.rs:L662-L681](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/pipeline/byte_stream.rs#L662-L681)）
+
+```rust
+pub fn into_bytes(self) -> Result<Vec<u8>, ShellError> {
+    // ...
+    #[cfg(feature = "os")]
+    ByteStreamSource::Child(child) => child.into_bytes(),
+}
+
+// child.rs:L376-L406
+pub fn into_bytes(self) -> Result<Vec<u8>, ShellError> {
+    let bytes = ...;  // 收集 stdout 字节
+    let mut exit_status = self.exit_status.lock()...;
+    let ignore_error = *self.ignore_error.lock()...;
+    check_ok(exit_status.wait(self.span)?, ignore_error, self.span)?;  // ⚠️ 检查退出码
+    Ok(bytes)
+}
+```
+
+#### 4.8.4 赋值语句行为总结
+
+以 `let x = (false | ^false | ^echo done)` 为例（false 是内部命令，退出码 1）：
+
+```
+执行: false | ^false | ^echo done
+
+数据流向:
+PipelineData::Value(Error) → ^false → ByteStream(ChildProcess) → ^echo done
+
+赋值收集:
+collect_reg() → exit.clear() → into_value()
+                      │                │
+                      │                └─ 检查 ^echo done 的退出码 → 成功
+                      │
+                      └─ pipefail 不会检查 ^false 的退出码
+
+结果:
+✅ 赋值成功，x = "done"
+✅ LAST_EXIT_CODE = 0（echo done 的退出码）
+⚠️ ^false 的失败被忽略
+```
+
+**关键结论**：
+- ✅ 赋值语句会检查**最后一个命令**的退出码
+- ❌ 赋值语句**不会**检查中间命令的退出码（即使 pipefail 开启）
+- ⚠️ 这是设计行为：赋值语句的语义是"收集管道输出的值"，而非"执行管道并检查所有命令"
+
+### 4.9 complete 命令的子进程失败检查
+
+**核心问题**：`complete` 捕获 stdout/stderr 时，是否还检查子进程的失败？
+
+**答案**：**complete 命令会捕获退出状态但不会报错，子进程失败通过 `exit_code` 字段返回。**
+
+#### 4.9.1 complete 命令实现
+
+定义于 [complete.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-command/src/system/complete.rs)
+
+```rust
+fn run(
+    &self,
+    _engine_state: &EngineState,
+    _stack: &mut Stack,
+    call: &Call,
+    input: PipelineData,
+) -> Result<PipelineData, ShellError> {
+    match input {
+        PipelineData::ByteStream(stream, ..) => {
+            let Ok(mut child) = stream.into_child() else {
+                return Err(ShellError::Generic(...));
+            };
+
+            // ⚠️ 标记忽略错误，防止 pipefail 重复检查
+            #[cfg(feature = "os")]
+            child.ignore_error(true);
+
+            // ⚠️ wait_with_output 不调用 check_ok
+            let output = child.wait_with_output()?;
+            let exit_code = output.exit_status.code();
+
+            // 构造包含 stdout、stderr、exit_code 的 record
+            let mut record = Record::new();
+            if let Some(stdout) = output.stdout {
+                record.push("stdout", ...);
+            }
+            if let Some(stderr) = output.stderr {
+                record.push("stderr", ...);
+            }
+            record.push("exit_code", Value::int(exit_code.into(), head));
+
+            Ok(Value::record(record, call.head).into_pipeline_data())
+        }
+        // ...
+    }
+}
+```
+
+#### 4.9.2 complete 的管道重定向
+
+`complete` 命令通过 `pipe_redirection()` 方法请求分离的 stderr 流（[complete.rs:L97-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-command/src/system/complete.rs#L97-L99)）：
+
+```rust
+fn pipe_redirection(&self) -> (Option<OutDest>, Option<OutDest>) {
+    (Some(OutDest::PipeSeparate), Some(OutDest::PipeSeparate))
+}
+```
+
+这确保了上游外部命令的 stdout 和 stderr 作为分离的管道传递给 complete。
+
+#### 4.9.3 wait_with_output 的实现
+
+定义于 [child.rs:L464-L505](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs#L464-L505)
+
+```rust
+pub fn wait_with_output(self) -> Result<ProcessOutput, ShellError> {
+    let (stdout, stderr) = match (self.stdout, self.stderr) {
+        (Some(stdout), Some(stderr)) => {
+            // 分别在不同线程收集 stdout 和 stderr
+            let stderr_handle = thread::spawn(move || collect_bytes(stderr));
+            let stdout = collect_bytes(stdout)?;
+            let stderr = stderr_handle.join()...?;
+            (Some(stdout), Some(stderr))
+        }
+        // ... 其他情况
+    };
+
+    let mut exit_status = self.exit_status.lock()...;
+    let exit_status = exit_status.wait(self.span)?;  // ⚠️ 只等待，不检查
+
+    Ok(ProcessOutput { stdout, stderr, exit_status })
+}
+```
+
+**关键点**：`wait_with_output()` **不调用 `check_ok()`**，只收集输出和退出状态。
+
+#### 4.9.4 Call 指令中的特殊处理
+
+在 `Instruction::Call` 处理中，`complete` 命令会清空继承的退出状态（[eval_ir.rs:L696-L698](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L696-L698)）：
+
+```rust
+// complete 命令：清空继承的退出状态
+if ctx.engine_state.get_decl(*decl_id).name() == "complete" {
+    original_exit.clear();  // ⚠️ 下游不再检查上游退出状态
+}
+```
+
+#### 4.9.5 complete 行为总结
+
+以 `^false | complete` 为例：
+
+```
+执行: ^false | complete
+
+阶段 1: ^false 执行
+  ├─ spawn 进程，退出码 1
+  └─ 返回 PipelineData::ByteStream(ChildProcess)
+      └─ exit_status_future = Some(ExitStatusGuard { ignore_error: false })
+
+阶段 2: complete 执行
+  ├─ stream.into_child() → 获取 ChildProcess
+  ├─ child.ignore_error(true) → 标记忽略
+  ├─ child.wait_with_output() → 收集 stdout/stderr，等待退出
+  │  └─ 不检查退出码，直接返回 exit_status=Exited(1)
+  ├─ original_exit.clear() → 清空上游退出状态
+  ├─ 返回 record { stdout: "", stderr: "", exit_code: 1 }
+  └─ clone_exit_status_future() → 返回 None（因为 output 是 Value，不是 ByteStream）
+
+阶段 3: 输出结果
+  └─ 打印 record，exit_code 字段为 1
+
+结果:
+✅ 不报错
+✅ exit_code 字段包含子进程的实际退出码
+✅ stdout/stderr 字段包含输出内容
+✅ LAST_EXIT_CODE 不会被设置为 1（因为没有错误）
+```
+
+**关键结论**：
+- ✅ `complete` 捕获所有输出和退出状态
+- ✅ 非零退出通过 `exit_code` 字段返回，不抛出错误
+- ✅ `ignore_error(true)` 防止后续 pipefail 检查重复报错
+- ✅ `original_exit.clear()` 确保下游不受上游失败影响
+- ⚠️ `complete` 命令名是硬编码检查的，不够优雅
+
 ---
 
 ## 第五部分：完整管道执行流程
@@ -702,6 +1002,259 @@ LAST_EXIT_CODE: 始终等于最后一个命令（cmd3）的退出码
 
 ---
 
+## 第七部分：stderr 单独入管道与完整捕获的流向
+
+### 7.1 stderr 管道模式对比
+
+Nushell 支持三种 stderr 管道模式，由 `OutDest` 枚举控制：
+
+| 模式 | 语法 | OutDest | 行为 |
+|------|------|---------|------|
+| 默认继承 | `external` | `OutDest::Inherit` | stderr 直接输出到终端 |
+| 合并管道 | `external o+e>| other` | `OutDest::Pipe`（stdout 和 stderr 都设为 Pipe） | stderr 与 stdout 合并后传递给下游 |
+| 分离管道 | `external e>| other` | `OutDest::PipeSeparate` | stderr 单独传递，stdout 去向由其他重定向决定 |
+| 完整捕获 | `external | complete` | `OutDest::PipeSeparate`（stdout 和 stderr 都设为 PipeSeparate） | stdout 和 stderr 分离捕获 |
+
+### 7.2 OutDest::Pipe 模式（合并流）
+
+#### 7.2.1 配置逻辑
+
+定义于 [run_external.rs:L240-L246](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-command/src/system/run_external.rs#L240-L246)
+
+```rust
+// 特殊情况：stdout 和 stderr 都为 Pipe 时，合并为一个流
+let merged_stream = if matches!(stdout, OutDest::Pipe) && matches!(stderr, OutDest::Pipe) {
+    let (reader, writer) = os_pipe::pipe()?;
+    command.stdout(writer.try_clone()?);
+    command.stderr(writer);       // stdout 和 stderr 写入同一个管道
+    Some(reader)
+} else {
+    command.stdout(Stdio::try_from(stdout)?);
+    command.stderr(Stdio::try_from(stderr)?);
+    None
+};
+```
+
+**关键点**：
+1. 使用 `os_pipe::pipe()` 创建单个管道
+2. stdout 和 stderr 都重定向到同一个写端
+3. 读端作为 `merged_stream` 包装到 `ChildProcess` 中
+4. 下游无法区分 stdout 和 stderr
+
+#### 7.2.2 ChildProcess 包装
+
+```rust
+let (stdout, stderr) = match reader {
+    Some(combined) => (Some(combined), None),  // ⚠️ stderr 为 None
+    None => {
+        let stdout = child.as_mut().stdout.take().map(convert_file);
+        let stderr = child.as_mut().stderr.take().map(convert_file);
+        if swap { (stderr, stdout) } else { (stdout, stderr) }
+    }
+};
+```
+
+**合并流向图**：
+```
+外部进程 stdout ──┐
+                  ├─ os_pipe::pipe() ──> ChildProcess.stdout ──> 下游
+外部进程 stderr ──┘
+                                         ChildProcess.stderr = None
+```
+
+### 7.3 OutDest::PipeSeparate 模式（分离流）
+
+#### 7.3.1 配置逻辑
+
+当只有 stderr 设为 `PipeSeparate`（如 `e>|`）或 stdout/stderr 都设为 `PipeSeparate`（如 `complete`）时：
+
+```rust
+// 不触发合并逻辑
+command.stdout(Stdio::try_from(stdout)?);   // stdout 独立管道
+command.stderr(Stdio::try_from(stderr)?);   // stderr 独立管道
+
+// ChildProcess 包装
+let stdout = child.as_mut().stdout.take().map(convert_file);  // 独立 PipeReader
+let stderr = child.as_mut().stderr.take().map(convert_file);  // 独立 PipeReader
+```
+
+**分离流向图**：
+```
+外部进程 stdout ──> stdout Pipe ──> ChildProcess.stdout ──> 下游 stdout
+外部进程 stderr ──> stderr Pipe ──> ChildProcess.stderr ──> 下游 stderr
+```
+
+#### 7.3.2 stderr 单独入管道：`e>|` 语法
+
+以 `external e>| ^grep error` 为例：
+
+```
+重定向配置:
+- stdout: OutDest::Inherit (输出到终端)
+- stderr: OutDest::PipeSeparate (通过管道传递)
+
+执行流程:
+1. external 启动
+   ├─ stdout → Stdio::inherit() (终端)
+   └─ stderr → Stdio::piped() (独立管道)
+
+2. external 返回 PipelineData::ByteStream(ChildProcess)
+   ├─ ChildProcess.stdout = None (因为 stdout 继承终端)
+   └─ ChildProcess.stderr = Some(PipeReader)
+
+3. ByteStream 传递给 ^grep error
+   ├─ stream.into_stdio()
+   │  └─ ByteStreamSource::Child(child)
+   │     └─ ChildProcess.stdout 是 None，ChildProcess.stderr 是 Some
+   │     └─ 失败！无法零拷贝（因为 stdout 是 None）
+   └─ 回退到用户空间拷贝:
+      ├─ 创建 stdin 管道
+      └─ external stdin worker 线程读取 ByteStream 并写入
+```
+
+**关键点**：
+- `e>|` 传递的是 stderr，但 ByteStream 封装的是 stdout 流
+- 如果 ChildProcess.stdout 是 None，`into_stdio()` 会失败
+- 这意味着 `e>|` 会触发用户空间拷贝，性能低于零拷贝
+
+#### 7.3.3 错误值处理：stderr_pipe_separate
+
+当 stderr 为 `PipeSeparate` 时，eval_call 中有特殊处理（[eval_ir.rs:L1230-L1235](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1230-L1235)）：
+
+```rust
+let stderr_pipe_separate = matches!(
+    redirect_err.as_ref(),
+    Some(Redirection::Pipe(OutDest::PipeSeparate))
+);
+
+// ... 命令执行 ...
+
+match result {
+    // 当 stderr 是 PipeSeparate 时，错误包装为 Value 传递给下游
+    Err(err) if stderr_pipe_separate => Ok(PipelineData::Value(Value::error(err, head), None)),
+    result => result,
+}
+```
+
+**这意味着**：`external e>| complete` 中，如果 external 执行出错（如命令不存在），错误会被包装为 `Value::Error` 传递给 complete，而不是直接抛出。
+
+### 7.4 complete 完整捕获流程
+
+`complete` 命令通过 `pipe_redirection()` 请求分离的 stdout 和 stderr（[complete.rs:L97-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-command/src/system/complete.rs#L97-L99)）：
+
+```rust
+fn pipe_redirection(&self) -> (Option<OutDest>, Option<OutDest>) {
+    (Some(OutDest::PipeSeparate), Some(OutDest::PipeSeparate))
+}
+```
+
+#### 7.4.1 完整执行流程
+
+以 `do { ^external arg1 } | complete` 为例：
+
+```
+阶段 1: 编译时重定向解析
+  └─ compile_redirection 时，查询 complete 的 pipe_redirection()
+     └─ 返回 (Some(PipeSeparate), Some(PipeSeparate))
+     └─ 上游 external 的 stdout 和 stderr 都设为 PipeSeparate
+
+阶段 2: external 执行
+  ├─ stdout: OutDest::PipeSeparate → Stdio::piped()
+  ├─ stderr: OutDest::PipeSeparate → Stdio::piped()
+  ├─ spawn 进程
+  ├─ ChildProcess {
+  │    stdout: Some(PipeReader),  // 独立管道
+  │    stderr: Some(PipeReader),  // 独立管道
+  │    exit_status: ...,
+  │    ignore_error: false,
+  │  }
+  └─ 返回 ByteStream(ChildProcess)
+
+阶段 3: 管道传递
+  ├─ 不触发合并逻辑（因为是 PipeSeparate，不是 Pipe）
+  └─ ByteStream 传递给 complete
+
+阶段 4: complete 执行
+  ├─ stream.into_child() → 获取 ChildProcess
+  ├─ child.ignore_error(true) → 标记忽略
+  ├─ child.wait_with_output()
+  │  ├─ stdout 线程: collect_bytes(child.stdout)
+  │  ├─ stderr 线程: collect_bytes(child.stderr)
+  │  └─ 等待进程退出（不检查退出码）
+  ├─ 构造 record { stdout, stderr, exit_code }
+  └─ 返回 PipelineData::Value(Record)
+```
+
+#### 7.4.2 wait_with_output 的并发收集
+
+定义于 [child.rs:L464-L492](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs#L464-L492)
+
+```rust
+pub fn wait_with_output(self) -> Result<ProcessOutput, ShellError> {
+    let (stdout, stderr) = match (self.stdout, self.stderr) {
+        (Some(stdout), Some(stderr)) => {
+            // ⚠️ 在独立线程中收集 stderr，避免死锁
+            let stderr_handle = thread::Builder::new()
+                .spawn(move || collect_bytes(stderr))
+                .map_err(&from_io_error)?;
+
+            // 在当前线程收集 stdout
+            let stdout = collect_bytes(stdout).map_err(&from_io_error)?;
+
+            // 等待 stderr 线程完成
+            let stderr = stderr_handle
+                .join()
+                .map_err(...)
+                .and_then(|r| r.map_err(&from_io_error))?;
+
+            (Some(stdout), Some(stderr))
+        }
+        // ... 其他情况
+    };
+
+    let mut exit_status = self.exit_status.lock()...;
+    let exit_status = exit_status.wait(self.span)?;  // 只等待，不检查
+
+    Ok(ProcessOutput { stdout, stderr, exit_status })
+}
+```
+
+**为什么需要独立线程？**
+- 如果先收集 stdout 再收集 stderr，当 stderr 缓冲区满时，子进程会阻塞写 stderr
+- 同时子进程等待 stdout 被读取，造成死锁
+- 使用独立线程并发收集 stdout 和 stderr 避免死锁
+
+### 7.5 三种 stderr 模式的对比表
+
+| 特性 | 默认(Inherit) | 合并(Pipe) | 分离(PipeSeparate) | complete 捕获 |
+|------|--------------|-----------|-------------------|--------------|
+| 语法 | `external` | `o+e>|` | `e>|` | `\| complete` |
+| stdout 去向 | 终端 | 合并流 | 终端/其他 | 独立捕获 |
+| stderr 去向 | 终端 | 合并流 | 管道 | 独立捕获 |
+| 能否区分来源 | 能（终端） | ❌ 不能 | ✅ 能 | ✅ 能 |
+| 零拷贝传递 | N/A | ✅ 能 | ❌ 不能 | ❌ 不需要 |
+| 死锁风险 | 无 | 无 | 低 | 已通过线程解决 |
+| 退出码检查 | 最后一个命令 | 最后一个命令 | 最后一个命令 | 通过 exit_code 字段 |
+
+### 7.6 stderr 管道边界问题
+
+1. **`e>|` 的零拷贝限制**
+   - `e>|` 传递 stderr，但 ByteStream 封装的是 stdout
+   - 如果 ChildProcess.stdout 是 None，无法零拷贝
+   - 必须经过用户空间拷贝
+
+2. **错误值传递的边界**
+   - `stderr_pipe_separate` 模式下，错误包装为 `Value::Error` 传递
+   - 下游命令需要处理 `Value::Error`
+   - `complete` 命令有专门的处理逻辑（[complete.rs:L80](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-command/src/system/complete.rs#L80)）
+
+3. **合并流与分离流的语义混淆**
+   - `Pipe` 模式：stdout 和 stderr 合并为一个流
+   - `PipeSeparate` 模式：stderr 单独为流，stdout 去向独立
+   - 边界：当只有一个流重定向时，使用哪个模式？
+
+---
+
 ## 第六部分：边界问题与设计权衡
 
 ### 6.1 管道边界的模糊点
@@ -723,21 +1276,49 @@ LAST_EXIT_CODE: 始终等于最后一个命令（cmd3）的退出码
 ### 6.2 退出码的边界
 
 1. **`LAST_EXIT_CODE` 与 pipefail 的关系**
-   - `LAST_EXIT_CODE` 只反映最后一个命令的退出码
-   - pipefail 是额外的错误检查机制
-   - pipefail 报错后，`LAST_EXIT_CODE` 仍为最后一个命令的值
+   - `LAST_EXIT_CODE` 先被设置为最后一个命令的退出码
+   - 如果 pipefail 检查发现中间命令失败，会更新为失败命令的退出码
+   - ✅ 不会被错误覆盖，最终反映的是**导致失败的命令**的退出码
 
-2. **ignore_error 的传播**
-   - `ignore_error` 是每个命令独立的标志
+2. **错误提取逻辑：external_exit_code()**
+   - `NonZeroExitCode` → 提取 `exit_code` 字段
+   - `TerminatedBySignal` / `CoreDumped` → 提取 `-signal`
+   - 其他错误 → 返回 `None`
+
+3. **ignore_error 的传播**
+   - `ignore_error` 是每个命令独立的标志，通过 `Arc<Mutex<bool>>` 共享
    - `ignore` 命令设置后续命令的 ignore_error
-   - 赋值语句通过清空 exit 向量来"忽略"错误
+   - 赋值语句通过 `collect_reg` 清空 exit 向量来"忽略"错误
+   - `complete` 命令通过 `child.ignore_error(true)` 标记忽略
 
-3. **信号退出码**
+4. **三种收集指令的差异**
+   - `collect_reg`：清空 exit，不检查 pipefail，但检查最后一个命令（`into_value`）
+   - `Collect`：`ignore_error=true`，不检查 pipefail，但检查最后一个命令
+   - `TryCollect`：`ignore_error=false`，检查 pipefail 和所有命令
+
+5. **信号退出码**
    - Unix 下信号终止的进程，退出码为 `-signal`
    - 如 `SIGINT=2` → 退出码 `-2`
    - `SIGPIPE` 特殊处理：不视为错误
 
-### 6.3 设计权衡总结
+### 6.3 stderr 管道的边界
+
+1. **`e>|` 的零拷贝限制**
+   - `e>|` 传递 stderr，但 ByteStream 封装的是 stdout
+   - 如果 ChildProcess.stdout 是 None，无法零拷贝
+   - 必须经过用户空间拷贝，性能低于 `o+e>|`
+
+2. **错误值传递的边界**
+   - `stderr_pipe_separate` 模式下，错误包装为 `Value::Error` 传递
+   - 下游命令需要处理 `Value::Error`
+   - `complete` 命令有专门的处理逻辑
+
+3. **`wait_with_output` 的死锁避免**
+   - 并发收集 stdout 和 stderr，避免缓冲区满导致的死锁
+   - 使用独立线程收集 stderr
+   - 这是分离流模式的必要开销
+
+### 6.4 设计权衡总结
 
 | 设计决策 | 优点 | 缺点 |
 |---------|------|------|
@@ -746,6 +1327,11 @@ LAST_EXIT_CODE: 始终等于最后一个命令（cmd3）的退出码
 | collect_reg 清空 exit | 赋值语句行为符合预期 | 机制不够直观 |
 | complete 清空 exit | 语义正确（已转为数据） | 硬编码命令名，不够优雅 |
 | 反向遍历检查 pipefail | 第一个错误就是最后一个命令的，符合直觉 | — |
+| ignore_error Arc<Mutex<bool>> | 运行时可修改，complete 可以标记忽略 | 共享状态增加复杂度 |
+| wait_with_output 并发收集 | 避免 stdout/stderr 死锁 | 额外线程开销 |
+| stderr_pipe_separate 错误包装 | 错误可以通过管道传递 | 下游需要处理 Value::Error |
+| PipeSeparate 分离流 | 支持 complete 捕获 stderr | e>| 无法零拷贝 |
+| external_exit_code 从错误提取 | 统一的退出码提取逻辑 | 部分错误返回 None |
 
 ---
 
@@ -762,13 +1348,23 @@ LAST_EXIT_CODE: 始终等于最后一个命令（cmd3）的退出码
 | ChildProcess 构造 | [child.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs) | L281-L343 |
 | 退出状态检查 check_ok | [child.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs) | L48-L89 |
 | pipefail 检查 | [child.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs) | L22-L29 |
+| wait_with_output | [child.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs) | L464-L505 |
+| ignore_error 设置 | [child.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs) | L364-L370 |
 | PipelineExecutionData | [pipeline_data.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/pipeline/pipeline_data.rs) | L1116-L1163 |
 | clone_exit_status_future | [pipeline_data.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/pipeline/pipeline_data.rs) | L871-L883 |
 | drain_to_out_dests | [pipeline_data.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/pipeline/pipeline_data.rs) | L302-L327 |
 | ByteStream::drain | [byte_stream.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/pipeline/byte_stream.rs) | L683-L694 |
+| ByteStream::into_value | [byte_stream.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/pipeline/byte_stream.rs) | L662-L681 |
+| ByteStream::into_child | [byte_stream.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/pipeline/byte_stream.rs) | L586-L592 |
 | LAST_EXIT_CODE 设置 | [stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/engine/stack.rs) | L309-L319 |
+| set_last_error | [stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/engine/stack.rs) | L313-L319 |
 | Call 指令处理 | [eval_ir.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs) | L675-L713 |
 | collect_reg | [eval_ir.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs) | L208-L221 |
-| drain pipefail 检查 | [eval_ir.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs) | L1761-L1768 |
+| collect 函数 | [eval_ir.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs) | L1698-L1712 |
+| drain 函数 | [eval_ir.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs) | L1715-L1771 |
 | drain_if_end | [eval_ir.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs) | L1774-L1793 |
+| stderr_pipe_separate 处理 | [eval_ir.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs) | L1230-L1235 |
+| external_exit_code | [shell_error/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/errors/shell_error/mod.rs) | L1481-L1497 |
+| complete 命令 | [complete.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-command/src/system/complete.rs) | L27-L88 |
+| complete.pipe_redirection | [complete.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-command/src/system/complete.rs) | L97-L99 |
 | 输出目标枚举 | [out_dest.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/pipeline/out_dest.rs) | L5-L40 |
