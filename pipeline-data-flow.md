@@ -549,8 +549,8 @@ fn each_map(value: Value, closure: &mut ClosureEval, head: Span) -> Result<Value
 | 闭包输出 Nothing | 不适用（条件判断不产出 Nothing） | 默认过滤掉；`--keep-empty` 保留 |
 | 流式保留 | **始终保留**（`into_iter_strict` → `filter_map`） | **始终保留**（`into_iter` → `map`/`flat_map`） |
 | ByteStream 处理 | 通过 `chunks()` 逐块处理（`into_iter_strict` 内部 `PipelineIterator` 转换） | 通过 `chunks()` 逐块处理（显式 `ByteStream` match 分支） |
-| ByteStream chunks 错误处理 | `PipelineIterator::next` 包装为 `Value::error(原始错误, Span::unknown)`，再传入闭包执行 → **二次嵌套，原始错误丢失，span 丢失** | `chunks.map(...and_then...)` 中 `Err` 短路跳过闭包 → `unwrap_or_else` 直接包装为 `Value::error(原始错误, head)` → **错误原样保留，span 为 head** |
-| ByteStream chunks 错误时闭包是否执行 | **是**（对包装后的 `Value::error(Span::unknown())` 执行闭包） | **否**（`and_then` 短路，闭包完全不被调用） |
+| ByteStream chunks 错误处理 | `PipelineIterator::next` 包装为 `Value::error(原始错误, Span::unknown)` 后传入闭包，进入闭包后分 4 种情况：<br>• A. 类型检查提升 → 原始错误保留<br>• B. 闭包忽略参数 → 原始错误作为值保留<br>• C. 路径追踪短路 → 原始错误保留<br>• D. 闭包逻辑覆盖 → 原始错误丢失 | `chunks.map(...and_then...)` 中 `Err` 短路跳过闭包 → `unwrap_or_else` 直接包装为 `Value::error(原始错误, head)` → **错误原样保留，span 为 head**，只有一种路径 |
+| ByteStream chunks 错误时闭包是否执行 | **是**（总是执行，结果取决于闭包逻辑） | **否**（`and_then` 短路，闭包完全不被调用） |
 
 ### 7.5 Record 与 List 在字段选择上的行为差异
 
@@ -680,7 +680,7 @@ ls | get name
 | `values` | `get_values` 遇非 Record 元素 | `Err(OnlySupportsThisInputType)` | 是 | 无 |
 | `values`（ByteStream） | 类型不匹配 | `Err(OnlySupportsThisInputType)` | 是 | 无 |
 | `where` | 闭包求值失败 | `Value::error` 替代原始值 | 否（流继续，后续元素可能正常） | 无 |
-| `where`（ByteStream） | chunks IO / UTF-8 错误 | 经 `PipelineIterator` 包装 `Value::error(原始错误, Span::unknown)` → 闭包二次执行 → `Value::error(二次错误, head)`，**原始错误类型丢失** | 产出一个错误值后流结束（chunks 设置 error 标记） | 无（二次嵌套） |
+| `where`（ByteStream） | chunks IO / UTF-8 错误 → 进入闭包后分 4 种情况 | **A/C. `Value::error(原始错误, head)`，B. `Value::error(原始错误, Span::unknown())` 作为元素保留，D. `Value::error(新错误, head)`** | 产出一个错误值后流结束（chunks 设置 error 标记） | 视分支而定（A/B/C 保留，D 丢失） |
 | `each` | 闭包求值失败 | `Value::error` 替代闭包返回值 | 否（流继续，后续元素可能正常） | `chain_error_with_input` |
 | `each`（ByteStream） | chunks IO / UTF-8 错误 | `and_then` 短路，跳过闭包 → `unwrap_or_else` 直接包装 `Value::error(原始错误, head)`，**原始错误原样保留** | 产出一个错误值后流结束（chunks 设置 error 标记） | 无（但保留了原始错误） |
 
@@ -693,9 +693,10 @@ ls | get name
 5. **ByteStream 的错误是"一次性的"**：chunks 迭代器设置 `self.error = true` 后，下一次 `next()` 直接返回 `None`，即错误元素之后不会再有更多元素流出——但从外部看，错误被包装为 `Value::Error` 嵌入流中，表现为"一个错误元素 + 流结束"
 6. `select` 对 ByteStream 的处理**最不直观**：既不报错也不处理，直接返回空流，用户可能困惑为什么没有输出
 7. **`where` 与 `each` 对 ByteStream 错误的包装路径截然不同**：
-   - `where` 通过 `into_iter_strict` → `PipelineIterator`，在迭代器层用 `Value::error(err, Span::unknown())` 包装后再传入闭包，导致**原始错误类型丢失、span 丢失、被二次嵌套**
-   - `each` 通过显式 `ByteStream` 分支直接操作 `chunks.map(result.and_then(...).unwrap_or_else(...))`，`and_then` 短路跳过闭包，**原始错误原样保留、span 为 head**
-8. **`where` 的 ByteStream 错误会触发闭包执行**（对错误值执行闭包），`each` 的 ByteStream 错误**不触发闭包**——同一类 IO 错误在两个命令中的表现差异巨大
+   - `where` 通过 `into_iter_strict` → `PipelineIterator`，在迭代器层用 `Value::error(err, Span::unknown())` 包装后再传入闭包。进入闭包后**分 4 种情况**：A 类型检查提升、B 闭包忽略参数、C 路径追踪短路（这三种都能保留原始错误），只有 D 闭包逻辑覆盖会丢失原始错误
+   - `each` 通过显式 `ByteStream` 分支直接操作 `chunks.map(result.and_then(...).unwrap_or_else(...))`，`and_then` 短路跳过闭包，**只有一条确定路径**：原始错误原样保留、span 为 head
+8. **where 的 ByteStream 错误大多数情况下可以保留原始错误**：最常见的闭包形式是 cell path 访问（如 `$it.type == file`），对应分支 C（`get_value_member` 对 `Value::Error` 直接返回 `Err(原始错误)`），原始错误能正确穿透
+9. **最不直观的场景是分支 B**（闭包忽略参数）：如 `where { true }` 会让 `Value::Error` 值原样通过筛选，错误元素继续向下游传播，而用户可能以为 `where` 只处理正常数据
 
 ### 7.8 `into_stream_or_original` 与 `into_iter_strict` 的分水岭
 
@@ -833,15 +834,18 @@ NthIterator {
 │    IO 错误: 设置 error 标记，产出 Err(ShellError::Io)                                            │
 │    信号中断: 立即停止，产出 None                                                                 │
 │                                                                                               │
-│  where 接收 ByteStream 错误路径:                                                                 │
+│  where 接收 ByteStream 错误路径（PipelineIterator 包装后分 4 分支）:                         │
 │    chunks Err → PipelineIterator::next() → Value::error(原始错误, Span::unknown) //FIXME          │
-│    → closure.run_with_value(该错误值) → 二次错误 → Value::error(二次错误, head)                  │
-│    → 原始错误类型丢失, span 丢失                                                                 │
+│    → closure.run_with_value(该错误值):                                                                 │
+│       分支 A (类型检查提升): check_input_types → Err(原始错误) → where 捕获为 Value::error(原始错误, head) │
+│       分支 B (闭包忽略参数): 如 where { true } → cond=true → 保留错误值(Span::unknown) 元素        │
+│       分支 C (路径追踪短路): $it.name → get_value_member → Err(原始错误) → Value::error(原始错误, head) │
+│       分支 D (闭包逻辑覆盖): $in + 1 等 → 新类型错误 → Value::error(新错误, head)                    │
 │                                                                                               │
-│  each 接收 ByteStream 错误路径:                                                                  │
+│  each 接收 ByteStream 错误路径（单一路径）:                                                        │
 │    chunks Err → and_then 短路, each_map/闭包不执行                                               │
 │    → unwrap_or_else(|err| Value::error(原始错误, head))                                          │
-│    → 原始错误原样保留, span 为 head                                                             │
+│    → 原始错误原样保留, span 为 head                                                                 │
 │                                                                                               │
 │  Value::Error 传播总览:                                                                        │
 │    Value 中 → Err 短路 (columns/values/get多路径/select Record 分支)                         │
@@ -884,18 +888,19 @@ pub fn chunks(self) -> Option<Chunks> {
 
 4. **错误传播链**：
 
-`where` 命令的 ByteStream 错误路径（经 `PipelineIterator` 包装，二次嵌套）：
+`where` 命令的 ByteStream 错误路径（经 `PipelineIterator` 包装后进入闭包，有多种分支）：
 ```
 ByteStream::chunks() → Chunks::next() → Err(ShellError::Io/NonUtf8)
   ↓ into_iter_strict (pipeline_data.rs#L410-L416)
   PipelineIteratorInner::ByteStream(chunks)
   ↓ PipelineIterator::next() (pipeline_data.rs#L1022-L1028)
-  Value::error(原始错误, Span::unknown())  // FIXME: span 丢失！
+  Value::error(原始错误, Span::unknown())  // FIXME: span 丢失
   ↓ where::filter_map (where_.rs#L73-L79)
-  closure.run_with_value(Value::error(Span::unknown()))
-    → 闭包尝试访问字段 → 产生 ShellError（二次错误，原始错误丢失）
-  ↓
-  Some(Value::error(二次错误, head))  // 最终输出
+  closure.run_with_value(Value::error(原始错误, Span::unknown()))
+    ├── 分支 A：类型检查提升 → Err(原始错误) 被 where 捕获为 Value::error(原始错误, head)
+    ├── 分支 B：闭包忽略参数（如 where { true }）→ Value::bool(true) → 保留错误值
+    ├── 分支 C：路径追踪短路 → Err(原始错误) 被 where 捕获为 Value::error(原始错误, head)
+    └── 分支 D：闭包逻辑覆盖（如 where { $in + 1 }）→ 新 Err 被 where 捕获为 Value::error(新错误, head)
 ```
 
 `each` 命令的 ByteStream 错误路径（显式 chunks 分支，`and_then` 短路，错误直接保留）：
@@ -908,18 +913,21 @@ ByteStream::chunks() → Chunks::next() → Err(ShellError::Io/NonUtf8)
   Value::error(原始错误, head)  // 原始错误保留，span 使用 head
 ```
 
-两条路径的关键差异：
+**where 路径的四种分支详解**：
 
-| 差异点 | `where`（经 PipelineIterator） | `each`（显式 chunks 分支，含 flatten） |
-|--------|------|------|
-| 转换层次 | 两次包装（PipelineIterator + 闭包二次处理） | 一次处理（`and_then` 短路 + `unwrap_or_else`） |
-| chunks 错误的 span | `Span::unknown()`（丢失源位置） | `head`（命令调用处 span） |
-| chunks 错误是否被保留 | **否，被嵌套为闭包错误**（原始错误类型被二次错误掩盖） | **是，原样保留**（flatten 和非 flatten 均使用 `and_then` 短路，不执行闭包） |
-| 闭包是否被调用 | **是**（对 `Value::error(Span::unknown())` 执行闭包） | **否**（`and_then` 短路，跳过闭包，flatten 路径同理） |
-| 最终错误类型 | 闭包执行错误（通常是字段访问错误或类型错误） | 原始 chunks 错误（`ShellError::Io` 或 `NonUtf8Custom`） |
+| 分支 | 触发条件 | 原始错误是否保留 | 最终输出 | 代码位置 |
+|------|---------|--------------|---------|---------|
+| **A. 类型检查提升** | 闭包是自定义命令，进入 `eval_call` 时 `check_input_types` 拦截 `PipelineData::Value(Value::Error{..})` → `Err(原始错误)` | **是** | `Value::error(原始错误, head)` | [eval_ir.rs#L1246](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-engine/src/eval_ir.rs#L1246) 或 [eval_ir.rs#L1284](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-engine/src/eval_ir.rs#L1284) |
+| **B. 闭包忽略参数** | 闭包逻辑不依赖输入值（如 `where { true }`、`where { 1 > 0 }`），Value::Error 作为参数传入但不被访问 | **是**（原始错误保留在流中作为元素） | `Some(Value::error(原始错误, Span::unknown()))`——保留了 where 迭代器产生的原始错误值（`cond.is_true().then_some(value)` 中的 value 就是它） | `where_.rs#L73-L79` 的 `cond.is_true().then_some(value)` 路径 |
+| **C. 路径追踪短路** | 闭包通过 cell path 访问错误值字段（如 `where { $it.name == "x" }`），`get_value_member` 遇到 `Value::Error` 时直接 `Err(原始错误)` 短路 | **是** | `Value::error(原始错误, head)` | [mod.rs#L2291](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/value/mod.rs#L2291)（Int 路径），[mod.rs#L2387](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/value/mod.rs#L2387)（String 路径） |
+| **D. 闭包逻辑覆盖** | 闭包执行了非路径追踪的计算且失败（如 `where { $in + 1 }` 对 Error 做加法，`where { str length }` 传入 Error），产生新的 ShellError | **否**——原始错误被新的类型错误/不支持操作错误替代 | `Value::error(新错误, head)` | 各内置命令的类型检查，如算术运算、字符串命令等 |
 
-`each` 的两个 ByteStream 子路径在错误处理上完全一致（[each.rs#L204-L210](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/each.rs#L204-L210)，[each.rs#L214-L218](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/each.rs#L214-L218)）：
+**分支 C 是最常见的情况**——典型 `where { $it.type == file }` 形式的闭包通过 cell path 访问字段，`get_value_member` 对 `Value::Error` 的处理是直接返回 `Err(*error.clone())`，原始错误可以原样保留（但 span 已在 `PipelineIterator` 层丢失）。
+
+**分支 B 是最隐蔽的情况**——如果闭包不访问输入值，`Value::Error` 元素会被错误地当作普通值通过 `where` 的条件过滤。例如 `where { true }` 对一个包含错误值的 ByteStream 会保留所有错误值，而用户可能以为 `where` 只处理正常数据。
+
+**`each` 的两个 ByteStream 子路径在错误处理上完全一致**（[each.rs#L204-L210](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/each.rs#L204-L210)，[each.rs#L214-L218](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/each.rs#L214-L218)）：
 - **非 flatten**：`result.and_then(|value| each_map(value, &mut closure, head))` → `unwrap_or_else(|error| Value::error(error, head))`
 - **flatten**：`result.and_then(|value| closure.run_with_value(value))` → `unwrap_or_else(|error| Value::error(error, head).into_pipeline_data())`
 
-`PipelineIterator::next()` 中的转换（[pipeline_data.rs#L1013-L1031](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/pipeline/pipeline_data.rs#L1013-L1031)）是 where 路径问题的根源：在迭代器层将 `Result::Err` 统一转换为 `Value::Error`，失去了"提前中断闭包执行"的机会。源码中的注释 `Span::unknown()` 和 `//FIXME: unclear where this span should come from` 明确承认了 span 信息丢失的问题。
+**`PipelineIterator::next()` 中的转换**（[pipeline_data.rs#L1013-L1031](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/pipeline/pipeline_data.rs#L1013-L1031)）是 where 路径多分支行为的根源：在迭代器层将 `Result::Err` 统一转换为 `Value::Error`（`Value::error(err, Span::unknown())`），丢失了 span 信息也放弃了"提前中断闭包执行"的语义。源码中的 `//FIXME: unclear where this span should come from` 注释明确承认了这一点。
