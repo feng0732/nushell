@@ -364,12 +364,42 @@ GC 停止条件（需 **同时满足**）：
 3. `locks == 0`（无活跃调用 / 无活跃流）
 4. 距 `last_update` 超过 `config.stop_after`
 
-> **关于默认值的说明**：
-> - `PluginGcConfig::default()` 的 `stop_after` 是 **10 秒**（10_000_000_000 纳秒）
-> - 但 `PluginGcConfigs`（配置文件中的默认配置）的 default 是 **30 秒**
-> - 实际运行时以 `$env.config.plugin_gc.default` 为准，每个插件也可单独配置
+#### 默认值分层（容易混淆，逐一厘清）
 
-见 `crates/nu-protocol/src/config/plugin_gc.rs` 第 56-58、114-116 行。
+代码中存在三种"默认值"，含义完全不同，不应混淆：
+
+| 来源 | `stop_after` | `enabled` | 何时生效 | 代码位置 |
+|---|---|---|---|---|
+| `PluginGcConfig::default()` | **10 秒** | `true` | Rust `Default` trait 的硬编码默认，**仅在未加载任何用户配置时使用**（如 `Config::default()` 初始化） | `crates/nu-protocol/src/config/plugin_gc.rs` 第 54-61 行 |
+| 用户配置 `$env.config.plugin_gc.default` | 由用户设定 | 由用户设定 | **运行时实际生效的值**，会覆盖 Rust Default | 经 `UpdateFromValue::update()` 合入 |
+| 测试样例 `test_pair()` | 30 秒 | `true` | **仅用于单元测试**，验证 `update/reconstruct` 逻辑正确性，不是任何运行时默认值 | `crates/nu-protocol/src/config/plugin_gc.rs` 第 111-141 行 |
+
+> **关键纠正**：30 秒只是测试用例中的断言值，**不是** `PluginGcConfigs` 的 Rust 默认值。`PluginGcConfigs::default()` 的 `default` 字段直接委托给 `PluginGcConfig::default()`，即 10 秒。如果用户在配置文件中显式写了 `stop_after: 30sec`，那运行时就是 30 秒，但这是用户配置覆盖的结果，不是代码默认值。
+
+#### 配置覆盖链路
+
+```
+Config::default()                           // plugin_gc: PluginGcConfigs::default()
+  │                                           //   → default: PluginGcConfig { enabled: true, stop_after: 10s }
+  ▼
+$env.config.plugin_gc.update(Value)         // 用户配置覆盖
+  │
+  ▼
+add_plugin_to_working_set()                 // crates/nu-plugin-engine/src/init.rs 第 300-316 行
+  │  gc_config = config.plugin_gc.get(name) // 按插件名查找，未指定则用 default
+  │  PersistentPlugin::new(identity, gc_config)
+  │  plugin.set_gc_config(&gc_config)       // 若已存在，也会热更新
+  ▼
+PersistentPlugin::spawn()
+  │  PluginGc::new(mutable.gc_config, ...)  // GC 线程启动，持有 config 副本
+  ▼
+PluginGcState::run()                        // GC 线程主循环
+     config.stop_after → next_timeout()
+```
+
+热更新机制：`set_gc_config()` 不仅更新 `MutableState.gc_config`，还会向运行中的 GC 线程发送 `PluginGcMsg::SetConfig`，使其**无需重启插件即可生效**。
+
+见 `crates/nu-plugin-engine/src/persistent.rs` 第 294-306 行。
 
 **锁计数规则**（见 `PluginGc::increment_locks / decrement_locks`）：
 - **+1**：每次发起 PluginCall（`write_plugin_call` 结尾）
