@@ -22,9 +22,9 @@
 | REPL 主循环 | `crates/nu-cli/src/repl.rs` | ✅ 代码事实 | 控制 prompt 更新与读取的时序 |
 | `reedline::Prompt` trait | 外部依赖 | 🔍 接口契约 | 定义渲染接口，reedline 内部决定何时调用 |
 
-- [NushellPrompt 定义](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L10-L19)
-- [update_prompt() 函数](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt_update.rs#L92-L124)
-- [REPL 中调用 update_prompt](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/repl.rs#L713-L726)
+- [NushellPrompt 定义](../crates/nu-cli/src/prompt.rs#L10-L19)
+- [update_prompt() 函数](../crates/nu-cli/src/prompt_update.rs#L92-L124)
+- [REPL 中调用 update_prompt](../crates/nu-cli/src/repl.rs#L713-L726)
 
 ### 1.2 时序与生命周期：两个关键阶段
 
@@ -51,14 +51,14 @@ update_prompt()                           |  reedline 根据需要调用
 
 ### 2.1 左区域（Left Prompt）
 
-**✅ 渲染前求值** — 在 [update_prompt()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt_update.rs#L99) 中：
+**✅ 渲染前求值** — 在 [update_prompt()](../crates/nu-cli/src/prompt_update.rs#L99) 中：
 
 ```rust
 let left_prompt_string = get_prompt_string(PROMPT_COMMAND, config, engine_state, stack);
 // 存入 NushellPrompt.left_prompt 字段
 ```
 
-**✅ 渲染时读取缓存** — 在 [render_prompt_left()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L89-L105) 中：
+**✅ 渲染时读取缓存** — 在 [render_prompt_left()](../crates/nu-cli/src/prompt.rs#L89-L105) 中：
 
 ```rust
 fn render_prompt_left(&self) -> Cow<'_, str> {
@@ -79,15 +79,15 @@ fn render_prompt_left(&self) -> Cow<'_, str> {
 
 ### 2.2 右区域（Right Prompt / 状态行）
 
-**✅ 渲染前求值** — 在 [update_prompt()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt_update.rs#L101) 中：
+**✅ 渲染前求值** — 在 [update_prompt()](../crates/nu-cli/src/prompt_update.rs#L101) 中：
 
 ```rust
 let right_prompt_string = get_prompt_string(PROMPT_COMMAND_RIGHT, config, engine_state, stack);
 ```
 
-**✅ 渲染时读取缓存** — 在 [render_prompt_right()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L107-L118) 中，逻辑与左区域对称。
+**✅ 渲染时读取缓存** — 在 [render_prompt_right()](../crates/nu-cli/src/prompt.rs#L107-L118) 中，逻辑与左区域对称。
 
-**✅ 右 prompt 颜色重置保护** — 在 [get_prompt_string()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt_update.rs#L80-L84) 中：
+**✅ 右 prompt 颜色重置保护** — 在 [get_prompt_string()](../crates/nu-cli/src/prompt_update.rs#L80-L84) 中：
 
 ```rust
 // Always reset the color at the start of the right prompt
@@ -116,11 +116,11 @@ prompt_string.replace('\n', "\r\n").into()
 
 #### 2.4.1 Nushell 代码中的确定事实
 
-- **配置定义**：[`nu-protocol` Config 结构体](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-protocol/src/config/mod.rs#L74) 中 `pub render_right_prompt_on_last_line: bool`
-- **默认值**：[`false`](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-protocol/src/config/mod.rs#L131)
-- **字段存储**：[`NushellPrompt.render_right_prompt_on_last_line`](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L18)
-- **更新入口**：[`update_all_prompt_strings()`](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L63-L81) 接收配置值并存储
-- **渲染时查询**：[`right_prompt_on_last_line()`](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L158-L160) 直接返回字段值
+- **配置定义**：[`nu-protocol` Config 结构体](../crates/nu-protocol/src/config/mod.rs#L74) 中 `pub render_right_prompt_on_last_line: bool`
+- **默认值**：[`false`](../crates/nu-protocol/src/config/mod.rs#L131)
+- **字段存储**：[`NushellPrompt.render_right_prompt_on_last_line`](../crates/nu-cli/src/prompt.rs#L18)
+- **更新入口**：[`update_all_prompt_strings()`](../crates/nu-cli/src/prompt.rs#L63-L81) 接收配置值并存储
+- **渲染时查询**：[`right_prompt_on_last_line()`](../crates/nu-cli/src/prompt.rs#L158-L160) 直接返回字段值
 
 **配置传递链路（代码确定事实）：**
 
@@ -145,7 +145,7 @@ reedline 内部使用该值进行布局             （🔍 外部行为）
 
 #### 2.4.2 配置文档描述（官方语义）
 
-[`doc_config.nu`](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-utils/src/default_files/doc_config.nu#L506-L510) 中的官方说明：
+[`doc_config.nu`](../crates/nu-utils/src/default_files/doc_config.nu#L506-L510) 中的官方说明：
 
 ```
 # render_right_prompt_on_last_line (bool): Right prompt position with multi-line left prompt.
@@ -218,7 +218,7 @@ pub trait Prompt {
 
 ✅ **全部为代码确定事实**
 
-[get_prompt_string()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt_update.rs#L51-L90) 函数内部的回退链：
+[get_prompt_string()](../crates/nu-cli/src/prompt_update.rs#L51-L90) 函数内部的回退链：
 
 ```rust
 fn get_prompt_string(prompt: &str, ...) -> Option<String> {
@@ -268,7 +268,7 @@ fn get_prompt_string(prompt: &str, ...) -> Option<String> {
 
 当 `get_prompt_string()` 返回 `None` 时，`NushellPrompt` 的对应字段为 `None`，此时在渲染时触发回退。
 
-**左/右 Prompt 回退** — [render_prompt_left()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L95-L104) / [render_prompt_right()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L108-L117)：
+**左/右 Prompt 回退** — [render_prompt_left()](../crates/nu-cli/src/prompt.rs#L95-L104) / [render_prompt_right()](../crates/nu-cli/src/prompt.rs#L108-L117)：
 
 ```rust
 if let Some(prompt_string) = &self.left_prompt {
@@ -280,7 +280,7 @@ if let Some(prompt_string) = &self.left_prompt {
 }
 ```
 
-**Indicator 回退** — [render_prompt_indicator()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L120-L132)：
+**Indicator 回退** — [render_prompt_indicator()](../crates/nu-cli/src/prompt.rs#L120-L132)：
 
 ```rust
 fn render_prompt_indicator(&self, edit_mode: PromptEditMode) -> Cow<'_, str> {
@@ -297,7 +297,7 @@ fn render_prompt_indicator(&self, edit_mode: PromptEditMode) -> Cow<'_, str> {
 }
 ```
 
-**多行 Indicator 回退** — [render_prompt_multiline_indicator()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L134-L141)：
+**多行 Indicator 回退** — [render_prompt_multiline_indicator()](../crates/nu-cli/src/prompt.rs#L134-L141)：
 
 ```rust
 fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
@@ -361,8 +361,8 @@ fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
 
 **多行 Indicator 的求值**：
 - 环境变量：`PROMPT_MULTILINE_INDICATOR`
-- 求值时机：与其他 prompt 组件同时，在 `update_prompt()` 中 [第 105-106 行](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt_update.rs#L105-L106)
-- 渲染方法：[`render_prompt_multiline_indicator()`](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L134-L141)
+- 求值时机：与其他 prompt 组件同时，在 `update_prompt()` 中 [第 105-106 行](../crates/nu-cli/src/prompt_update.rs#L105-L106)
+- 渲染方法：[`render_prompt_multiline_indicator()`](../crates/nu-cli/src/prompt.rs#L134-L141)
 - 默认值：`"::: "`（硬编码回退值）
 
 **两个独立的 indicator 方法**：
@@ -491,10 +491,10 @@ fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
 
 | 行为 | 类型 | 依据 |
 |------|------|------|
-| `update_prompt()` 在 `read_line()` 前调用 | ✅ 代码事实 | [repl.rs:715](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/repl.rs#L715) |
-| 左/右 prompt 字符串缓存于 `NushellPrompt` | ✅ 代码事实 | [prompt.rs:12-13](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L12-L13) |
-| 渲染时做 `\n` → `\r\n` 转换 | ✅ 代码事实 | [prompt.rs:96](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt.rs#L96) |
-| `right_prompt_on_last_line` 控制右 prompt 垂直位置 | ✅ 接口语义 + 配置文档 | [doc_config.nu:506](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-utils/src/default_files/doc_config.nu#L506) |
+| `update_prompt()` 在 `read_line()` 前调用 | ✅ 代码事实 | [repl.rs:715](../crates/nu-cli/src/repl.rs#L715) |
+| 左/右 prompt 字符串缓存于 `NushellPrompt` | ✅ 代码事实 | [prompt.rs:12-13](../crates/nu-cli/src/prompt.rs#L12-L13) |
+| 渲染时做 `\n` → `\r\n` 转换 | ✅ 代码事实 | [prompt.rs:96](../crates/nu-cli/src/prompt.rs#L96) |
+| `right_prompt_on_last_line` 控制右 prompt 垂直位置 | ✅ 接口语义 + 配置文档 | [doc_config.nu:506](../crates/nu-utils/src/default_files/doc_config.nu#L506) |
 | `render_prompt_multiline_indicator()` 在续行时调用 | 🔍 reedline 行为 | `Prompt` trait 方法设计意图 |
 | 多行 indicator 水平对齐到指示符列 | 🔍 reedline 行为 | 常见终端模式推断 |
 | 用户输入多行时右 prompt 不随之下移 | 🔍 语义推导 | 配置项语义 "with multi-line left prompt" |
@@ -502,7 +502,7 @@ fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
 
 ## 五、完整的 REPL 迭代流程
 
-[repl.rs: loop_iteration()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/repl.rs#L713-L748) 中的时序：
+[repl.rs: loop_iteration()](../crates/nu-cli/src/repl.rs#L713-L748) 中的时序：
 
 ```
 start_time = Instant::now();
@@ -555,7 +555,7 @@ line_editor = line_editor
 
 ## 六、Transient Prompt 机制
 
-[make_transient_prompt()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt_update.rs#L129-L176) 在执行命令后替换原有 prompt，使历史记录更简洁。
+[make_transient_prompt()](../crates/nu-cli/src/prompt_update.rs#L129-L176) 在执行命令后替换原有 prompt，使历史记录更简洁。
 
 **✅ 求值时机**：与普通 prompt 相同，在 `read_line()` 前求值。
 
@@ -572,7 +572,7 @@ if let Some(s) = get_prompt_string(TRANSIENT_PROMPT_COMMAND, ...) {
 
 ## 七、环境变量清单
 
-所有可配置的 prompt 环境变量定义在 [prompt_update.rs:12-26](file:///d:/fz/0601-2/solo-dogfeeding/code/71-nushell/crates/nu-cli/src/prompt_update.rs#L12-L26)：
+所有可配置的 prompt 环境变量定义在 [prompt_update.rs:12-26](../crates/nu-cli/src/prompt_update.rs#L12-L26)：
 
 | 常量名 | 环境变量名 | 用途 | 类型 |
 |--------|-----------|------|------|
