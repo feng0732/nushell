@@ -10,7 +10,7 @@ Nushell 为每个配置类型（环境配置 `env.nu` 和主配置 `config.nu`�
 
 | 层级 | 文件名模板 | 作用 | 加载时机 |
 |------|-----------|------|---------|
-| **默认配置** | `default_env.nu` / `default_config.nu` | 编译时嵌入的内置默认值，保证最小可用环境 | `default_env.nu` **每次**正常启动都加载；`default_config.nu` 仅 REPL 模式、或命令/脚本模式指定 `--config`/`--login` 时加载 |
+| **默认配置** | `default_env.nu` / `default_config.nu` | 编译时嵌入的内置默认值，保证最小可用环境 | `default_env.nu` **每次**正常启动都加载；`default_config.nu` — REPL 模式始终加载、命令模式（`nu -c`）指定 `--config` 或 `--login` 时加载、脚本模式（`nu script.nu`）**仅**显式 `--config` 时加载（`--login` 不触发） |
 | **脚手架配置** | `scaffold_env.nu` / `scaffold_config.nu` | 首次启动时写入用户配置目录的模板文件（仅注释无代码） | 首次启动**创建**用户配置时 |
 | **文档配置** | `doc_env.nu` / `doc_config.nu` | 带完整注释的文档，供 `config env --doc` 查看 | 从不自动加载，仅用户主动查阅 |
 | **用户配置** | `env.nu` / `config.nu` | 用户自定义配置（位于 `$nu.config-path` 目录） | 正常启动时**在默认配置之后**加载 |
