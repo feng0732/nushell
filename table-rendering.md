@@ -197,63 +197,137 @@ impl TableOption<...> for DimensionCtrl {
 
 ## 四、主题色系统：着色链路与副作用
 
-### 4.1 样式计算链
+### 4.1 样式计算链：四种渲染模式的着色路径
 
-颜色来源于 `StyleComputer`（由 `$env.config.color_config` 生成）。单元格着色存在**两条独立路径**，分别服务于不同的表格类型。两条路径的共同点是：`clean_charset`（字符集规整化）都发生在**颜色写入文本之前**。
+颜色来源于 `StyleComputer`（由 `$env.config.color_config` 生成）。`table` 命令的四种视图模式对应四条独立的着色链路（分派点：`crates/nu-command/src/viewers/table.rs` 第 690–746 行的 `build_table_kv` / `build_table_batch`）。
 
-#### 路径 A：直接着色路径（`nu_value_to_string_colored`）
+所有链路的共同点：`clean_charset`（字符集规整化：`\t`→4 空格、去 `\r`）都发生在**颜色写入文本之前**。
 
-位置：`crates/nu-table/src/common.rs` 第 42–59 行
+---
 
-用于单值表、Record 表等非 list 类型的表格构建。颜色直接写入字符串，tabled 把它当普通文本处理。
+#### 链路 1：普通 List 表（`TableView::General` + `Value::List`）
+
+**入口**：`crates/nu-command/src/viewers/table.rs` 第 733 行 → `JustTable::table` → `list_table`（`crates/nu-table/src/types/general.rs` 第 27 行）
+
+**着色方式：样式分离路径**。文本与样式分开存储，渲染阶段再合并。
 
 ```
-1. val.to_abbreviated_string()        → 纯文本
-2. style_computer.style_primitive()   → 拿到 nu_ansi_term::Style（样式信息）
-3. clean_charset                      → 文本形态规整化（\t→4空格、去 \r）【仅 String 类型】
-4. color.paint(text).to_string()      → 包裹 ANSI 前缀/后缀（真正上色）
-5. colorize_space_str                 → 行首尾空格再包一层颜色【仅 String 类型】
-```
-
-代码证据（第 46–48 行先 clean，第 50–52 行再 paint）：
-
-```rust
-if is_string {
-    text = clean_charset(&text);        // ← 先规整
-}
-if let Some(color) = style.color_style {
-    text = color.paint(text).to_string(); // ← 后上色
-}
-```
-
-#### 路径 B：样式分离路径（`get_value_style` + `colorize_table` + `colorize_space`）
-
-用于 `create_table_with_*` 系列的常规 list 表格（`table` 命令的主路径）。文本与样式分离存储，渲染阶段再合并。
-
-**构建阶段**（`crates/nu-table/src/types/general.rs` 第 220–229 行）：
-```
+构建阶段（create_table → create_table_with_* → get_string_value）：
 1. get_value_style()                  → 返回 (text, style) 元组，文本与样式分离
 2. clean_charset                      → 文本规整化【仅 String 类型】
 3. table.insert(pos, text)            → 写入纯文本
-4. table.insert_style(pos, style)     → 写入样式（独立存储）
-```
+4. table.insert_style(pos, style)     → 写入样式（独立存储于 NuTable.styles）
 
-**第二遍空格着色**（`crates/nu-table/src/types/general.rs` 第 34–35 行）：
-```
+第二遍空格着色（list_table 第 34–35 行）：
 5. colorize_space(out.table.get_records_mut(), ...)
-                                       → 全表扫描，对单元格内首尾空格着色
-```
-代码注释明确写着 `// TODO: It would be WAY more effitient to do right away instead of second pass over the data.`
+                                       → 全表扫描，对所有单元格内首尾空格着色
+                                       【TODO 注释：应合并到构建阶段一次完成】
 
-**渲染阶段**（`crates/nu-table/src/table.rs` 第 579–583 行 `set_styles`）：
-```
+渲染阶段（NuTable::draw → set_styles → colorize_table）：
 6. colorize_table(table, colors, structure)
                                        → 通过 tabled 的 Color 配置把样式应用到单元格
 ```
 
-> **⚠️ 推断**：路径 A 是直接上色（字符串里带 ANSI），路径 B 是样式分离存到 tabled config。两条路径的存在可能是历史演进的结果：路径 A 更简单直接，路径 B 更利于 tabled 内部对齐和宽度计算。
+**代码证据**：
+- `crates/nu-table/src/types/general.rs` 第 220–229 行（`get_string_value`：样式分离存储）
+- `crates/nu-table/src/types/general.rs` 第 34–35 行（第二遍 `colorize_space`）
+- `crates/nu-table/src/table.rs` 第 579–583 行（`set_styles`：`colorize_table` 应用）
 
-**颜色来源汇总**（代码事实）：
+---
+
+#### 链路 2：普通 Record 键值表（`TableView::General` + `Value::Record`）
+
+**入口**：`crates/nu-command/src/viewers/table.rs` 第 697 行 → `JustTable::kv_table`（`crates/nu-table/src/types/general.rs` 第 47 行）
+
+**着色方式：直接着色路径**。颜色直接写入字符串，tabled 把它当普通文本处理。
+
+```
+构建阶段（kv_table 第 52–58 行 for 循环）：
+1. val.to_abbreviated_string()        → 纯文本
+2. style_computer.style_primitive()   → 拿到 nu_ansi_term::Style（样式信息）
+3. clean_charset                      → 文本规整化【仅 String 类型】
+4. color.paint(text).to_string()      → 包裹 ANSI 前缀/后缀（真正上色）
+5. colorize_space_str                 → 行首尾空格再包一层颜色【仅 String 类型】
+6. table.insert((i, 1), value)        → 直接插入带 ANSI 的字符串
+```
+
+**代码证据**（`nu_value_to_string_colored`，`crates/nu-table/src/common.rs` 第 42–59 行）：
+
+```rust
+if is_string {
+    text = clean_charset(&text);        // ← 先规整（L47）
+}
+if let Some(color) = style.color_style {
+    text = color.paint(text).to_string(); // ← 后上色（L51）
+}
+```
+
+**注意**：此链路**没有**第二遍 `colorize_space` 全表扫描，因为空格着色已在步骤 5 中按单元格完成。
+
+---
+
+#### 链路 3：Expanded 渲染（`TableView::Expanded`）
+
+**入口**：`crates/nu-command/src/viewers/table.rs` 第 704 / 740 行 → `ExpandedTable::build_map` / `build_list`（`crates/nu-table/src/types/expanded.rs` 第 41 / 46 行）
+
+**着色方式：混合链路**——叶子节点直接着色，嵌套节点渲染成子表后作为纯文本嵌入。
+
+```
+expand_entry（L520）/ expand_value（L451）递归遍历：
+
+├─ 叶子值（非 Record/List）：
+│  1. nu_value_to_string_clean        → 返回 (text, style)，clean_charset + colorize_space_str
+│  2. (或) nu_value_to_string         → 返回 (text, style)，仅文本+样式分离
+│  3. (或) nu_value_to_string_colored → 直接上色（仅 value_to_wrapped_string_clean L667）
+│  4. 存入 CellOutput.styled / CellOutput.text
+│
+└─ 嵌套值（Record/List）：
+   1. 递归调用 expanded_table_kv / expand_list → 渲染成完整子表（含主题、着色）
+   2. 子表 to_string() 得到纯文本（已带 ANSI 颜色）
+   3. 用 CellOutput.clean() 存入（无额外样式，样式已在文本里）
+```
+
+**代码证据**：
+- 叶子直接着色：`crates/nu-table/src/types/expanded.rs` 第 522 行（`nu_value_to_string_clean`）、第 667 行（`nu_value_to_string_colored`）
+- 嵌套子表内嵌：`crates/nu-table/src/types/expanded.rs` 第 466–468 行（`out.table.draw_unchecked(width)` → `CellOutput::clean`）
+
+> **⚠️ 推断**：Expanded 链路混用了三种字符串转换函数（`nu_value_to_string` / `_clean` / `_colored`），看起来是逐步叠加功能的结果，并非统一设计。不同分支选择哪个函数似乎取决于该值是否还需要进一步处理（如 wrap 换行）。
+
+---
+
+#### 链路 4：Collapsed 渲染（`TableView::Collapsed`）
+
+**入口**：`crates/nu-command/src/viewers/table.rs` 第 708 / 744 行 → `CollapsedTable::build`（`crates/nu-table/src/types/collapse.rs`）
+
+**着色方式：树状遍历着色**——先递归遍历整个 Value 树把颜色写进字符串，再交给 tabled 展示。
+
+```
+CollapsedTable::build：
+1. colorize_value(&mut value, ...)    → 递归遍历 Value 树
+│     ├─ Record：每个 key 调 colorize_text(header, style.color_style)
+│     │            每个 value 递归 colorize_value
+│     └─ List：每个元素递归 colorize_value
+│            叶子值：nu_value_to_string_clean → colorize_text(text, style.color_style)
+2. NuTable 插入已着色的文本
+3. configure_table → draw
+```
+
+**代码证据**：
+- `crates/nu-table/src/types/collapse.rs` 第 35 行（`colorize_value` 入口）
+- `crates/nu-table/src/types/collapse.rs` 第 63–64 行（叶子：`nu_value_to_string_clean` → `colorize_text`）
+
+---
+
+#### 四种链路的对比汇总
+
+| 视图模式 | 着色策略 | 文本与样式关系 | 第二遍 colorize_space | 适用场景 |
+|---------|---------|--------------|---------------------|---------|
+| General + List | **样式分离** | 分离存储，渲染阶段合并 | ✅ 有（全表扫描） | `table` 命令主路径，最常用 |
+| General + Record | **直接着色** | 颜色写进字符串 | ❌ 无 | 单个 Record 的键值展示 |
+| Expanded | **混合** | 叶子着色 + 子表内嵌文本 | ❌ 无 | `table -e` 递归展开 |
+| Collapsed | **树状遍历** | 递归着色后写进字符串 | ❌ 无 | `table -c` 紧凑折叠视图 |
+
+**颜色来源汇总**（代码事实，适用于所有链路）：
 - `style_primitive()`：基础类型颜色（int/float/string/bool/...）
 - `compute("row_index", _)`：索引列
 - `compute("header", _)`：表头
