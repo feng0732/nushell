@@ -26,19 +26,19 @@ StateWorkingSet.read_span() — 全局 Span → 文件定位 → 局部偏移 �
 
 | 文件 | 职责 |
 |------|------|
-| [cached_file.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/engine/cached_file.rs) | CachedFile 定义 |
-| [span.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/span.rs) | Span / Spanned 定义 |
-| [state_working_set.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/engine/state_working_set.rs) | SourceCode 实现、get_span_contents |
-| [engine_state.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/engine/engine_state.rs) | 永久状态的文件存储与 span 内容查询 |
-| [report_error.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/report_error.rs) | 错误报告入口、CliError、ErrorStyle 分派 |
-| [parse_error.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/parse_error.rs) | ParseError 枚举、DidYouMean 类型 |
-| [shell_error/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/shell_error/mod.rs) | ShellError 枚举、ErrorSite、ErrorSource |
-| [shell_error/generic.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/shell_error/generic.rs) | GenericError 结构体 |
-| [labeled_error.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/labeled_error.rs) | LabeledError、ErrorLabel |
-| [chained_error.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/chained_error.rs) | ChainedError 链式错误 |
-| [short_handler.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/short_handler.rs) | ShortReportHandler |
-| [did_you_mean.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/did_you_mean.rs) | did_you_mean 函数 |
-| [lev_distance.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/lev_distance.rs) | 编辑距离算法（源自 rustc） |
+| [cached_file.rs](crates/nu-protocol/src/engine/cached_file.rs) | CachedFile 定义 |
+| [span.rs](crates/nu-protocol/src/span.rs) | Span / Spanned 定义 |
+| [state_working_set.rs](crates/nu-protocol/src/engine/state_working_set.rs) | SourceCode 实现、get_span_contents |
+| [engine_state.rs](crates/nu-protocol/src/engine/engine_state.rs) | 永久状态的文件存储与 span 内容查询 |
+| [report_error.rs](crates/nu-protocol/src/errors/report_error.rs) | 错误报告入口、CliError、ErrorStyle 分派 |
+| [parse_error.rs](crates/nu-protocol/src/errors/parse_error.rs) | ParseError 枚举、DidYouMean 类型 |
+| [shell_error/mod.rs](crates/nu-protocol/src/errors/shell_error/mod.rs) | ShellError 枚举、ErrorSite、ErrorSource |
+| [shell_error/generic.rs](crates/nu-protocol/src/errors/shell_error/generic.rs) | GenericError 结构体 |
+| [labeled_error.rs](crates/nu-protocol/src/errors/labeled_error.rs) | LabeledError、ErrorLabel |
+| [chained_error.rs](crates/nu-protocol/src/errors/chained_error.rs) | ChainedError 链式错误 |
+| [short_handler.rs](crates/nu-protocol/src/errors/short_handler.rs) | ShortReportHandler |
+| [did_you_mean.rs](crates/nu-protocol/src/did_you_mean.rs) | did_you_mean 函数 |
+| [lev_distance.rs](crates/nu-protocol/src/lev_distance.rs) | 编辑距离算法（源自 rustc） |
 
 ---
 
@@ -46,16 +46,18 @@ StateWorkingSet.read_span() — 全局 Span → 文件定位 → 局部偏移 �
 
 ### 2.1 CachedFile — 源码缓存单元
 
-[cached_file.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/engine/cached_file.rs#L6-L16) 定义了源码缓存的最小单元：
+[cached_file.rs#L6-L16](crates/nu-protocol/src/engine/cached_file.rs#L6-L16) 定义了源码缓存的最小单元：
 
 ```rust
 pub struct CachedFile {
-    /// 文件名（包括 REPL 输入 "<cli>"）
+    // Use Arcs of slice types for more compact representation (capacity less)
+    // Could possibly become an `Arc<PathBuf>`
+    /// The file name with which the code is associated (also includes REPL input)
     pub name: Arc<str>,
-    /// 源码原始字节
+    /// Source code as raw bytes
     #[debug("[...]")]
     pub content: Arc<[u8]>,
-    /// 该文件在全局 span 空间中占据的范围
+    /// global span coordinates that are covered by this [`CachedFile`]
     pub covered_span: Span,
 }
 ```
@@ -70,11 +72,11 @@ pub struct CachedFile {
 
 ### 2.2 全局偏移分配
 
-文件被添加到工作集时，全局偏移按顺序递增分配。入口是 [StateWorkingSet::add_file](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/engine/state_working_set.rs#L338-L359)：
+文件被添加到工作集时，全局偏移按顺序递增分配。入口是 [state_working_set.rs#L338-L359](crates/nu-protocol/src/engine/state_working_set.rs#L338-L359)：
 
 ```rust
 pub fn add_file(&mut self, filename: &str, contents: &[u8]) -> FileId {
-    // 去重：如果已有同名同内容文件，直接返回已有 FileId
+    // First, look for the file to see if we already have it
     for (idx, cached_file) in self.files().enumerate() {
         if &*cached_file.name == filename && &*cached_file.content == contents {
             return FileId::new(idx);
@@ -83,6 +85,7 @@ pub fn add_file(&mut self, filename: &str, contents: &[u8]) -> FileId {
 
     let next_span_start = self.next_span_start();
     let next_span_end = next_span_start + contents.len();
+
     let covered_span = Span::new(next_span_start, next_span_end);
 
     self.delta.files.push(CachedFile {
@@ -95,11 +98,12 @@ pub fn add_file(&mut self, filename: &str, contents: &[u8]) -> FileId {
 }
 ```
 
-**`next_span_start()`** 的计算逻辑（[第 307-315 行](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/engine/state_working_set.rs#L307-L315)）：
+**`next_span_start()`** 的计算逻辑（[state_working_set.rs#L307-L314](crates/nu-protocol/src/engine/state_working_set.rs#L307-L314)）：
 
 ```rust
 pub fn next_span_start(&self) -> usize {
     let permanent_span_start = self.permanent_state.next_span_start();
+
     if let Some(cached_file) = self.delta.files.last() {
         cached_file.covered_span.end   // delta 有文件 → 接在最后一个 delta 文件后面
     } else {
@@ -108,7 +112,17 @@ pub fn next_span_start(&self) -> usize {
 }
 ```
 
-而 `EngineState::next_span_start()`（[第 939-945 行](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/engine/engine_state.rs#L939-L945)）返回最后一个永久文件的 `covered_span.end`，若无文件则返回 0。
+而 `EngineState::next_span_start()`（[engine_state.rs#L939-L945](crates/nu-protocol/src/engine/engine_state.rs#L939-L945)）返回最后一个永久文件的 `covered_span.end`，若无文件则返回 0：
+
+```rust
+pub fn next_span_start(&self) -> usize {
+    if let Some(cached_file) = self.files.last() {
+        cached_file.covered_span.end
+    } else {
+        0
+    }
+}
+```
 
 **示意：**
 ```
@@ -128,7 +142,7 @@ CachedFile 存储在两个位置：
 - **`EngineState.files: Vec<CachedFile>`** — 永久状态，存放已被 merge 的文件
 - **`StateDelta.files: Vec<CachedFile>`** — 增量状态，存放本次解析新增的文件
 
-`StateWorkingSet::files()` 将两者拼接为一个迭代器（[第 317-319 行](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/engine/state_working_set.rs#L317-L319)）：
+`StateWorkingSet::files()` 将两者拼接为一个迭代器（[state_working_set.rs#L317-L319](crates/nu-protocol/src/engine/state_working_set.rs#L317-L319)）：
 
 ```rust
 pub fn files(&self) -> impl Iterator<Item = &CachedFile> {
@@ -136,7 +150,15 @@ pub fn files(&self) -> impl Iterator<Item = &CachedFile> {
 }
 ```
 
-`EngineState::files()` 返回 `impl DoubleEndedIterator + ExactSizeIterator`（[第 947-951 行](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/engine/engine_state.rs#L947-L951)），支持双向遍历和精确长度。
+`EngineState::files()` 返回 `impl DoubleEndedIterator + ExactSizeIterator`（[engine_state.rs#L947-L951](crates/nu-protocol/src/engine/engine_state.rs#L947-L951)），支持双向遍历和精确长度：
+
+```rust
+pub fn files(
+    &self,
+) -> impl DoubleEndedIterator<Item = &CachedFile> + ExactSizeIterator<Item = &CachedFile> {
+    self.files.iter()
+}
+```
 
 ---
 
@@ -144,7 +166,7 @@ pub fn files(&self) -> impl Iterator<Item = &CachedFile> {
 
 ### 3.1 get_span_contents — 纯内容读取
 
-[StateWorkingSet::get_span_contents](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/engine/state_working_set.rs#L396-L409) 将全局 Span 映射到源码字节切片：
+[state_working_set.rs#L396-L409](crates/nu-protocol/src/engine/state_working_set.rs#L396-L409) 将全局 Span 映射到源码字节切片：
 
 ```rust
 pub fn get_span_contents(&self, span: Span) -> &[u8] {
@@ -153,20 +175,19 @@ pub fn get_span_contents(&self, span: Span) -> &[u8] {
     if permanent_end <= span.start {
         for cached_file in &self.delta.files {
             if cached_file.covered_span.contains_span(span) {
-                return &cached_file.content
-                    [span.start - cached_file.covered_span.start
+                return &cached_file.content[span.start - cached_file.covered_span.start
                     ..span.end - cached_file.covered_span.start];
             }
         }
     }
-    // 回退到永久状态
+    // if no files with span were found, fall back on permanent ones
     self.permanent_state.get_span_contents(span)
 }
 ```
 
 **关键分支逻辑：** `permanent_end <= span.start` 是一个优化。如果 span 起始位置在永久状态结束之后，它只可能属于 delta 中的文件，无需遍历永久状态。若该条件不成立，则直接委托给 `EngineState::get_span_contents`。
 
-[EngineState::try_get_file_contents](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/engine/engine_state.rs#L776-L786) 遍历所有文件做相同匹配：
+[engine_state.rs#L776-L786](crates/nu-protocol/src/engine/engine_state.rs#L776-L786) 遍历所有文件做相同匹配：
 
 ```rust
 pub fn try_get_file_contents(&self, span: Span) -> Option<&[u8]> {
@@ -186,7 +207,7 @@ pub fn try_get_file_contents(&self, span: Span) -> Option<&[u8]> {
 
 ### 3.2 read_span — SourceCode trait 实现（渲染核心）
 
-[`impl miette::SourceCode for &StateWorkingSet<'_>`](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/engine/state_working_set.rs#L1098-L1178) 是诊断渲染的源码提供核心。`read_span` 不只返回原始内容，还要附带行号、列号、上下文行等信息供 miette 格式化：
+[`impl miette::SourceCode for &StateWorkingSet<'_>`](crates/nu-protocol/src/engine/state_working_set.rs#L1098-L1178) 是诊断渲染的源码提供核心。`read_span` 不只返回原始内容，还要附带行号、列号、上下文行等信息供 miette 格式化：
 
 ```rust
 fn read_span<'b>(
@@ -256,7 +277,7 @@ fn read_span<'b>(
 
 ### 3.3 Span 与 miette 的转换
 
-[Span → SourceSpan](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/span.rs#L384-L388) 的转换将 Nushell 的 `{start, end}` 转为 miette 的 `{offset, len}`：
+[span.rs#L384-L388](crates/nu-protocol/src/span.rs#L384-L388) 的转换将 Nushell 的 `{start, end}` 转为 miette 的 `{offset, len}`：
 
 ```rust
 impl From<Span> for SourceSpan {
@@ -274,7 +295,7 @@ impl From<Span> for SourceSpan {
 
 ### 4.1 ParseError — 解析错误
 
-[ParseError](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/parse_error.rs) 使用 `thiserror` + `miette` 过程宏声明式定义：
+[parse_error.rs](crates/nu-protocol/src/errors/parse_error.rs) 使用 `thiserror` + `miette` 过程宏声明式定义：
 
 ```rust
 #[derive(Clone, Debug, Error, Diagnostic, Serialize, Deserialize, PartialEq)]
@@ -310,38 +331,61 @@ pub enum ParseError {
 
 ### 4.2 ShellError — 运行时错误
 
-[ShellError](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/shell_error/mod.rs) 结构与 ParseError 类似，包含数十种变体。其中 `ChainedError` 变体通过 `#[diagnostic(transparent)]` 完全委托给 `ChainedError`。
+[shell_error/mod.rs](crates/nu-protocol/src/errors/shell_error/mod.rs) 结构与 ParseError 类似，包含数十种变体。其中 `ChainedError` 变体通过 `#[diagnostic(transparent)]` 完全委托给 `ChainedError`。
 
 ### 4.3 GenericError — 通用错误构建器
 
-[GenericError](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/shell_error/generic.rs#L28-L53) 用 struct 字段手动实现 `Diagnostic`：
+[generic.rs#L28-L53](crates/nu-protocol/src/errors/shell_error/generic.rs#L28-L53) 用 struct 字段手动实现 `Diagnostic`：
 
 ```rust
 pub struct GenericError {
+    /// The diagnostic code for this error.
+    ///
+    /// Defaults to [`DEFAULT_CODE`].
+    /// Use [`with_code`](Self::with_code) to override it.
     pub code: Cow<'static, str>,
+
+    /// A short, user-facing title for the error.
     pub error: Cow<'static, str>,        // Display 输出
+
+    /// The message describing what went wrong.
     pub msg: Cow<'static, str>,          // 标签文本
+
+    /// The error origin: either a user span or an internal Rust location.
     pub site: ErrorSite,                 // 错误位置
+
+    /// Optional additional guidance for the user.
     pub help: Option<Cow<'static, str>>,
+
+    /// Related errors that provide more context.
     pub inner: Vec<ShellError>,          // related 错误
+
+    /// Optional error source.
     pub source: Option<ErrorSource>,     // diagnostic_source
 }
 ```
 
-**ErrorSite**（[第 1694-1703 行](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/shell_error/mod.rs#L1694-L1703)）决定标签位置和源码来源：
+**ErrorSite**（[shell_error/mod.rs#L1694-L1703](crates/nu-protocol/src/errors/shell_error/mod.rs#L1694-L1703)）决定标签位置和源码来源：
 
 ```rust
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ErrorSite {
-    Span(Span),                    // 用户代码位置 → labels 返回该 span
-    Location(String),              // Rust 内部位置 → source_code 返回 Location 字符串
+    /// A span in user-provided Nushell code.
+    Span(Span),
+
+    /// A [`Location`] string from Rust code where the error originated.
+    ///
+    /// For usage with [`miette`] it's easier to hold a string here instead of a [`Location`].
+    Location(String),
 }
 ```
 
 当 `site` 为 `ErrorSite::Span(span)` 时，`labels()` 返回一个标签指向该 span，`source_code()` 返回 `None`（回退到 StateWorkingSet）。当 `site` 为 `ErrorSite::Location(loc)` 时，`labels()` 的偏移为 0、长度为 `loc.len()`，`source_code()` 返回 `&loc`（Location 字符串本身就是源码）。
 
-**ErrorSource**（[第 1718-1720 行](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/shell_error/mod.rs#L1718-L1720)）通过 `#[error(transparent)]` + `Diagnostic` 透明转发底层错误：
+**ErrorSource**（[shell_error/mod.rs#L1717-L1720](crates/nu-protocol/src/errors/shell_error/mod.rs#L1717-L1720)）通过 `#[error(transparent)]` + `Diagnostic` 透明转发底层错误：
 
 ```rust
+// TODO: implement further chaining than just one
 #[derive(Debug, Error, Clone, Diagnostic)]
 #[error(transparent)]
 pub struct ErrorSource(Arc<dyn StdError + Send + Sync>);
@@ -351,22 +395,36 @@ pub struct ErrorSource(Arc<dyn StdError + Send + Sync>);
 
 ### 4.4 LabeledError — 协议级错误
 
-[LabeledError](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/labeled_error.rs#L15-L34) 用于与插件和脚本交互，所有字段都是可序列化的：
+[labeled_error.rs#L15-L34](crates/nu-protocol/src/errors/labeled_error.rs#L15-L34) 用于与插件和脚本交互，所有字段都是可序列化的：
 
 ```rust
 pub struct LabeledError {
+    /// The main message for the error.
     pub msg: String,
+    /// Labeled spans attached to the error, demonstrating to the user where the problem is.
     pub labels: Box<Vec<ErrorLabel>>,
+    /// A unique machine- and search-friendly error code to associate to the error.
     pub code: Option<String>,
+    /// A link to documentation about the error, used in conjunction with `code`
     pub url: Option<String>,
+    /// Additional help for the error, usually a hint about what the user might try
     pub help: Option<String>,
+    /// Errors that are related to or caused this error
     pub inner: Box<Vec<ShellError>>,
 }
 ```
 
-**ErrorLabel → LabeledSpan 转换**（[第 194-202 行](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/labeled_error.rs#L194-L202)）：
+**ErrorLabel → LabeledSpan 转换**（[labeled_error.rs#L194-L202](crates/nu-protocol/src/errors/labeled_error.rs#L194-L202)）：
 
 ```rust
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorLabel {
+    /// Text to show together with the span
+    pub text: String,
+    /// Span pointing at where the text references in the source
+    pub span: Span,
+}
+
 impl From<ErrorLabel> for LabeledSpan {
     fn from(val: ErrorLabel) -> Self {
         LabeledSpan::new(
@@ -407,13 +465,16 @@ fn report_error(stack, working_set, error, default_code) {
 
 ### 5.2 CliError — SourceCode 延迟绑定
 
-[CliError](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/report_error.rs#L23-L29) 在渲染时才绑定源码：
+[CliError](crates/nu-protocol/src/errors/report_error.rs#L23-L29) 在渲染时才绑定源码：
 
 ```rust
+#[derive(Error)]
+#[error("{diagnostic}")]
 struct CliError<'src> {
     stack: Option<&'src Stack>,
     diagnostic: &'src dyn miette::Diagnostic,
     working_set: &'src StateWorkingSet<'src>,
+    // error code to use if `diagnostic` doesn't provide one
     default_code: Option<&'static str>,
 }
 ```
@@ -451,24 +512,32 @@ fn source_code(&self) -> Option<&dyn SourceCode> {
 
 ### 5.4 ShortReportHandler
 
-[ShortReportHandler](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/short_handler.rs#L8-L56) 是 Nushell 自定义的极简处理器：
+[short_handler.rs#L8-L56](crates/nu-protocol/src/errors/short_handler.rs#L8-L56) 是 Nushell 自定义的极简处理器：
 
 ```rust
-fn render_report(&self, f: &mut fmt::Formatter<'_>, diagnostic: &dyn Diagnostic) -> fmt::Result {
-    write!(f, "{}: ", diagnostic)?;              // 错误消息
-    // 遍历所有标签，用逗号连接
+fn render_report(
+    &self,
+    f: &mut fmt::Formatter<'_>,
+    diagnostic: &dyn Diagnostic,
+) -> fmt::Result {
+    write!(f, "{}: ", diagnostic)?;
+
     if let Some(labels) = diagnostic.labels() {
-        let mut labels = labels.into_iter()
+        let mut labels = labels
+            .into_iter()
             .filter_map(|span| span.label().map(String::from))
             .peekable();
+
         while let Some(label) = labels.next() {
             let end_char = if labels.peek().is_some() { ", " } else { " " };
             write!(f, "{}{}", label, end_char)?;
         }
     }
+
     if let Some(help) = diagnostic.help() {
-        write!(f, "({})", help)?;                 // help 放在括号里
+        write!(f, "({})", help)?;
     }
+
     Ok(())
 }
 ```
@@ -485,7 +554,7 @@ fn render_report(&self, f: &mut fmt::Formatter<'_>, diagnostic: &dyn Diagnostic)
 
 ### 6.2 did_you_mean 函数
 
-[did_you_mean](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/did_you_mean.rs#L1-L17) 是对外暴露的拼写建议接口：
+[did_you_mean.rs#L1-L17](crates/nu-protocol/src/did_you_mean.rs#L1-L17) 是对外暴露的拼写建议接口：
 
 ```rust
 pub fn did_you_mean<'a, 'b, I, S>(possibilities: I, input: &'b str) -> Option<String>
@@ -497,7 +566,6 @@ where
     let suggestion =
         crate::lev_distance::find_best_match_for_name_with_substrings(&possibilities, input, None)
             .map(|s| s.to_string());
-    // 单字符建议在大小写不同时不返回（避免误导）
     if let Some(suggestion) = &suggestion
         && suggestion.len() == 1
         && !suggestion.eq_ignore_ascii_case(input)
@@ -512,9 +580,9 @@ where
 
 ### 6.3 lev_distance — 编辑距离算法（源自 rustc）
 
-[lev_distance.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/lev_distance.rs) 从 rustc 复制而来，提供三级匹配策略：
+[lev_distance.rs](crates/nu-protocol/src/lev_distance.rs) 从 rustc 复制而来，提供三级匹配策略：
 
-**[find_best_match_for_name_impl](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/lev_distance.rs#L134-L175) 的匹配优先级：**
+**[find_best_match_for_name_impl](crates/nu-protocol/src/lev_distance.rs#L134-L175) 的匹配优先级：**
 
 1. **大小写不敏感精确匹配** — `candidates.iter().find(|c| c.to_uppercase() == lookup_uppercase)`，找到则立即返回。
 
@@ -522,34 +590,36 @@ where
 
 3. **排序词匹配** — 如果上述都无结果，调用 `find_match_by_sorted_words`：将候选和输入按下划线 `_` 分割并排序后比较。例如 `"foo_bar"` 和 `"bar_foo"` 排序后相同，视为匹配。
 
-**[lev_distance_with_substrings](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/lev_distance.rs#L72-L98) 的子串评分逻辑：**
+**[lev_distance_with_substrings](crates/nu-protocol/src/lev_distance.rs#L72-L98) 的子串评分逻辑：**
 
 在基础 Levenshtein 距离上，扣除长度差异的代价（`score = lev - len_diff`），然后分三种情况调整：
 
 - 精确子串匹配（score == 0 且有长度差异且长度不太悬殊）→ 返回 1（不是完全匹配但很接近）
-- 长度不太悬殊 → `score + len_diff / 2`（半价补偿长度差异）
+- 长度不太悬殊 → `score + len_diff.div_ceil(2)`（半价补偿长度差异）
 - 长度悬殊（一个超过另一个的两倍）→ `score + len_diff`（完全加回长度差异，防止 "in" 匹配到 "shrink"）
 
 ### 6.4 DidYouMean 类型
 
-[DidYouMean](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/parse_error.rs#L670-L702) 是 ParseError 内部的 newtype，接收字节切片输入：
+[parse_error.rs#L670-L702](crates/nu-protocol/src/errors/parse_error.rs#L670-L702) 是 ParseError 内部的 newtype，接收字节切片输入：
 
 ```rust
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DidYouMean(Option<String>);
 
+fn did_you_mean_impl(possibilities_bytes: &[&[u8]], input_bytes: &[u8]) -> Option<String> {
+    let input = from_utf8(input_bytes).ok()?;
+    let possibilities = possibilities_bytes
+        .iter()
+        .map(|p| from_utf8(p))
+        .collect::<Result<Vec<&str>, Utf8Error>>()
+        .ok()?;
+    did_you_mean(&possibilities, input)
+}
+
 impl DidYouMean {
     pub fn new(possibilities_bytes: &[&[u8]], input_bytes: &[u8]) -> DidYouMean {
         DidYouMean(did_you_mean_impl(possibilities_bytes, input_bytes))
     }
-}
-
-fn did_you_mean_impl(possibilities_bytes: &[&[u8]], input_bytes: &[u8]) -> Option<String> {
-    let input = from_utf8(input_bytes).ok()?;
-    let possibilities = possibilities_bytes
-        .iter().map(|p| from_utf8(p))
-        .collect::<Result<Vec<&str>, Utf8Error>>().ok()?;
-    did_you_mean(&possibilities, input)
 }
 
 impl Display for DidYouMean {
@@ -579,7 +649,7 @@ impl Display for DidYouMean {
 
 ### 7.2 GenericError.inner
 
-[GenericError](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/shell_error/generic.rs#L196-L202) 通过 `inner: Vec<ShellError>` 存储相关错误：
+[generic.rs#L196-L202](crates/nu-protocol/src/errors/shell_error/generic.rs#L196-L202) 通过 `inner: Vec<ShellError>` 存储相关错误：
 
 ```rust
 fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn Diagnostic> + 'a>> {
@@ -592,11 +662,11 @@ fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn Diagnostic> +
 }
 ```
 
-构建方式：`.with_inner(vec![error1, error2])`。
+构建方式：`.with_inner(vec![error1, error2])`。`inner` 为空时返回 `None`。
 
 ### 7.3 LabeledError.inner
 
-[LabeledError](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/labeled_error.rs#L413-L415) 始终暴露 `inner`：
+[labeled_error.rs#L413-L415](crates/nu-protocol/src/errors/labeled_error.rs#L413-L415) 始终暴露 `inner`：
 
 ```rust
 fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn Diagnostic> + 'a>> {
@@ -608,7 +678,7 @@ fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn Diagnostic> +
 
 ### 7.4 ChainedError — 链式错误
 
-[ChainedError](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/chained_error.rs#L14-L19) 是 `ShellError::ChainedError` 变体的内部类型：
+[chained_error.rs#L14-L19](crates/nu-protocol/src/errors/chained_error.rs#L14-L19) 是 `ShellError::ChainedError` 变体的内部类型：
 
 ```rust
 pub struct ChainedError {
@@ -620,27 +690,45 @@ pub struct ChainedError {
 
 **两种构建方式，两种行为模式：**
 
-- [`ChainedError::new(source, span)`](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/chained_error.rs#L32-L38) — `first = true`，行为与原始错误完全一致：所有 `Diagnostic` 方法转发到 `sources[0]`，就像一个透明包装。
+- [`ChainedError::new(source, span)`](crates/nu-protocol/src/errors/chained_error.rs#L32-L38) — `first = true`，行为与原始错误完全一致：所有 `Diagnostic` 方法转发到 `sources[0]`，就像一个透明包装。`Display` 输出 `sources[0]` 的消息。
 
-- [`ChainedError::new_chained(sources, span)`](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/chained_error.rs#L40-L46) — `first = false`，将 `sources`（整个 ChainedError）作为 `ShellError::ChainedError` 推入 `self.sources`。此时 `related()` 返回所有 sources，自身只提供一个标签 `"error happened when running this"`。
+- [`ChainedError::new_chained(sources, span)`](crates/nu-protocol/src/errors/chained_error.rs#L40-L46) — `first = false`，将 `sources`（整个 ChainedError）作为 `ShellError::ChainedError` 推入 `self.sources`。此时 `related()` 返回所有 sources，自身只提供一个标签 `"error happened when running this"`。`Display` 输出 `"oops"`。
+
+**Diagnostic 方法转发的完整规则：**
+
+| 方法 | `first = true` | `first = false` |
+|------|---------------|-----------------|
+| `related()` | 转发 `sources[0].related()` | `Some(self.sources.iter())` |
+| `code()` | 转发 `sources[0].code()` | `Some("chained_error")` |
+| `severity()` | 转发 `sources[0].severity()` | `None` |
+| `help()` | 转发 `sources[0].help()` | `None` |
+| `url()` | 转发 `sources[0].url()` | `None` |
+| `labels()` | 转发 `sources[0].labels()` | 标签 `"error happened when running this"` + `self.span` |
+| `source_code()` | 转发 `sources[0].source_code()` | `None` |
+| `diagnostic_source()` | 转发 `sources[0].diagnostic_source()` | `None` |
 
 ### 7.5 into_chained — 构建入口
 
-[ShellError::into_chained](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/shell_error/mod.rs#L1532-L1555) 是链式错误的构建入口：
+[shell_error/mod.rs#L1532-L1555](crates/nu-protocol/src/errors/shell_error/mod.rs#L1532-L1555) 是链式错误的构建入口：
 
 ```rust
+/// Convert self error to a [`ShellError::ChainedError`] variant.
 pub fn into_chained(self, span: Span) -> Self {
     Self::ChainedError(match self {
         // 已经是 ChainedError → 嵌套一层 (first = false)
         Self::ChainedError(inner) => ChainedError::new_chained(inner, span),
         // 普通错误 → 创建首个链节点 (first = true)
         other => {
+            // If it's not already a chained error, it could have more errors below
+            // it that we want to chain together
             let error = other.clone();
             let mut now = ChainedError::new(other, span);
-            // 如果原错误有 related，将它们也收集到 sources 中
             if let Some(related) = error.related() {
                 let mapped = related
-                    .map(|s| Self::from_diagnostic(s))
+                    .map(|s| {
+                        let shellerror: Self = Self::from_diagnostic(s);
+                        shellerror
+                    })
                     .collect::<Vec<_>>();
                 if !mapped.is_empty() {
                     now.sources = [now.sources, mapped].concat();
@@ -658,9 +746,10 @@ pub fn into_chained(self, span: Span) -> Self {
 
 ### 7.6 ErrorSource 与 diagnostic_source
 
-[ErrorSource](file:///d:/fz/0601-2/solo-dogfeeding/code/76-nushell/crates/nu-protocol/src/errors/shell_error/mod.rs#L1717-L1720) 通过 `Diagnostic::diagnostic_source()` 展示错误链：
+[shell_error/mod.rs#L1717-L1720](crates/nu-protocol/src/errors/shell_error/mod.rs#L1717-L1720) 通过 `Diagnostic::diagnostic_source()` 展示错误链：
 
 ```rust
+// TODO: implement further chaining than just one
 #[derive(Debug, Error, Clone, Diagnostic)]
 #[error(transparent)]
 pub struct ErrorSource(Arc<dyn StdError + Send + Sync>);
