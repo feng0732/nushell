@@ -332,6 +332,232 @@ eval 闭包，$arg = ["docker", "run", "--na"]
 （可选）文件回退：FileCompletion 在当前目录搜索匹配 "--na*" 的文件
 ```
 
+### 2.6 external.enable 与外部补全器闭包的边界
+
+配置 `config.completions.external` 下有三个字段：`enable`、`max_results`、`completer`。它们控制的补全阶段不同，极易混淆。以下逐一厘清边界。
+
+#### 2.6.1 三者的配置定义
+
+源码（[completions.rs#L58-L72](crates/nu-protocol/src/config/completions.rs#L58-L72)）：
+
+```rust
+pub struct ExternalCompleterConfig {
+    pub enable: bool,            // 控制 PATH 外部命令发现
+    pub max_results: i64,         // 仅影响 PATH 搜索的外部命令数
+    pub completer: Option<Closure>, // 独立的参数补全闭包
+}
+
+impl Default for ExternalCompleterConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            max_results: 100,
+            completer: None,
+        }
+    }
+}
+```
+
+官方配置文档（[doc_config.nu#L263-L284](crates/nu-utils/src/default_files/doc_config.nu#L263-L284)）：
+- `enable`: "Enable searching for external commands on PATH"
+- `max_results`: "Maximum external commands retrieved from PATH. Has no effect if external.enable is false."
+- `completer`: "Custom closure for argument completions. The closure receives a |spans| parameter"
+
+**核心结论**：三个字段是**正交的**。`enable` 只影响「PATH 中外部命令名的发现」，`completer` 闭包**完全独立**，不受 `enable` 控制。
+
+#### 2.6.2 external.enable 的影响范围：仅「外部命令名发现」
+
+`external.enable` 在代码中**只有一处使用**（[completer.rs#L676-L688](crates/nu-cli/src/completions/completer.rs#L676-L688)）：
+
+```rust
+fn command_completion_helper(&self, ...) -> Vec<SemanticSuggestion> {
+    let config = self.engine_state.get_config();
+    let mut command_completions = CommandCompletion {
+        internals: options.internals,
+        externals: !options.internals
+            || (options.externals && config.completions.external.enable),
+        //                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        //                    唯一使用 external.enable 的地方
+        builtins_only: options.builtins_only,
+        quote_internals: options.quote_internals,
+    };
+    // ...
+}
+```
+
+这个表达式展开后有两个分支：
+
+```
+externals = (!options.internals)       // 分支 A：不是"只补内部"
+        || (options.externals          // 分支 B：允许补外部
+            && config.completions.external.enable)
+```
+
+**分支分析**：
+
+| 调用方 | options.internals | options.externals | externals 值 | 是否受 enable 影响 |
+|--------|------------------|-------------------|--------------|-------------------|
+| **sudo/doas 穿透** | `true` | `true` | `false || (true && enable)` = **`enable`** | ✅ **受影响** |
+| **普通命令位置补全** | `true` | `true` | 同上 | ✅ **受影响** |
+| **其它（`which` 等）** | 依赖调用 | 依赖调用 | 依赖组合 | 视情况而定 |
+
+然后在 `CommandCompletion::fetch()` 中，`externals` 字段控制两个行为（[command_completions.rs#L235-L267](crates/nu-cli/src/completions/command_completions.rs#L235-L267)）：
+
+```rust
+// 1. 是否为冲突的内置命令添加 % 前缀别名
+if self.externals {
+    let collisions = self.external_command_collisions(...);
+    // ... 为冲突命令追加 %name 形式
+}
+
+// 2. 是否遍历 PATH 查找可执行文件
+if self.externals {
+    let external_suggs = self.external_command_completion(...);
+    res.extend(external_suggs);
+}
+```
+
+**即 `external.enable=false` 的效果**：
+1. 命令补全时**不遍历 PATH** 找外部可执行文件
+2. 不为与内置命令同名的外部命令生成 `%name` 形式
+
+**但 `external.enable=false` 不影响**（后文详述）：
+- `^explicit` 前缀的外部命令（显式标记）
+- sudo/doas 穿透的**内置命令**部分（仅外部命令部分受影响）
+- 外部补全器**闭包**的执行
+
+测试用例验证（[mod.rs#L793-L815](crates/nu-cli/tests/completions/mod.rs#L793-L815)）：
+
+```rust
+#[test]
+fn external_commands_disabled() {
+    config.completions.external.enable = false;
+    // ^sleep 是显式外部命令，补全仍然有效
+    let suggestions = completer.complete("ls; ^sleep", ...);
+    // → 返回 ["sleep"]（外部命令，explicit 前缀不受影响）
+
+    // sleep 作为普通命令补全：只返回内置命令 sleep，不搜索 PATH
+    let suggestions = completer.complete("sleep", ...);
+    // → 返回 ["sleep"]（内置命令，没有 PATH 外部命令）
+}
+```
+
+#### 2.6.3 external.enable 对 sudo/doas 穿透补全的影响
+
+sudo/doas 调用 `command_completion_helper` 时使用的参数（[completer.rs#L587-L598](crates/nu-cli/src/completions/completer.rs#L587-L598)）：
+
+```rust
+let commands = self.command_completion_helper(
+    working_set, span, offset,
+    CommandCompletionOptions {
+        internals: true,   // ← true
+        externals: true,   // ← true
+        builtins_only: false,
+        quote_internals: false,
+    },
+    strip,
+);
+```
+
+代入 `externals` 公式：`!true || (true && enable)` = **`enable`**
+
+**因此：**
+- `enable=true`：sudo 后补全包含内置命令 + PATH 外部命令
+- `enable=false`：sudo 后**只补全内置命令**，PATH 外部命令不出现
+
+**示例**（假设系统 PATH 中有 `rg`、`fd` 等外部命令）：
+
+| 场景 | `enable=true` | `enable=false` |
+|------|---------------|----------------|
+| `sudo r<TAB>` | `rm, rg, rmdir, ...`（含外部 `rg`） | `rm, rmdir, ...`（只含内置，无 `rg`） |
+| `sudo l<TAB>` | `ls, let, lines, less, ...`（含外部 `less`） | `ls, let, lines, loop, ...`（只含内置） |
+
+#### 2.6.4 external.enable 与外部补全器闭包：完全独立
+
+外部补全器闭包的调用代码（[completer.rs#L606-L628](crates/nu-cli/src/completions/completer.rs#L606-L628)）：
+
+```rust
+let completion = self
+    .engine_state
+    .get_config()
+    .completions
+    .external
+    .completer            // ← 只检查 completer 字段是否为 Some
+    .as_ref()
+    .map(|closure| {
+        CommandWideCompletion::closure(closure, element_expression, strip)
+    });
+
+// 没有任何地方检查 external.enable！
+```
+
+**关键发现**：闭包的读取和执行**完全不检查** `external.enable`。两者是正交关系：
+
+| 配置组合 | 外部命令名发现（PATH 搜索） | 外部补全器闭包执行 |
+|----------|---------------------------|-------------------|
+| `enable=true, completer=null` | ✅ 开启 | ❌ 不执行 |
+| `enable=true, completer=Some(closure)` | ✅ 开启 | ✅ 执行 |
+| `enable=false, completer=null` | ❌ 关闭 | ❌ 不执行 |
+| `enable=false, completer=Some(closure)` | ❌ **关闭** | ✅ **仍然执行** |
+
+**实际含义**：
+- 在 PATH 位于慢速网络盘时，可设置 `enable=false` 避免搜索变慢，同时仍可配置 `completer` 使用 Carapace 等第三方参数补全
+- 禁用 `enable` 不会影响 `^docker run <TAB>` 的参数补全（只要配置了 completer 闭包）
+- 反之，`enable=true` 只是让命令名补全包含 PATH 可执行文件，**不会自动获得**参数补全能力（仍需 completer 闭包）
+
+#### 2.6.5 边界总结表
+
+| 功能 | external.enable 控制？ | external.completer 控制？ | 代码位置 |
+|------|------------------------|--------------------------|----------|
+| 命令位置补全的 PATH 搜索 | ✅ 是 | ❌ 否 | [command_completions.rs#L259-L267](crates/nu-cli/src/completions/command_completions.rs#L259-L267) |
+| 内置/外部命令冲突的 % 前缀 | ✅ 是 | ❌ 否 | [command_completions.rs#L235-L254](crates/nu-cli/src/completions/command_completions.rs#L235-L254) |
+| sudo/doas 穿透的内置命令 | ❌ 否（始终包含） | ❌ 否 | [completer.rs#L587-L598](crates/nu-cli/src/completions/completer.rs#L587-L598) |
+| sudo/doas 穿透的外部命令 | ✅ 是（由 enable 决定） | ❌ 否 | 同上 + `externals` 公式 |
+| `^explicit` 显式外部命令 | ❌ 否（始终可补全） | ❌ 否 | 解析器直接标记为 ExternalCall |
+| ExternalCall 的参数补全闭包 | ❌ 否（与 enable 无关） | ✅ 是 | [completer.rs#L606-L628](crates/nu-cli/src/completions/completer.rs#L606-L628) |
+| 参数补全后的文件回退 | ❌ 否 | ❌ 否（始终兜底） | [completer.rs#L630-L636](crates/nu-cli/src/completions/completer.rs#L630-L636) |
+| `max_results` 限制条数 | ✅ 前提 enable=true | ❌ 否 | [command_completions.rs#L89-L93](crates/nu-cli/src/completions/command_completions.rs#L89-L93) |
+
+#### 2.6.6 典型配置场景
+
+**场景 1：追求最快补全，PATH 在慢速网络盘**
+
+```nu
+$env.config.completions.external = {
+    enable: false           # 不搜索 PATH，命令补全只显示内置命令
+    max_results: 100        # 无影响（enable=false）
+    completer: null         # 不使用参数补全闭包
+}
+# 效果：sudo l<TAB> → 只显示 ls, let 等内置命令
+#       docker run <TAB> → 回退到文件补全
+```
+
+**场景 2：使用 Carapace 做参数补全，但 PATH 较慢**
+
+```nu
+$env.config.completions.external = {
+    enable: false           # 不搜索 PATH，命令名补全不包含外部命令
+    max_results: 100        # 无影响
+    completer: {|spans|     # 仍使用 Carapace 做参数补全
+        carapace $spans.0 nushell ...$spans | from json
+    }
+}
+# 效果：^docker run --n<TAB> → Carapace 返回 --network, --name
+#       sudo r<TAB> → 只显示内置命令（无 rg, fd 等）
+```
+
+**场景 3：完整补全（默认）**
+
+```nu
+$env.config.completions.external = {
+    enable: true            # 搜索 PATH，补全包含外部命令
+    max_results: 100        # PATH 最多返回 100 条外部命令
+    completer: {|spans| ... }  # 参数补全由闭包负责
+}
+# 效果：sudo r<TAB> → rm, rmdir, rg, fd, ...
+#       ^docker run --n<TAB> → --network, --name
+```
+
 ---
 
 ## 三、作用域数据在补全中的使用
@@ -803,6 +1029,19 @@ RUST_LOG=nu_cli::completions=debug nu
 | `eval_block_with_early_return` 执行 | 同上 | L420-L426 | `nu_engine::eval_block_with_early_return::<WithoutDebug>(...)` | ✅ |
 | 结果转换（Nothing → need_fallback） | 同上 | L442-L484 | `Value::Nothing { .. } => None` 触发 need_fallback=true | ✅ |
 | `map_value_completions` 结果映射 | 同上 | L19-L49 | List → SemanticSuggestion 转换 | ✅ |
+
+#### external.enable 与外部补全器闭包边界
+| 文档描述 | 文件 | 行号 | 核实内容 | 状态 |
+|----------|------|------|----------|------|
+| ExternalCompleterConfig 三字段定义 | `crates/nu-protocol/src/config/completions.rs` | L58-L72 | `enable: bool`, `max_results: i64`, `completer: Option<Closure>` | ✅ |
+| 官方配置文档（三者正交描述） | `crates/nu-utils/src/default_files/doc_config.nu` | L263-L284 | enable 控制 PATH 搜索；max_results 说明无影响；completer 独立说明 | ✅ |
+| external.enable 唯一使用位置 | `crates/nu-cli/src/completions/completer.rs` | L676-L688 | `externals: !options.internals \|\| (options.externals && config.completions.external.enable)` | ✅ |
+| sudo/doas 传参 `internals=true` | 同上 | L587-L598 | `CommandCompletionOptions { internals: true, externals: true, ... }` | ✅ |
+| 闭包调用无 enable 检查 | 同上 | L606-L628 | 仅检查 `completer.as_ref()`，无 enable 判断 | ✅ |
+| CommandCompletion externals 控制冲突前缀 | `crates/nu-cli/src/completions/command_completions.rs` | L235-L254 | `if self.externals { // %name 前缀处理 }` | ✅ |
+| CommandCompletion externals 控制 PATH 搜索 | 同上 | L259-L267 | `if self.externals { external_command_completion(...) }` | ✅ |
+| max_results 限制（enable=true 前提） | 同上 | L89-L93 | `if max_results <= len { break; }`（在 external_command_completion 内） | ✅ |
+| enable=false 测试用例 | `crates/nu-cli/tests/completions/mod.rs` | L793-L815 | `external_commands_disabled()` 验证 ^sleep 仍可补全、sleep 只补内置 | ✅ |
 
 ### 复核结论
 
