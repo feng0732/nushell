@@ -66,11 +66,17 @@ pub fn expand_tilde(path: impl AsRef<Path>) -> PathBuf {
 - **Linux（非 macOS/Android）**：使用 `pwd` crate 的 `Passwd::from_name` 查询 `/etc/passwd`，失败时 fallback
   （见 [tilde.rs:L68-L75](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/tilde.rs#L68-L75)）
 
-- **macOS / Windows / Android**：先 `dirs::home_dir()` 拿到当前用户目录，再替换最后一级目录名为目标用户名，检查目录是否存在
+- **macOS / Windows**：先 `dirs::home_dir()` 拿到当前用户目录，再替换最后一级目录名为目标用户名，检查目录是否存在
   （见 [tilde.rs:L77-L112](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/tilde.rs#L77-L112)）
 
-- **Android Termux 特殊处理**：检测 `TERMUX_VERSION` 环境变量，固定使用 `/data/data/com.termux/files/home`
-  （见 [tilde.rs:L17-L18](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/tilde.rs#L17-L18) 和 [tilde.rs:L121-L126](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/tilde.rs#L121-L126)）
+- **Android**：与 macOS/Windows 共享同一函数体，但行为有本质区别——由 `!cfg!(target_os = "android")` 守卫的"替换最后一级目录名"逻辑在 Android 上**被跳过**。即：
+  - `dirs::home_dir()` 返回 `None`：若是 Termux 则返回 `/data/data/com.termux/files/home`，否则走 fallback
+  - `dirs::home_dir()` 返回 `Some(current_home)`：**不替换用户名**，直接把当前用户的 home 当作目标用户的 home，检查是否为目录，否则 fallback
+  （见 [tilde.rs:L94-L103](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/tilde.rs#L94-L103)）
+
+- **Android Termux 特殊处理**：仅当 `dirs::home_dir()` 返回 `None` 时触发，检测 `TERMUX_VERSION` 环境变量，固定使用 `/data/data/com.termux/files/home`。
+  若 `dirs::home_dir()` 成功拿到值，Termux 分支不会被执行。
+  （见 [tilde.rs:L82-L87](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/tilde.rs#L82-L87) 和 [tilde.rs:L121-L126](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/tilde.rs#L121-L126)）
 
 - **WASM**：读 `HOME` 环境变量，否则用 `/`
 
