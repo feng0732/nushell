@@ -487,6 +487,7 @@ PipelineData::ListStream(stream, metadata, ..) => Ok(stream
 | Record 输入 | 直接迭代列名，**零收集** | `val.values().cloned()`，**克隆值** |
 | List（table）输入 | `get_columns` 遍历收集列名 | `get_values` 按**列优先**重组为 `list<list>` |
 | ListStream 输入 | **全量收集** | **全量收集** |
+| ByteStream 输入 | `Err(OnlySupportsThisInputType)` **报错** | `Err(OnlySupportsThisInputType)` **报错** |
 | 遇到 Error 元素 | Record 级别短路（`Value::Error`→`Err`），元素级别不检查 | `get_values` 内部**逐元素检查**，遇 Error 立即 `Err` |
 | Custom 值 | **展开**后处理 | **展开**后处理 |
 
@@ -498,6 +499,8 @@ PipelineData::ListStream(stream, metadata, ..) => Ok(stream
 
 - 输入通过 `into_iter_strict(head)` 转为迭代器（[where_.rs#L71](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/where_.rs#L71)）
 - `into_iter_strict` 对 `ListStream` 直接返回内部迭代器，**保留流式**；对 `Value::List` 和 `Value::Range` 创建新 `ListStream`
+- `into_iter_strict` 对 `ByteStream` 通过 `stream.chunks()` 转为 `Chunks` 迭代器，**也支持流式处理**（[pipeline_data.rs#L410-L416](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/pipeline/pipeline_data.rs#L410-L416)）
+- `chunks()` 返回 `Option<Chunks>`，当 `stream.reader()` 为 `None` 时返回 `PipelineIteratorInner::Empty`（空流，非报错）
 - 闭包求值失败时，**不过滤掉该元素**，而是将原始值替换为 `Value::error(err, head)` 放入输出（[where_.rs#L77-L79](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/where_.rs#L77-L79)）
 - 闭包求值成功但条件为 false 时，元素被 `filter_map` 丢弃
 - 输出总是 `ListStream`（通过 `into_pipeline_data_with_metadata`）
@@ -545,7 +548,8 @@ fn each_map(value: Value, closure: &mut ClosureEval, head: Span) -> Result<Value
 | 闭包输出为流时 | `into_value(head)` 收集 | 非 flatten 模式：`into_value(head)` 收集；flatten 模式：`flat_map` 展开 |
 | 闭包输出 Nothing | 不适用（条件判断不产出 Nothing） | 默认过滤掉；`--keep-empty` 保留 |
 | 流式保留 | **始终保留**（`into_iter_strict` → `filter_map`） | **始终保留**（`into_iter` → `map`/`flat_map`） |
-| ByteStream 处理 | 不支持（`into_iter_strict` 对 ByteStream 报错） | 通过 `chunks()` 逐块处理 |
+| ByteStream 处理 | 通过 `chunks()` 逐块处理（`into_iter_strict` 内部转换） | 通过 `chunks()` 逐块处理（显式分支） |
+| ByteStream 错误处理 | `PipelineIterator::next` 包装为 `Value::error` | `chunks.map(and_then)` 后 `unwrap_or_else` 包装为 `Value::error` |
 
 ### 7.5 Record 与 List 在字段选择上的行为差异
 
@@ -558,6 +562,7 @@ Record 和 List 在 Nushell 中是两种不同的结构化容器，命令对它�
 | `Record` | 返回只含 `name` 字段的 Record | 返回 `name` 字段的裸值 |
 | `List`（table） | 逐元素提取 `name`，返回只含 `name` 列的 table | 逐元素提取 `name`，返回 `list<any>`（所有行的 name 值） |
 | `ListStream` | 流式逐元素提取，输出 `ListStream` | 流式逐元素提取，输出 `ListStream`（单路径时） |
+| `ByteStream` | 静默返回空（fallthrough → `PipelineData::empty()`） | `Err(IncompatiblePathAccess)` 报错 |
 
 **数据收集**：
 
@@ -566,8 +571,9 @@ Record 和 List 在 Nushell 中是两种不同的结构化容器，命令对它�
 | `Record` | 零收集（直接迭代列名） | 克隆值（`val.values().cloned()`） | 零收集（直接构建新 Record） | 零收集（`follow_cell_path` 借用） |
 | `Value::List` | 遍历所有元素收集列名 | `get_values` 按列优先重组 | 逐元素构建 Record，输出 `ListStream` | **全量收集**（`into_value`） |
 | `ListStream` | **全量收集** | **全量收集** | **流式保留** | **全量收集**（`into_value`） |
+| `ByteStream` | **报错**（`OnlySupportsThisInputType`） | **报错**（`OnlySupportsThisInputType`） | 静默空（fallthrough） | **全量收集**（`into_value` 转为 string 或 binary） |
 
-**核心差异**：Record 作为单行结构，字段操作天然不需要收集；List（table）作为多行结构，列级操作需要遍历所有行；ListStream 的特殊性在于——`select` 和 `each`/`where` 可以逐元素处理保持流式，但 `columns`/`values` 和 `get`（多路径）因为需要全量视角，不得不收集。
+**核心差异**：Record 作为单行结构，字段操作天然不需要收集；List（table）作为多行结构，列级操作需要遍历所有行；ListStream 的特殊性在于——`select` 和 `each`/`where` 可以逐元素处理保持流式，但 `columns`/`values` 和 `get`（多路径）因为需要全量视角，不得不收集；ByteStream 则因为语义差异，在字段选择命令中表现各不相同（`get` 报错、`select` 静默空、`columns`/`values` 报错）。
 
 ### 7.6 命令链组合中的数据流变迁
 
@@ -662,14 +668,20 @@ ls | get name
 |------|---------|---------|----------|---------|
 | `get`（单路径） | cell path 追踪失败 | `Value::error` 嵌入流 | 否 | 无 |
 | `get`（多路径） | cell path 追踪失败 | `Err(ShellError)` | 是 | 无 |
+| `get`（ByteStream） | ByteStream 不支持路径访问 | `Err(IncompatiblePathAccess)` | 是 | 无 |
 | `select` | cell path 追踪失败 | `Value::error` 嵌入流 | 否 | 无 |
+| `select`（ByteStream） | fallthrough 空分支 | 静默返回 `PipelineData::empty()` | 否（空流） | N/A |
 | `columns` | 输入为 `Value::Error` | `Err(*error)` 短路 | 是 | 无 |
 | `columns` | `get_columns` 遇非 Record 元素 | 静默返回空列表 | 否 | N/A |
+| `columns`（ByteStream） | 类型不匹配 | `Err(OnlySupportsThisInputType)` | 是 | 无 |
 | `values` | 输入为 `Value::Error` | `Err(*error)` 短路 | 是 | 无 |
 | `values` | `get_values` 遇 `Value::Error` 元素 | `Err(*error)` 提前终止 | 是 | 无 |
 | `values` | `get_values` 遇非 Record 元素 | `Err(OnlySupportsThisInputType)` | 是 | 无 |
-| `where` | 闭包求值失败 | `Value::error` 替代原始值 | 否 | 无 |
-| `each` | 闭包求值失败 | `Value::error` 替代闭包返回值 | 否 | `chain_error_with_input` |
+| `values`（ByteStream） | 类型不匹配 | `Err(OnlySupportsThisInputType)` | 是 | 无 |
+| `where` | 闭包求值失败 | `Value::error` 替代原始值 | 否（流继续，后续元素可能正常） | 无 |
+| `where`（ByteStream） | chunks IO / UTF-8 错误 | `Value::error` 嵌入流（经 PipelineIterator 包装） | 产出一个错误值后流结束（chunks 设置 error 标记） | 无 |
+| `each` | 闭包求值失败 | `Value::error` 替代闭包返回值 | 否（流继续，后续元素可能正常） | `chain_error_with_input` |
+| `each`（ByteStream） | chunks IO / UTF-8 错误 | `Value::error` 嵌入流（经 unwrap_or_else 包装） | 产出一个错误值后流结束（chunks 设置 error 标记） | 无 |
 
 **关键发现**：
 
@@ -677,6 +689,8 @@ ls | get name
 2. `get` 在多路径模式下**最严格**：直接 `Err` 中断整个 pipeline
 3. `where` 的错误处理**最宽松**：闭包失败的元素被保留为 `Value::Error`，允许下游命令看到错误并决定如何处理
 4. `each` 的 `chain_error_with_input` 是唯一提供**错误上下文增强**的命令——当输入本身不是错误时，会包装为 `EvalBlockWithInput` 错误
+5. **ByteStream 的错误是"一次性的"**：chunks 迭代器设置 `self.error = true` 后，下一次 `next()` 直接返回 `None`，即错误元素之后不会再有更多元素流出——但从外部看，错误被包装为 `Value::Error` 嵌入流中，表现为"一个错误元素 + 流结束"
+6. `select` 对 ByteStream 的处理**最不直观**：既不报错也不处理，直接返回空流，用户可能困惑为什么没有输出
 
 ### 7.8 `into_stream_or_original` 与 `into_iter_strict` 的分水岭
 
@@ -685,7 +699,7 @@ ls | get name
 | 方法 | 语义 | `Value::List` 行为 | `ListStream` 行为 | `ByteStream` 行为 | `Value::Error` 行为 |
 |------|------|-------------------|-------------------|-------------------|-------------------|
 | `into_stream_or_original` | 尽量转为流，否则保持原样 | 转为 `ListStream` | 透传 | 保持 `ByteStream` | 保持 `Value` |
-| `into_iter_strict` | 必须转为迭代器 | 转为 `ListStream` | 透传 | **报错** | **报错** |
+| `into_iter_strict` | 必须转为迭代器（返回 `Result`） | 转为 `ListStream` | 透传 | **转为 `Chunks` 迭代器**（`stream.chunks()`） | **报错**（`return Err(*error)`） |
 
 `into_stream_or_original` 的关键代码（[pipeline_data.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/pipeline/pipeline_data.rs)）：
 
@@ -768,50 +782,102 @@ NthIterator {
 ### 7.11 完整协作链数据流图
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Pipeline 数据流全景                               │
-├─────────────────────────────────────────────────────────────────────────┤
+┌───────────────────────────────────────────────────────────────────────────┐
+│                         Pipeline 数据流全景                                 │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  ls / open / 外部命令                                                      │
+│    │                                                                      │
+│    ├── PipelineData::ListStream ───────────────────────────────────┐     │
+│    │     │                                                          │     │
+│    │     ├── get (单路径, 列名) ── 流式保留 ──→ ListStream           │     │
+│    │     ├── get (单路径, 行号) ── 全量收集 ──→ Value                │     │
+│    │     ├── get (多路径)      ── 全量收集 ──→ ListStream            │     │
+│    │     │                                                          │     │
+│    │     ├── select (列名)     ── 流式保留 ──→ ListStream           │     │
+│    │     ├── select (行号)     ── 流式跳过 ──→ ListStream           │     │
+│    │     ├── select (行+列)    ── 流式保留 ──→ ListStream           │     │
+│    │     │                                                          │     │
+│    │     ├── where             ── 流式保留 ──→ ListStream           │     │
+│    │     ├── each              ── 流式保留 ──→ ListStream           │     │
+│    │     │                                                          │     │
+│    │     ├── columns           ── 全量收集 ──→ Value::List          │     │
+│    │     └── values            ── 全量收集 ──→ Value::List          │     │
+│    │                                                                │     │
+│    ├── PipelineData::Value(Value::Record) ────────────────────┐     │     │
+│    │     │                                                       │     │     │
+│    │     ├── get (单路径)     ── 零收集  ──→ Value (裸值)        │     │
+│    │     ├── select          ── 零收集  ──→ Value (Record)         │     │
+│    │     ├── columns         ── 零收集  ──→ Value::List          │     │
+│    │     ├── values          ── 克隆值  ──→ Value::List          │     │
+│    │     ├── where           ── 不适用  (Record 不是列表)        │     │
+│    │     └── each            ── 单次执行 ──→ 闭包返回值          │     │
+│    │                                                             │     │
+│    └── PipelineData::ByteStream ────────────────────────┐      │     │
+│          │                                                │      │     │
+│          ├── each             ── chunks() 流式 ──→ ListStream           │     │
+│          ├── where            ── chunks() 流式 ──→ ListStream           │     │
+│          ├── get              ── Err(IncompatiblePathAccess)               │     │
+│          ├── select           ── 静默空 (fallthrough → empty)                   │     │
+│          └── columns/values   ── Err(OnlySupportsThisInputType)              │     │
 │                                                                         │
-│  ls / open / 外部命令                                                    │
-│    │                                                                    │
-│    ├── PipelineData::ListStream ──────────────────────────────────┐     │
-│    │     │                                                        │     │
-│    │     ├── get (单路径, 列名) ── 流式保留 ──→ ListStream         │     │
-│    │     ├── get (单路径, 行号) ── 全量收集 ──→ Value              │     │
-│    │     ├── get (多路径)      ── 全量收集 ──→ ListStream          │     │
-│    │     │                                                        │     │
-│    │     ├── select (列名)     ── 流式保留 ──→ ListStream         │     │
-│    │     ├── select (行号)     ── 流式跳过 ──→ ListStream         │     │
-│    │     ├── select (行+列)    ── 流式保留 ──→ ListStream         │     │
-│    │     │                                                        │     │
-│    │     ├── where             ── 流式保留 ──→ ListStream         │     │
-│    │     ├── each              ── 流式保留 ──→ ListStream         │     │
-│    │     │                                                        │     │
-│    │     ├── columns           ── 全量收集 ──→ Value::List        │     │
-│    │     └── values            ── 全量收集 ──→ Value::List        │     │
-│    │                                                              │     │
-│    ├── PipelineData::Value(Value::Record) ──────────────────┐     │     │
-│    │     │                                                   │     │
-│    │     ├── get (单路径)     ── 零收集  ──→ Value (裸值)    │     │
-│    │     ├── select          ── 零收集  ──→ Value (Record)   │     │
-│    │     ├── columns         ── 零收集  ──→ Value::List      │     │
-│    │     ├── values          ── 克隆值  ──→ Value::List      │     │
-│    │     ├── where           ── 不适用  (Record 不是列表)    │     │
-│    │     └── each            ── 单次执行 ──→ 闭包返回值      │     │
-│    │                                                         │     │
-│    └── PipelineData::ByteStream ──────────────────────┐      │     │
-│          │                                             │      │     │
-│          ├── each           ── chunks() 流式 ──→ ListStream   │     │
-│          ├── where          ── 报错 (into_iter_strict) │      │     │
-│          ├── get/select/    ── 报错或不支持            │      │     │
-│          └── columns/values ── 报错 (OnlySupportsThis) │      │     │
-│                                                        │      │     │
-│  错误传播:                                              │      │     │
-│    Value::Error 在 Value 中 → Err 短路 (columns/values)│      │     │
-│    Value::Error 在 Stream 中 → 嵌入流延迟 (get/select/each/where)     │
-│    闭包失败            → Value::error 嵌入流 (each/where)             │
-│    cell path 失败      → Value::error 嵌入流 (get单路径/select)       │
-│    cell path 失败      → Err 中断 (get多路径)                        │
-│                                                                       │
-└───────────────────────────────────────────────────────────────────────┘
+│  ByteStream chunks 的错误传播:                                                   │
+│    Binary type: 始终生成 Value::Binary 块                                        │
+│    String type: 生成 Value::String，UTF-8 失败 → Err 停止                  │
+│    Unknown type: 先试 String，UTF-8 失败 → 永久切换到 Binary 模式              │
+│    IO 错误: 设置 error 标记，产出 Err(ShellError::Io)                              │
+│    信号中断: 立即停止，产出 None                                              │
+│    chunks Item: 全部经过 PipelineIterator → 包装为 Value::error                  │
+│                                                                         │
+│  Value::Error 传播总览:                                                      │
+│    Value 中 → Err 短路 (columns/values/select(record分支)                         │
+│    Stream 中 → 嵌入流延迟 (get单路径/select/each/where)                    │
+│    闭包失败 → Value::error 嵌入流 (each/where)                               │
+│    cell path 失败 → Value::error 嵌入流 (get单路径/select)                  │
+│    cell path 失败 → Err 中断 (get多路径)                                    │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
+
+### 7.12 ByteStream `chunks()` 迭代器的详细行为
+
+`chunks()` 定义于 [byte_stream.rs#L542-L545](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/pipeline/byte_stream.rs#L542-L545)，是 ByteStream 与值流之间的桥梁：
+
+```rust
+pub fn chunks(self) -> Option<Chunks> {
+    let reader = self.stream.reader()?;
+    Some(Chunks::new(reader, self.span, self.signals, self.type_))
+}
+```
+
+`Chunks` 迭代器（`impl Iterator for Chunks`）的 `type Item = Result<Value, ShellError>`。不同 `ByteStreamType` 的行为差异：
+
+| ByteStreamType | 产出值类型 | UTF-8 失败行为 | 错误后是否停止 | 信号中断行为 |
+|----------------|-----------|--------------|------------|------------|
+| `Binary` | `Value::Binary`（字节块） | N/A | 是（`self.error = true`） | 是（`signals.interrupted()` → None） |
+| `String` | `Value::String`（UTF-8 文本块） | `Err(NonUtf8Custom)`，**永久停止** | 是 | 是 |
+| `Unknown` | 先 `Value::String`，失败后切换到 `Value::Binary` | 首块非空 → **切换到 Binary 模式**继续；首块空或后续块错误 → 停止 | 是（彻底失败后） | 是 |
+
+**关键行为细节**：
+
+1. **Binary 模式**：通过 `reader.fill_buf()` 读取可用字节，产出 `Value::binary(buf, span)`，消费后继续。每次 `next()` 返回的字节块大小取决于内核缓冲区中的可用字节数。
+
+2. **String 模式**：调用 `self.next_string()`（[byte_stream.rs#L1066-L1072](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/pipeline/byte_stream.rs#L1066-L1072)），遇到 UTF-8 错误时设置 `self.error = true`，下一次 `next()` 直接返回 `None`。
+
+3. **Unknown 模式**（最复杂）：先尝试 `next_string()`，成功则产出 `Value::String`；失败但缓冲区非空时，**不可逆地切换到 `ByteStreamType::Binary`**（[byte_stream.rs#L1075-L1088](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/pipeline/byte_stream.rs#L1075-L1088)），将当前缓冲区内容作为 `Value::Binary` 产出，之后按 Binary 模式继续。这意味着同一个 Chunks 迭代器可能先产出 String 后产出 Binary，类型不一致。
+
+4. **错误传播链**：
+
+```
+ByteStream::chunks() → Chunks::next() → Result<Value, ShellError>
+  ↓ (PipelineIterator::next())
+  Value::error(err, Span::unknown())  // FIXME: 包装为 Value::Error 嵌入流
+  ↓ (where 命令：into_iter_strict 内部转换)
+  filter_map 中继续传递
+  ↓ (each 命令：显式 chunks() 调用)
+  chunks.map(and_then...).unwrap_or_else
+  ↓ (消费点：into_value / drain / collect_reg)
+  Err(ShellError)  // 提升为结构化错误
+```
+
+`PipelineIterator::next()` 中的转换（[pipeline_data.rs#L1013-L1031](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/pipeline/pipeline_data.rs#L1013-L1031)）将 Chunks 的 `Result` 错误包装为 `Value::Error` 嵌入流中，使用 `Value::error(err, Span::unknown()) // FIXME`，注释表明 span 信息丢失了。
