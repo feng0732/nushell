@@ -594,6 +594,137 @@ impl Drop for PluginCustomValueWithSource {
 
 见 `crates/nu-plugin-engine/src/interface/mod.rs` 第 752-763 行、1142-1154 行。
 
+### 6.7 调用状态保活与 Dropped 的间接关系：为何 PluginCallState::drop 也会触发通知
+
+虽然 Dropped 的**直接触发点**是 `PluginCustomValueWithSource::drop()`，但调用状态（`PluginCallState`）通过**保活通道**和**流计数器**与 Dropped 通知形成了**间接因果关系**，这是最容易混淆的边界。
+
+#### 保活通道：keep_plugin_custom_values
+
+每次发起 PluginCall 时，会创建一对 mpsc 通道：
+
+```rust
+// write_plugin_call() 中
+let keep_plugin_custom_values = mpsc::channel();  // (tx, rx)
+
+PluginCallState {
+    keep_plugin_custom_values,  // (tx, rx) 均由 PluginCallState 持有
+    ...
+}
+```
+
+发送端 tx 的克隆被存入 `CurrentCallState`，当引擎侧将用户数据发送给插件时，所有**需要通知 drop 的自定义值**会被**额外 clone 一份送入通道**：
+
+```rust
+// CurrentCallState::prepare_custom_value()
+if let Some(keep_tx) = &self.keep_plugin_custom_values_tx
+    && let Some(custom_value) = custom_value
+        .item.as_any()
+        .downcast_ref::<PluginCustomValueWithSource>()
+    && custom_value.notify_on_drop()  // 只保留需要通知的
+{
+    keep_tx.send(custom_value.clone())?;  // clone 一份，ref_count += 1
+}
+
+// 随后立刻 remove_source，准备发送给插件（跨边界需要无 source）
+PluginCustomValueWithSource::remove_source(&mut *custom_value.item);
+```
+
+见 `crates/nu-plugin-engine/src/interface/mod.rs` 第 1263-1294 行。
+
+> **关键洞察**：这里做了两件事：
+> 1. **clone + send 保活**：让 `SharedCow` 的引用计数 **额外 +1**
+> 2. **remove_source**：把发送给插件的副本变成 `PluginCustomValue`（不再持有 source，无法触发 Dropped）
+>
+> 因此，**"真正能触发 Dropped"的那个 WithSource 副本被刻意藏在通道里**，直到 PluginCallState drop 时才被释放。
+
+#### 释放时序：两条导致 PluginCallState 清理的路径
+
+`PluginCallState` 存在于 `plugin_call_states: BTreeMap<PluginCallId, PluginCallState>` 中。它从 map 中移除（触发 drop）的条件是：
+
+**路径 A：收到 CallResponse 且无待读流**
+```
+consume(CallResponse(id, ..))
+    → sender.send(Response)        通知等待线程
+    → remaining_streams_to_read <= 0 ?
+        → e.remove()               ← PluginCallState drop
+```
+
+**路径 B：所有流读完（CallResponse 早于流 End 到达）**
+```
+consume(End(stream_id))
+    → call_id = plugin_call_input_streams.remove(stream_id)
+    → remaining_streams_to_read -= 1
+    → remaining_streams_to_read <= 0 ?
+        → e.remove()               ← PluginCallState drop
+```
+
+两条路径殊途同归：**最后导致 `PluginCallState::drop()` 执行**。
+
+#### PluginCallState::drop 的实际工作
+
+```rust
+impl Drop for PluginCallState {
+    fn drop(&mut self) {
+        // 逐一把保活通道里藏着的 WithSource 取出来 drop
+        for value in self.keep_plugin_custom_values.1.try_iter() {
+            drop(value);  // ← 这里可能触发 Dropped 通知！
+        }
+    }
+}
+```
+
+每个 `drop(value)` 调用都会进入 `PluginCustomValueWithSource::drop()` 检查三条件。此时：
+- `notify_on_drop == true` ✅（只有满足的才会被送进通道）
+- 插件还活着 → get_plugin 成功 ✅
+- **ref_count 是否 == 1？** → 取决于外部是否还有其他持有（见下）
+
+#### 间接关系全景图
+
+```
+引擎持有 PluginCustomValueWithSource
+  (ref_count = N, 用户变量/pipeline中传递)
+        │
+        ▼  prepare_custom_value() 时
+  ┌──── clone + send ────────────────────────────────────────┐
+  │  (ref_count 变为 N+1)                                     │
+  │                                                           │
+  ▼                                        ┌──────────────────▼──────────────┐
+外部持有 (用户变量/pipeline)            │ PluginCallState.keep_rx            │
+  ref_count 中的 N 份                     │   持有额外的 1 份 WithSource      │
+                                         │   ref_count 中的 +1 份             │
+                                         └──────────────────┬──────────────┘
+                                                            │
+  ... 时间流逝 ...                                           │
+  外部可能 drop 了一些, ref_count 减少                        │
+                                                            │
+        │                                                   │
+        ▼                                                   ▼
+PluginCallState 清理条件满足                   remaining_streams_to_read == 0
+（CallResponse 到了 / 所有流读完）          ───→  PluginCallState::drop()
+                                                            │
+                                                            ▼
+                                              keep_rx.try_iter() → 逐个 drop()
+                                                            │
+                                                            ▼
+                                         PluginCustomValueWithSource::drop()
+                                          ├─ notify_on_drop?      ── (已保证 true)
+                                          ├─ ref_count == 1?      ── 取决于外部
+                                          └─ get_plugin 成功?      ── 取决于插件
+                                                            │
+                                          全部满足 → write Dropped 消息
+```
+
+#### 容易混淆的四个边界点
+
+| 现象 | 解释 |
+|---|---|
+| **"为什么用户还持有变量，但 Dropped 通知发了？"** | 说明外部持有已经结束了（比如 pipeline 消费完了），`ref_count == 1` 的唯一剩余就是保活通道里那一份 |
+| **"为什么 PluginCall 结束了很久，Dropped 还没发？"** | 因为 ref_count > 1，用户还在某个变量里持有该自定义值（例如存入了一个 `$myvar`），PluginCallState drop 只是把保活那份释放了 |
+| **"Dropped 是不是一定在 PluginCallState drop 时发？"** | **不一定**。如果外部持有先 drop，ref_count 先减到 1，此时外部那个 WithSource 的 drop 就会先触发。保活通道只是**保证至少有一份活到 PluginCall 结束**，不保证一定是最后一份 |
+| **"如果 Plugin 死了怎么办？"** | `get_plugin()` 失败，只记一条 warn 日志，Dropped 通知静默丢失，不报错 |
+
+见 `crates/nu-plugin-engine/src/interface/mod.rs` 第 101-135 行（PluginCallState 定义与 Drop）、第 206-282 行（清理条件）、第 1263-1294 行（保活通道入队）。
+
 ---
 
 ## 7. 边界速查表：什么归哪层管？
