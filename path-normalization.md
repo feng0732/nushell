@@ -264,13 +264,112 @@ pub fn is_windows_device_path(path: &Path) -> bool {
 
 ### 三种展开函数的区别
 
-| 函数 | 解析 symlink | 访盘 | 转绝对 | 词法消 `..` | 适用场景 |
-|------|:---:|:---:|:---:|:---:|----------|
-| `expand_path_with` | ❌ | ❌ | ✅ | ✅ | 需要稳定的词法归一（不要求文件存在） |
-| `absolute_with` | ❌ | 仅读取 cwd | ✅ | **平台相关** | 需要绝对路径但不想跟随链接 |
-| `canonicalize_with` | ✅ | ✅ | ✅ | ✅ | 需要真实物理路径 |
+| 函数 | 解析 symlink | 访盘 | 转绝对 | 词法消 `..` | Verbatim→WinUser 转换 | 适用场景 |
+|------|:---:|:---:|:---:|:---:|:---:|----------|
+| `expand_path_with` | ❌ | ❌ | ✅ | **有条件消除** | ✅ | 需要稳定的词法归一（不要求文件存在） |
+| `absolute_with` | ❌ | 仅读取 cwd | ✅ | **平台相关** | ❌ | 需要绝对路径但不想跟随链接 |
+| `canonicalize_with` | ✅ | ✅ | ✅ | ✅（内核处理） | ✅（内核处理） | 需要真实物理路径 |
 
-（见 [expansions.rs:L55-L82](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/expansions.rs#L55-L82)）
+（见 [expansions.rs:L55-L114](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/expansions.rs#L55-L114)）
+
+### Windows 下 `absolute_with` 与 `expand_path_with` 的差异边界
+
+两条路径前三步相同，**差异完全在最后一步**：
+
+```
+expand_path_with:
+  join_path_relative → expand_tilde → expand_ndots → expand_dots
+                                                              └─→ simiplified()
+                                                                     └─→ to_winuser_path()
+absolute_with:
+  join_path_relative → expand_tilde → expand_ndots → std::path::absolute
+                                                                    └─→ GetFullPathNameW
+```
+
+**差异 1：末尾的 Verbatim → WinUser 转换**
+
+`expand_dots` 在所有组件处理完之后，会无条件调用 `simiplified()`（Windows 专有），也就是 `to_winuser_path()`：
+
+```rust
+// expand_dots 末尾
+let result = result.as_path();
+simiplified(result)
+
+// simiplified 仅 Windows
+fn simiplified(path: &std::path::Path) -> PathBuf {
+    path.to_winuser_path()
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+```
+
+（见 [dots.rs:L119-L126](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/dots.rs#L119-L126)）
+
+这意味着：
+
+| 输入路径 | `expand_path_with` 结果 | `absolute_with` 结果 |
+|----------|------------------------|----------------------|
+| `\\?\C:\foo` | `C:\foo`（被 to_winuser_path 转换） | `\\?\C:\foo`（GetFullPathNameW 保留 Verbatim 原样） |
+| `\\?\UNC\server\share` | `\\server\share`（被转换） | `\\?\UNC\server\share`（保留 Verbatim UNC） |
+| `C:\foo` | `C:\foo` | `C:\foo` |
+
+**差异 2：`..` 的消除条件不同**
+
+`expand_dots` 中 `..` 的消除条件**严格限制**为"前面必须是 `Normal` 组件"，否则保留（见 [dots.rs:L74-L75](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/dots.rs#L74-L75)）。
+
+而 `std::path::absolute` → Win32 `GetFullPathNameW` 按 DOS 风格直接消 `..`，不受此限制。
+
+**关键反例 `a/b/../../c`**：
+
+- **`expand_dots` 的逐步追踪**：
+
+| 步骤 | 当前组件 | result（处理前） | 匹配分支 | result（处理后） | 说明 |
+|------|----------|-----------------|----------|-----------------|------|
+| 1 | `Normal("a")` | `""` | `_` | `"a"` | 直接 push |
+| 2 | `Normal("b")` | `"a"` | `_` | `"a/b"` | 直接 push |
+| 3 | `ParentDir` | `"a/b"` | `ParentDir if last_normal` → pop | `"a"` | `"b"` 是 Normal，消掉 |
+| 4 | `ParentDir` | `"a"` | `ParentDir if last_normal` → pop | `""` | `"a"` 是 Normal，消掉 |
+| 5 | `ParentDir` | `""` | `_` | `".."` | 前面空，既不是 Normal 也不是 ParentDir → push |
+| 6 | `Normal("c")` | `".."` | `_` | `"../c"` | 直接 push |
+
+**结论**：`a/b/../../c` 经过 `expand_dots` 得到 **`../c`**。两个 `..` 消掉了 `a/b`，但第三个 `..` 前面没有 Normal 组件可消，被保留为 `..`。
+
+- **`GetFullPathNameW`（`absolute_with`）**：按 DOS 风格，`../` 直接回退目录层级。假设 cwd 是 `C:\work`，`join_path_relative` 拼完后为 `C:\work\a\b\..\..\c`，`GetFullPathNameW` 完全消掉 `..`，得到 **`C:\work\c`**。
+
+| 输入 | expand_path_with | absolute_with（假设 cwd=C:\work） |
+|------|-----------------|-----------------------------------|
+| `a/b/../../c` | `../c` | `C:\work\c` |
+| `../a/../b` | `../../b`（第二个 `..` 消 `a`，但第一个 `..` 前不是 Normal，所以 `..` 被保留） | `C:\b` |
+| `/foo/../bar` | `/bar`（`foo` 是 Normal，被消） | `C:\bar` |
+
+注意 `/foo/../bar` 这两个函数的**输出形式也不同**：`expand_path_with` 输出 `/bar`（但此时已通过 `join_path_relative` 拼过 cwd，实际是 `C:\work/bar` 这种），而 `absolute_with` 输出 `C:\work\bar`。
+
+**差异 3：`.` 的消除条件不同**
+
+`expand_dots` 中 `.`（`CurDir`）也有相同的条件——只有前面是 Normal 才 no-op，否则 push：
+
+```rust
+Component::CurDir if last_component_is_normal(&result) => {
+    // no-op，不 push
+}
+```
+
+（见 [dots.rs:L70-L71](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/dots.rs#L70-L71)）
+
+| 输入 | expand_path_with | absolute_with |
+|------|-----------------|---------------|
+| `./foo` | `./foo`（开头的 `.` 前不是 Normal → push） | `C:\work\foo`（GetFullPathNameW 完全消 `.`） |
+| `a/./b` | `a/b`（`a` 是 Normal → `.` 被 no-op） | `C:\work\a\b` |
+| `a/b/./` | `a/b/`（保留尾随斜杠，`b` 是 Normal → `.` 被 no-op） | `C:\work\a\b`（GetFullPathNameW 去掉尾随斜杠） |
+
+**差异 4：尾随斜杠处理不同**
+
+`expand_dots` 内部追加了空 `Normal("")` 组件来保留尾随斜杠（见前文 expand_ndots 的组件转换逻辑），而 `GetFullPathNameW` 通常会去掉尾随反斜杠：
+
+| 输入 | expand_path_with | absolute_with |
+|------|-----------------|---------------|
+| `a/b/` | `a/b/`（保留） | `C:\work\a\b`（去掉） |
+
+### 修正后的 `absolute_with` 跨平台差异
 
 **`absolute_with` 的点号处理是跨平台行为差异的关键**。函数的文档注释明确标注了这一点（[expansions.rs:L65-L68](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/expansions.rs#L65-L68)）：
 
@@ -299,21 +398,29 @@ where
 | 平台 | `std::path::absolute` 行为 | 结果 | 原因 |
 |------|---------------------------|------|------|
 | **Unix** | 保留 `..` | `/foo/link/../bar` | Unix 上 `..` 被视为一种"链接"，必须解析 symlink 后才能知道父目录。词法消除可能导致错误——`link/..` 实际应指向 `/other/..` = `/`，而非 `/foo` |
-| **Windows** | 词法消除 `..` | `/foo/bar` | Windows 上不把 `..` 视为链接符号，直接按词法消除 |
+| **Windows** | `GetFullPathNameW` 词法消除 `..` | `/foo/bar` | Windows 上不把 `..` 视为链接符号，直接按 Win32 规则词法消除 |
 
 **注意：Unix 上 `std::path::absolute` 的行为并非 Nushell 决定，而是 Rust 标准库的设计。** 它不做任何词法 `..` 消除，以避免在 symlink 存在时给出错误结果。
 
-**与 `expand_path_with` 的对比**：
-- `expand_path_with` → 调 `expand_dots()` → 所有平台都词法消 `..`
-- `absolute_with` → 调 `std::path::absolute()` → 保留 `..`（Unix）/ 消除 `..`（Windows）
-- `canonicalize_with` → 调 `std::fs::canonicalize()` → 内核先解析 symlink 再处理 `..`，所有平台都消除
+**与 `expand_path_with` 的对比（Windows 下）**：
 
-因此，在 Unix 上如果想在不访盘的前提下消 `..`，应该用 `expand_path_with`；如果想保留 `..` 交给内核处理，应该用 `absolute_with`。在 Windows 上两者结果没有区别。
+| 维度 | `expand_path_with` | `absolute_with` |
+|------|-------------------|-----------------|
+| `..` 消除规则 | 前一组件是 Normal 才消 | `GetFullPathNameW` 直接消 |
+| `a/b/../../c` 的结果 | `../c`（第二个 `..` 消 `a`，但第三个 `..` 无法消 → 保留 `..`） | `C:\work\c`（全消） |
+| `.` 消除规则 | 前一组件是 Normal 才消 | 全部消除 |
+| `./foo` 的结果 | `./foo`（开头 `.` 保留） | `C:\work\foo`（全消） |
+| Verbatim → WinUser | ✅（末尾 `to_winuser_path`） | ❌ |
+| 尾随斜杠 | ✅ 保留 | ❌ 去掉 |
+| 转绝对方式 | `join_path_relative`（join cwd） | `GetFullPathNameW`（考虑 Windows 驱动器语义） |
+| 防错机制 | `expand_dots` 有 Prefix::Disk 特判避免多分隔符 | `GetFullPathNameW` 系统级处理 |
+
+**结论：Windows 下两条路径的结果** **不相同**，差异主要体现在 `a/b/../../c` 这类包含"连续回退超过输入起点"的路径、Verbatim 前缀格式、尾随斜杠、以及开头 `./` 等情况。
 
 **`absolute_with` 的点号展开层次**：
 - ✅ 展开 `~`（`expand_tilde`）
 - ✅ 展开 `...`/`....` 等 ndots（`expand_ndots`）
-- ❌ **不调用** `expand_dots`，所以 `.` 和 `..` 交由 `std::path::absolute` 处理（平台相关）
+- ❌ **不调用** `expand_dots`，所以 `.` 和 `..` 交由 `std::path::absolute` 处理（平台相关、格式相关）
 
 ### path expand 命令的实现
 
@@ -439,8 +546,8 @@ Component::ParentDir if last_component_is_normal(&result) => {
 
 **这意味着词法折叠 vs symlink 安全的关键分界线不在 `expand_dots` 内部，而在调用者选择哪条路径**：
 
-- `expand_path()` 调用 `expand_dots()`，**所有平台**都会词法折叠 `link/..`
-- `absolute_with()` 调用 `expand_tilde` + `expand_ndots` + `std::path::absolute`，**不调用** `expand_dots`，所以 `..` 的处理**跨平台不同**：Unix 保留 `..`，Windows 消除 `..`
+- `expand_path()` 调用 `expand_dots()`，**所有平台**都按"前一组件是 Normal 才消"的规则词法折叠 `link/..`，末尾执行 Verbatim→WinUser 转换
+- `absolute_with()` 调用 `expand_tilde` + `expand_ndots` + `std::path::absolute`，**不调用** `expand_dots`，所以 `..` 的处理**跨平台不同**：Unix 保留 `..`，Windows 由 `GetFullPathNameW` 全部消除；不执行 Verbatim→WinUser 转换
 - `canonicalize_with()` 最终走 `std::fs::canonicalize()`，**所有平台**都由内核解析 symlink 后再处理 `..`
 
 ### AbsolutePath 的 canonicalize 方法
