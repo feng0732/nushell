@@ -10,7 +10,7 @@
 
 所有自定义命令的主体和闭包最终都以 `Block` 的形式存储在引擎状态中。
 
-定义位置：[block.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-protocol/src/ast/block.rs#L5-L14)
+定义位置：[block.rs](crates/nu-protocol/src/ast/block.rs#L5-L14)
 
 ```rust
 pub struct Block {
@@ -29,7 +29,7 @@ pub struct Block {
 
 闭包作为运行时的 `Value`，在求值时产生，与 `Block` 的区别在于它携带了**变量的实际值快照**。
 
-定义位置：[closure.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-protocol/src/engine/closure.rs#L10-L14)
+定义位置：[closure.rs](crates/nu-protocol/src/engine/closure.rs#L10-L14)
 
 ```rust
 pub struct Closure {
@@ -44,7 +44,7 @@ pub struct Closure {
 
 在 AST 表达式层，二者都是 `BlockId`，但语义不同：
 
-定义位置：[expr.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-protocol/src/ast/expr.rs#L31-L32)
+定义位置：[expr.rs](crates/nu-protocol/src/ast/expr.rs#L31-L32)
 
 - `Expr::Block(BlockId)`：普通代码块，如 `if` 的分支、循环体等
 - `Expr::Closure(BlockId)`：闭包字面量，如 `{ |x| $x + 1 }`、`def` 的函数体
@@ -55,7 +55,7 @@ pub struct Closure {
 
 Stack 是变量在运行时的载体。
 
-定义位置：[stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-protocol/src/engine/stack.rs#L38-L67)
+定义位置：[stack.rs](crates/nu-protocol/src/engine/stack.rs#L38-L67)
 
 ```rust
 pub struct Stack {
@@ -66,7 +66,7 @@ pub struct Stack {
 }
 ```
 
-Stack 设计理念：不使用传统的帧式调用栈，而是通过"捕获变量快照"的方式创建新 Stack（见 [stack.rs 注释](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-protocol/src/engine/stack.rs#L21-L36)）。
+Stack 设计理念：不使用传统的帧式调用栈，而是通过"捕获变量快照"的方式创建新 Stack（见 [stack.rs 注释](crates/nu-protocol/src/engine/stack.rs#L21-L36)）。
 
 ---
 
@@ -81,7 +81,7 @@ Stack 设计理念：不使用传统的帧式调用栈，而是通过"捕获变�
 
 ### 2.2 预声明阶段（parse_def_predecl）
 
-实现位置：[parse_def_predecl](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_def.rs#L51-L161)
+实现位置：[parse_def_predecl](crates/nu-parser/src/parse_def.rs#L51-L161)
 
 核心流程：
 1. 识别 `def` / `export def` / `extern` 关键字
@@ -99,11 +99,11 @@ def sam [] { 3 }
 bob
 ```
 
-测试验证：[predecl_check](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/tests/repl/test_custom_commands.rs#L170-L172)
+测试验证：[predecl_check](tests/repl/test_custom_commands.rs#L170-L172)
 
 ### 2.3 完整解析阶段（parse_def_inner）
 
-实现位置：[parse_def_inner](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_def.rs#L402-L651)
+实现位置：[parse_def_inner](crates/nu-parser/src/parse_def.rs#L402-L651)
 
 关键步骤：
 
@@ -115,7 +115,7 @@ bob
 3. **编译函数体 Block**：
 
 ```rust
-// [parse_def.rs#L491-L496](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_def.rs#L491-L496)
+// [parse_def.rs#L491-L496](crates/nu-parser/src/parse_def.rs#L491-L496)
 Some(Expression { expr: Expr::Closure(block_id), .. }) => {
     compile_block_with_id(working_set, *block_id);    // AST → IR
     *working_set.get_block_mut(*block_id).signature = sig.clone();
@@ -125,7 +125,7 @@ Some(Expression { expr: Expr::Closure(block_id), .. }) => {
 4. **将 Block 包装为 Custom Command**：
 
 ```rust
-// [parse_def.rs#L613-L615](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_def.rs#L613-L615)
+// [parse_def.rs#L613-L615](crates/nu-parser/src/parse_def.rs#L613-L615)
 *declaration = signature
     .clone()
     .into_block_command(block_id, attribute_vals, examples);
@@ -136,7 +136,7 @@ Some(Expression { expr: Expr::Closure(block_id), .. }) => {
 5. **设置 redirect_env**：
 
 ```rust
-// [parse_def.rs#L619](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_def.rs#L619)
+// [parse_def.rs#L619](crates/nu-parser/src/parse_def.rs#L619)
 block.redirect_env = has_env;  // def --env 才为 true
 ```
 
@@ -144,19 +144,19 @@ block.redirect_env = has_env;  // def --env 才为 true
 
 这是整个机制最核心的部分。捕获分析在 `parse()` 函数的最后阶段进行。
 
-实现位置：[parse_captures_compile.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L512-L622)
+实现位置：[parse_captures_compile.rs](crates/nu-parser/src/parse_captures_compile.rs#L512-L622)
 
 核心思想：**遍历整个 AST，对每个 Block/Closure，找出它引用了哪些在外部定义的变量**。
 
 #### 2.4.1 算法流程
 
-`discover_captures_in_closure` 函数（[parse_captures_compile.rs#L47-L81](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L47-L81)）：
+`discover_captures_in_closure` 函数（[parse_captures_compile.rs#L47-L81](crates/nu-parser/src/parse_captures_compile.rs#L47-L81)）：
 
 1. 先把 Block 自身签名中定义的所有参数变量加入 `seen` 列表（"已在本作用域定义"）
 2. 遍历 Block 的所有 Pipeline
 3. 递归进入每个 Expression
 
-`discover_captures_in_expr` 函数（[parse_captures_compile.rs#L154-L449](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L154-L449)）处理各种表达式类型：
+`discover_captures_in_expr` 函数（[parse_captures_compile.rs#L154-L449](crates/nu-parser/src/parse_captures_compile.rs#L154-L449)）处理各种表达式类型：
 
 | 表达式类型 | 处理方式 |
 |-----------|---------|
@@ -174,7 +174,7 @@ block.redirect_env = has_env;  // def --env 才为 true
 这是容易被忽略的关键点。当函数体内调用另一个自定义命令时：
 
 ```rust
-// [parse_captures_compile.rs#L229-L280](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L229-L280)
+// [parse_captures_compile.rs#L229-L280](crates/nu-parser/src/parse_captures_compile.rs#L229-L280)
 Expr::Call(call) => {
     let decl = working_set.get_decl(call.decl_id);
     if let Some(block_id) = decl.block_id() {
@@ -191,7 +191,7 @@ Expr::Call(call) => {
 分析完成后，将捕获列表写入每个 Block：
 
 ```rust
-// [parse_captures_compile.rs#L596-L618](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L596-L618)
+// [parse_captures_compile.rs#L596-L618](crates/nu-parser/src/parse_captures_compile.rs#L596-L618)
 for (block_id, captures) in seen_blocks.into_iter() {
     if !captures.is_empty()
         && block_captures_empty
@@ -203,12 +203,12 @@ for (block_id, captures) in seen_blocks.into_iter() {
 }
 ```
 
-注意条件 `block_id.get() >= working_set.permanent_state.num_blocks()`：这是为了**防止递归定义场景下修改已经固化的 Block**（[parse_captures_compile.rs#L603-L611](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L603-L611) 注释中有详细说明）。
+注意条件 `block_id.get() >= working_set.permanent_state.num_blocks()`：这是为了**防止递归定义场景下修改已经固化的 Block**（[parse_captures_compile.rs#L603-L611](crates/nu-parser/src/parse_captures_compile.rs#L603-L611) 注释中有详细说明）。
 
 #### 2.4.4 可变变量捕获限制
 
 ```rust
-// [parse_captures_compile.rs#L186-L192](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L186-L192)
+// [parse_captures_compile.rs#L186-L192](crates/nu-parser/src/parse_captures_compile.rs#L186-L192)
 for (var_id, span) in results.iter() {
     if !seen.contains(var_id)
         && let Some(variable) = working_set.get_variable_if_possible(*var_id)
@@ -229,7 +229,7 @@ for (var_id, span) in results.iter() {
 
 当表达式求值遇到 `Expr::Closure(block_id)` 时：
 
-实现位置：[eval.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/eval.rs#L810-L835)
+实现位置：[eval.rs](crates/nu-engine/src/eval.rs#L810-L835)
 
 ```rust
 fn eval_row_condition_or_closure(...) -> Result<Value, ShellError> {
@@ -253,7 +253,7 @@ fn eval_row_condition_or_closure(...) -> Result<Value, ShellError> {
 
 ### 3.2 Stack::captures_to_stack —— 从闭包值创建执行栈
 
-实现位置：[stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-protocol/src/engine/stack.rs#L331-L357)
+实现位置：[stack.rs](crates/nu-protocol/src/engine/stack.rs#L331-L357)
 
 ```rust
 pub fn captures_to_stack_preserve_out_dest(&self, captures: Vec<(VarId, Value)>) -> Stack {
@@ -271,11 +271,11 @@ pub fn captures_to_stack_preserve_out_dest(&self, captures: Vec<(VarId, Value)>)
 
 ### 3.3 ClosureEval —— 闭包求值封装
 
-实现位置：[closure_eval.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/closure_eval.rs)
+实现位置：[closure_eval.rs](crates/nu-engine/src/closure_eval.rs)
 
 `ClosureEval`（可多次调用）和 `ClosureEvalOnce`（单次调用）是外部命令（如 `each`, `filter`, `map`）调用闭包的标准接口。
 
-以 `ClosureEvalOnce::new` 为例（[closure_eval.rs#L209-L224](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/closure_eval.rs#L209-L224)）：
+以 `ClosureEvalOnce::new` 为例（[closure_eval.rs#L209-L224](crates/nu-engine/src/closure_eval.rs#L209-L224)）：
 
 ```rust
 pub fn new(engine_state: &'a EngineState, stack: &Stack, closure: Closure) -> Self {
@@ -286,7 +286,7 @@ pub fn new(engine_state: &'a EngineState, stack: &Stack, closure: Closure) -> Se
 }
 ```
 
-添加参数（[closure_eval.rs#L280-L284](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/closure_eval.rs#L280-L284)）：
+添加参数（[closure_eval.rs#L280-L284](crates/nu-engine/src/closure_eval.rs#L280-L284)）：
 ```rust
 pub fn add_arg(mut self, value: Value) -> Result<Self, ShellError> {
     self.call_eval.add_positional(&self.block.signature, Cow::Owned(value))?;
@@ -294,7 +294,7 @@ pub fn add_arg(mut self, value: Value) -> Result<Self, ShellError> {
 }
 ```
 
-最终执行（[closure_eval.rs#L298-L304](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/closure_eval.rs#L298-L304)）：
+最终执行（[closure_eval.rs#L298-L304](crates/nu-engine/src/closure_eval.rs#L298-L304)）：
 ```rust
 pub fn run_with_input(mut self, input: PipelineData) -> Result<PipelineData, ShellError> {
     self.call_eval.run(self.engine_state, self.block, input)
@@ -305,9 +305,9 @@ pub fn run_with_input(mut self, input: PipelineData) -> Result<PipelineData, She
 
 `CallEval` 为自定义命令调用和闭包调用提供统一的参数绑定逻辑。
 
-实现位置：[eval.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/eval.rs#L29-L289)
+实现位置：[eval.rs](crates/nu-engine/src/eval.rs#L29-L289)
 
-`finalize_arguments` 方法（[eval.rs#L221-L288](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/eval.rs#L221-L288)）处理：
+`finalize_arguments` 方法（[eval.rs#L221-L288](crates/nu-engine/src/eval.rs#L221-L288)）处理：
 - 必填位置参数缺失报错
 - 可选参数默认值填充
 - rest 参数列表组装
@@ -321,7 +321,7 @@ pub fn run_with_input(mut self, input: PipelineData) -> Result<PipelineData, She
 
 ### 4.1 AST 求值路径（eval_call）
 
-实现位置：[eval_call](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/eval.rs#L292-L366)
+实现位置：[eval_call](crates/nu-engine/src/eval.rs#L292-L366)
 
 ```rust
 pub fn eval_call<D: DebugContext>(
@@ -375,7 +375,7 @@ pub fn eval_call<D: DebugContext>(
 
 ### 4.2 Stack::gather_captures —— 自定义命令专用
 
-实现位置：[stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-protocol/src/engine/stack.rs#L359-L393)
+实现位置：[stack.rs](crates/nu-protocol/src/engine/stack.rs#L359-L393)
 
 ```rust
 pub fn gather_captures(&self, engine_state: &EngineState, captures: &[(VarId, Span)]) -> Stack {
@@ -398,7 +398,7 @@ pub fn gather_captures(&self, engine_state: &EngineState, captures: &[(VarId, Sp
 
 IR 路径中 `Instruction::Call` 最终调用 `eval_call` 函数。
 
-实现位置：[eval_ir.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/eval_ir.rs#L1213-L1312)
+实现位置：[eval_ir.rs](crates/nu-engine/src/eval_ir.rs#L1213-L1312)
 
 ```rust
 fn eval_call<D: DebugContext>(...) -> Result<PipelineData, ShellError> {
@@ -441,11 +441,11 @@ IR 路径与 AST 路径的主要区别：参数不是通过重新求值表达式
 
 | 位置 | 检查时机 |
 |------|---------|
-| [eval.rs:314-322](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/eval.rs#L314-L322) | AST 路径调用前（callee_stack 创建后） |
-| [eval_ir.rs:53-63](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/eval_ir.rs#L53-L63) | IR 路径 eval_ir_block 入口处 |
+| [eval.rs:314-322](crates/nu-engine/src/eval.rs#L314-L322) | AST 路径调用前（callee_stack 创建后） |
+| [eval_ir.rs:53-63](crates/nu-engine/src/eval_ir.rs#L53-L63) | IR 路径 eval_ir_block 入口处 |
 
 ```rust
-// [eval.rs#L314-L322](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/eval.rs#L314-L322)
+// [eval.rs#L314-L322](crates/nu-engine/src/eval.rs#L314-L322)
 let maximum_call_stack_depth: u64 = engine_state.config.recursion_limit as u64;
 callee_stack.recursion_count += 1;
 if callee_stack.recursion_count > maximum_call_stack_depth {
@@ -453,7 +453,7 @@ if callee_stack.recursion_count > maximum_call_stack_depth {
 }
 ```
 
-默认限制为 50。测试验证：[infinite_recursion_does_not_panic](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/tests/repl/test_custom_commands.rs#L223-L228)
+默认限制为 50。测试验证：[infinite_recursion_does_not_panic](tests/repl/test_custom_commands.rs#L223-L228)
 
 ### 5.2 递归与变量捕获
 
@@ -516,14 +516,14 @@ is_even 4
 - `is_even 4` → recursion_count=1 → 调用 `is_odd 3` → recursion_count=2 → ...
 - 两个函数各自的参数 `$n` 在独立的 Stack 中，互不影响
 
-测试验证：[infinite_mutual_recursion_does_not_panic](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/tests/repl/test_custom_commands.rs#L235-L240)
+测试验证：[infinite_mutual_recursion_does_not_panic](tests/repl/test_custom_commands.rs#L235-L240)
 
 ### 5.5 捕获分析中对递归 Block 的保护
 
 在捕获写回阶段有一个关键判断：
 
 ```rust
-// [parse_captures_compile.rs#L612-L618](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L612-L618)
+// [parse_captures_compile.rs#L612-L618](crates/nu-parser/src/parse_captures_compile.rs#L612-L618)
 if !captures.is_empty()
     && block_captures_empty
     && block_id.get() >= working_set.permanent_state.num_blocks()  // 只修改本次 delta 中的 Block
@@ -549,7 +549,7 @@ $x  # 错误：Variable not found
 
 原因：`foo` 的 callee_stack 在调用结束后被丢弃，`$x` 存在于那个栈中，caller_stack 永远看不到。
 
-测试：[no_scope_leak1](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/tests/repl/test_custom_commands.rs#L7-L12)
+测试：[no_scope_leak1](tests/repl/test_custom_commands.rs#L7-L12)
 
 ### 6.2 自定义命令不能隐式访问调用者的变量
 
@@ -561,7 +561,7 @@ bar  # 错误：Variable not found
 
 原因：`foo` 定义在顶层作用域，函数体中引用的 `$x` 在定义时没有对应的外部变量存在，因此 `$x` 被解析为一个与 `bar` 内部 `let $x = 10` 的 VarId 不同的标识符。虽然 `$x` 被加入了 foo 的 captures 列表，但调用时 `gather_captures` 在 caller_stack 中按 VarId 查找，找不到匹配的值（两者的 VarId 不同）。`$x` 对 `foo` 不可见——这就是**词法作用域**的核心：捕获取决于变量定义的位置，而非调用时的栈状态。
 
-测试：[no_scope_leak2](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/tests/repl/test_custom_commands.rs#L14-L20)
+测试：[no_scope_leak2](tests/repl/test_custom_commands.rs#L14-L20)
 
 ### 6.3 显式捕获外部变量（闭包）
 
@@ -573,7 +573,7 @@ foo  # 输出 10
 
 原因：解析 `foo` 时，`discover_captures_in_closure` 发现 `$x` 在函数体中被引用但未在参数中定义 → 加入 captures。运行时 `gather_captures` 从 caller_stack 读取 `$x` 的值并放入 callee_stack。
 
-测试：[simple_var_closing](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/tests/repl/test_custom_commands.rs#L165-L167)
+测试：[simple_var_closing](tests/repl/test_custom_commands.rs#L165-L167)
 
 ### 6.4 参数优先于捕获
 
@@ -585,7 +585,7 @@ bar  # 输出 20，不是 10
 
 原因：`$x` 是 `foo` 的参数，加入 `seen` 列表，不计入 captures。运行时参数绑定覆盖同名外部变量。
 
-测试：[no_scope_leak3](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/tests/repl/test_custom_commands.rs#L23-L28)
+测试：[no_scope_leak3](tests/repl/test_custom_commands.rs#L23-L28)
 
 ---
 
@@ -686,17 +686,17 @@ parse() 末尾: discover_captures_in_closure()
 
 | 模块 | 文件 | 作用 |
 |------|------|------|
-| 解析器 | [parse_def.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_def.rs) | `def` 命令解析 |
-| 解析器 | [parse_captures_compile.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs) | 变量捕获发现算法 |
-| 引擎求值 | [eval.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/eval.rs) | AST 求值、CallEval、eval_call |
-| 引擎求值 | [eval_ir.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/eval_ir.rs) | IR 求值、递归深度检查 |
-| 引擎求值 | [closure_eval.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/closure_eval.rs) | 闭包求值封装 |
-| 引擎编译 | [compile/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/compile/mod.rs) | AST → IR 编译 |
-| 引擎编译 | [compile/call.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/compile/call.rs) | Call 指令编译 |
-| 协议层 AST | [ast/block.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-protocol/src/ast/block.rs) | Block 结构定义 |
-| 协议层 AST | [ast/expr.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-protocol/src/ast/expr.rs) | Expr 枚举（Block/Closure） |
-| 协议层引擎 | [engine/closure.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-protocol/src/engine/closure.rs) | Closure 值结构 |
-| 协议层引擎 | [engine/stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-protocol/src/engine/stack.rs) | Stack 实现（gather_captures、captures_to_stack） |
-| 协议层引擎 | [engine/command.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-protocol/src/engine/command.rs) | Command trait（block_id 方法） |
-| 测试 | [test_custom_commands.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/tests/repl/test_custom_commands.rs) | 自定义命令测试 |
-| 测试 | [test_closures.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/tests/repl/test_closures.rs) | 闭包测试 |
+| 解析器 | [parse_def.rs](crates/nu-parser/src/parse_def.rs) | `def` 命令解析 |
+| 解析器 | [parse_captures_compile.rs](crates/nu-parser/src/parse_captures_compile.rs) | 变量捕获发现算法 |
+| 引擎求值 | [eval.rs](crates/nu-engine/src/eval.rs) | AST 求值、CallEval、eval_call |
+| 引擎求值 | [eval_ir.rs](crates/nu-engine/src/eval_ir.rs) | IR 求值、递归深度检查 |
+| 引擎求值 | [closure_eval.rs](crates/nu-engine/src/closure_eval.rs) | 闭包求值封装 |
+| 引擎编译 | [compile/mod.rs](crates/nu-engine/src/compile/mod.rs) | AST → IR 编译 |
+| 引擎编译 | [compile/call.rs](crates/nu-engine/src/compile/call.rs) | Call 指令编译 |
+| 协议层 AST | [ast/block.rs](crates/nu-protocol/src/ast/block.rs) | Block 结构定义 |
+| 协议层 AST | [ast/expr.rs](crates/nu-protocol/src/ast/expr.rs) | Expr 枚举（Block/Closure） |
+| 协议层引擎 | [engine/closure.rs](crates/nu-protocol/src/engine/closure.rs) | Closure 值结构 |
+| 协议层引擎 | [engine/stack.rs](crates/nu-protocol/src/engine/stack.rs) | Stack 实现（gather_captures、captures_to_stack） |
+| 协议层引擎 | [engine/command.rs](crates/nu-protocol/src/engine/command.rs) | Command trait（block_id 方法） |
+| 测试 | [test_custom_commands.rs](tests/repl/test_custom_commands.rs) | 自定义命令测试 |
+| 测试 | [test_closures.rs](tests/repl/test_closures.rs) | 闭包测试 |
