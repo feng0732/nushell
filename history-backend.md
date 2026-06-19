@@ -6,6 +6,12 @@ Reedline 相关源码文件（nushell/reedline 仓库）：
 - `src/history/file_backed.rs` — `FileBackedHistory`（Plaintext）
 - `src/history/sqlite_backed.rs` — `SqliteBackedHistory`（SQLite）
 - `src/history/base.rs` — `History` trait、`SearchQuery`、`SearchFilter` 等
+- `src/history/cursor.rs` — `HistoryCursor` 导航游标
+- `src/engine.rs` — Reedline 核心引擎、`submit_buffer` 保存逻辑
+- `src/hinter/cwd_aware.rs` — `CwdAwareHinter` 历史提示
+- `src/completion/history.rs` — `HistoryCompleter` 历史菜单补全
+
+---
 
 ## 一、配置结构与默认值
 
@@ -26,6 +32,8 @@ pub struct HistoryConfig {
 - `Plaintext` → 文件 `history.txt`（默认）
 - `Sqlite` → 文件 `history.sqlite3`（需启用 `sqlite` 编译特性）
 
+---
+
 ## 二、后端选择逻辑
 
 ### 2.1 编译时特性门控
@@ -40,17 +48,15 @@ pub struct HistoryConfig {
 历史记录的核心参数是**启动锁定**的。在 [repl.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-cli/src/repl.rs#L305-L309)：
 
 ```rust
-// Lock the startup-only `$env.config.history.*` options
-// (`path`, `max_size`, `file_format`, `isolation`) against further changes.
 engine_state.history_locked_after_startup = true;
 ```
 
-以下字段在启动后不可更改：`path`、`max_size`、`file_format`、`isolation`。
-但 `sync_on_enter` 和 `ignore_space_prefixed` 可以运行时修改。
+启动后不可更改：`path`、`max_size`、`file_format`、`isolation`。
+可运行时修改：`sync_on_enter`、`ignore_space_prefixed`。
 
 ### 2.3 兼容性校验
 
-`isolation`（会话隔离）仅与 SQLite 格式兼容。如果同时设置 `isolation=true` + `file_format=Plaintext`，会发出警告（见 [history.rs L217-L227](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-protocol/src/config/history.rs#L217-L227)）。
+`isolation=true` + `file_format=Plaintext` → 发出警告（Plaintext 不支持隔离）。见 [history.rs L217-L227](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-protocol/src/config/history.rs#L217-L227)。
 
 ### 2.4 后端初始化
 
@@ -66,692 +72,503 @@ let history: Box<dyn reedline::History> = match history.file_format {
         SqliteBackedHistory::with_file(
             history_path,
             history_session_id,     // 会话隔离时为 Some(...)
-            Some(chrono::Utc::now()),
+            Some(chrono::Utc::now()),  // session_timestamp：用于隔离判断
         )?,
     ),
 };
 ```
 
-关键参数：
-- **Plaintext**：传入 `max_size`（文件滚动容量）
-- **SQLite**：传入 `history_session_id`（会话隔离标识）和**当前会话启动时间** `session_timestamp`（用于跨会话合并判断）
+---
 
 ## 三、History trait 统一接口
 
-Reedline 中所有历史后端都实现同一个 `History` trait（`base.rs`），核心方法如下：
+所有历史后端都实现同一个 `History` trait（`base.rs`），核心方法：
 
 | 方法 | 说明 |
 |------|------|
-| `save(&mut self, h: HistoryItem)` | 保存一条历史条目，可能去重 |
-| `load(&self, id: HistoryItemId)` | 按 ID 加载单条 |
-| `search(&self, query: SearchQuery)` | 按查询条件搜索 |
-| `count(&self, query: SearchQuery)` | 统计匹配条数 |
-| `update(&mut self, id, updater)` | 更新已有条目（SQLite 支持，Text 不支持） |
+| `save(&mut self, h: HistoryItem)` | 保存/更新一条历史 |
+| `load(&self, id)` | 按 ID 加载 |
+| `search(&self, query: SearchQuery)` | 按查询搜索 |
+| `count(&self, query)` | 统计匹配数 |
+| `update(&mut self, id, updater)` | 更新已有条目（Text 不支持） |
 | `sync(&mut self)` | 同步内存与磁盘 |
-| `clear()` / `delete()` | 清空 / 删除单条 |
-| `session()` | 返回当前会话 ID |
+| `session()` | 返回当前 session_id |
 
-`HistoryItem` 包含完整元数据：`id`、`start_timestamp`、`command_line`、`session_id`、`hostname`、`cwd`、`duration`、`exit_status`、`more_info`。
+`HistoryItem` 字段：`id`、`start_timestamp`、`command_line`、`session_id`、`hostname`、`cwd`、`duration`、`exit_status`、`more_info`。
 
 ---
 
-## 四、保存流程（写入）详解
+## 四、保存链路：三层过滤 + 两种后端差异
 
-### 4.1 Nushell 上层时序
+保存一条命令的完整链路经过**三层过滤**，按顺序执行。
 
-一次完整的命令执行涉及历史记录写入的完整流程（在 `RunContext` 中，[repl.rs L340-L507](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-cli/src/repl.rs#L340-L507)）：
+### 4.1 保存链路全景
 
 ```
-用户按下 Enter
+用户按 Enter
     │
-    ├─► 判断 history_supports_meta（仅 SQLite 为 true）
-    │       │
-    │       └─► prepare_history_metadata()    ← 阶段①：写入前置元数据
+    ▼
+submit_buffer()  ← 引擎层（Reedline engine.rs）
     │
-    ├─► 执行命令（parse_operation → do_run_cmd → eval_source）
+    ├─► 层级①：history_exclusion_prefix 空格前缀过滤
+    │       ├─► 命中 → 设 FILTERED_ITEM_ID，存入 history_excluded_item（内存）
+    │       └─► 未命中 → 调用 history.save()
     │
-    └─► fill_in_result_related_history_metadata()  ← 阶段②：补全结果元数据
-            │
-            └─► 下一轮循环开始时 sync_history()  ← 阶段③：同步到磁盘
+    ▼
+history.save()  ← 后端层（FileBackedHistory / SqliteBackedHistory）
+    │
+    ├─► 层级②：空命令 / capacity=0 检查
+    │
+    └─► 层级③：连续重复去重（仅 Plaintext）
+            ├─► 命中 → 不保存，返回 id=None
+            └─► 未命中 → 真正写入
 ```
 
-**阶段①：前置元数据写入（SQLite 专属）**
+---
 
-[prepare_history_metadata](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-cli/src/repl.rs#L853-L875) 在命令执行前调用：
+### 4.2 层级①：引擎层 — 空格前缀过滤
+
+`Reedline.submit_buffer()`（`engine.rs` L2265）是保存的入口：
 
 ```rust
-line_editor.update_last_command_context(&|mut c| {
-    c.start_timestamp = Some(chrono::Utc::now());  // 开始时间
-    c.hostname = hostname.map(str::to_string);      // 主机名
-    c.cwd = engine_state.cwd(None)...;              // 工作目录
-    c
-});
-```
+fn submit_buffer(&mut self, prompt: &dyn Prompt) -> io::Result<EventStatus> {
+    let buffer = self.editor.get_buffer().to_string();
+    if !buffer.is_empty() {
+        let mut entry = HistoryItem::from_command_line(&buffer);
+        entry.session_id = self.get_history_session_id();  // 先设置 session_id
 
-**阶段②：结果元数据补全（SQLite 专属）**
-
-[fill_in_result_related_history_metadata](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-cli/src/repl.rs#L880-L899) 在命令执行后调用：
-
-```rust
-line_editor.update_last_command_context(&|mut c| {
-    c.duration = Some(cmd_duration);                              // 执行耗时
-    c.exit_status = stack.get_env_var("LAST_EXIT_CODE")...;      // 退出码
-    c
-});
-```
-
-**阶段③：同步到磁盘（sync_on_enter）**
-
-在每次 REPL 循环开始时（读取用户输入前），如果 `sync_on_enter=true`，会调用 [sync_history](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-cli/src/repl.rs#L692-L705)：
-
-```rust
-if history.sync_on_enter {
-    line_editor.sync_history();  // 将内存中的历史条目刷入磁盘文件
+        if self.history_exclusion_prefix
+            .as_ref()
+            .map(|prefix| buffer.starts_with(prefix))
+            .unwrap_or(false)
+        {
+            // ★ 被排除的命令：不写入历史，只存在内存中
+            entry.id = Some(Self::FILTERED_ITEM_ID);  // i64::MAX
+            self.history_last_run_id = entry.id;
+            self.history_excluded_item = Some(entry);
+        } else {
+            // 正常保存到历史后端
+            entry = self.history.save(entry).expect("todo: error handling");
+            self.history_last_run_id = entry.id;
+            self.history_excluded_item = None;
+        }
+    }
+    // ...
 }
 ```
 
+**关键事实**：
+- `session_id` 在保存**之前**就被设置到 `entry` 上，由引擎层保证，不是后端自己加的
+- 被排除的命令仍然有完整的 `HistoryItem` 结构，只是 `id = FILTERED_ITEM_ID`（`i64::MAX`）
+- `history_excluded_item` 存在于 Reedline 实例内存中，不持久化
+
 ---
 
-### 4.2 Plaintext 后端保存（FileBackedHistory::save）
+### 4.3 被排除命令的元数据更新
 
-Reedline 源码 `file_backed.rs` 中的 `save` 方法：
+`update_last_command_context()`（`engine.rs` L748）也分两条路径：
+
+```rust
+pub fn update_last_command_context(
+    &mut self,
+    f: &dyn Fn(HistoryItem) -> HistoryItem,
+) -> crate::Result<()> {
+    match &self.history_last_run_id {
+        Some(Self::FILTERED_ITEM_ID) => {
+            // 被排除的命令：更新内存中的副本
+            self.history_excluded_item = Some(f(self.history_excluded_item.take().unwrap()));
+            Ok(())
+        }
+        Some(r) => self.history.update(*r, f),  // 正常命令：通过后端 update()
+        None => Err("No command run".into()),
+    }
+}
+```
+
+**含义**：即使命令因空格前缀被排除，Nushell 仍然可以通过 `update_last_command_context` 为其补全元数据（duration、exit_status 等），但这些元数据只存在内存中，不会写入历史文件/数据库。
+
+`has_last_command_context()` 判断 `history_last_run_id.is_some()` —— 被排除的命令也返回 `true`，因为 `FILTERED_ITEM_ID` 也是 `Some`。
+
+---
+
+### 4.4 层级②③：后端层 — Plaintext 的保存与去重
+
+`FileBackedHistory::save()`（`file_backed.rs`）：
 
 ```rust
 fn save(&mut self, h: HistoryItem) -> Result<HistoryItem> {
     let entry = h.command_line;
-    // Don't append if the preceding value is identical or the string empty
     let entry_id =
-        if (self.entries.back() != Some(&entry))   // ← 关键：与最后一条比较，相同则跳过
-            && !entry.is_empty()
-            && self.capacity > 0
+        if (self.entries.back() != Some(&entry))   // 层级③：连续重复去重
+            && !entry.is_empty()                    // 层级②：空命令不存
+            && self.capacity > 0                    // 层级②：容量为0不存
         {
             if self.entries.len() == self.capacity {
-                // History is "full", so we delete the oldest entry first
-                self.entries.pop_front();
+                self.entries.pop_front();  // 容量滚动
                 self.len_on_disk = self.len_on_disk.saturating_sub(1);
             }
             self.entries.push_back(entry.to_string());
             Some(HistoryItemId::new((self.entries.len() - 1) as i64))
         } else {
-            None  // 重复或空，不保存
+            None  // 重复或空，返回 id=None
         };
     Ok(FileBackedHistory::construct_entry(entry_id, entry))
 }
 ```
 
-**Plaintext 保存规则总结**：
-
-1. **连续重复去重**：`self.entries.back() != Some(&entry)` — 与内存中最后一条相同则跳过（不会保存）
-2. **空命令不存**：`!entry.is_empty()`
-3. **容量为 0 不存**：`self.capacity > 0`
-4. **容量滚动**：超出 `capacity` 时 `pop_front()` 丢弃最旧条目
-5. **仅保存命令文本**：通过 `construct_entry` 构造，所有元数据字段（时间、主机、CWD、duration、exit_status、session_id）全部设为 `None`
-
-数据结构：`entries: VecDeque<String>` — 仅存命令行字符串的双端队列。
+**Plaintext 保存规则**：
+1. 空命令不存
+2. capacity=0 不存
+3. 与最后一条相同则不存（连续去重）
+4. 超出容量丢弃最旧的
+5. 仅存 `command_line`，元数据全部为 `None`
+6. 返回值 `id=None` 表示没保存，`id=Some` 表示保存成功
 
 ---
 
-### 4.3 SQLite 后端保存（SqliteBackedHistory::save）
+### 4.5 层级②：后端层 — SQLite 的保存（无内置去重）
 
-Reedline 源码 `sqlite_backed.rs` 中的 `save` 方法使用 **UPSERT**（INSERT ... ON CONFLICT DO UPDATE）：
+`SqliteBackedHistory::save()`（`sqlite_backed.rs`）使用 UPSERT：
+
+```sql
+INSERT INTO history
+  (id, start_timestamp, command_line, session_id, hostname, cwd,
+   duration_ms, exit_status, more_info)
+VALUES (:id, :start_timestamp, :command_line, :session_id, :hostname,
+        :cwd, :duration_ms, :exit_status, :more_info)
+ON CONFLICT (history.id) DO UPDATE SET
+  start_timestamp = excluded.start_timestamp,
+  command_line    = excluded.command_line,
+  ... -- 所有字段全部覆盖
+RETURNING id
+```
+
+**SQLite 保存规则**：
+- `id=None` → INSERT 新条目，自增 id
+- `id=Some` → UPDATE 覆盖所有字段（UPSERT）
+- **无内置去重**：相同命令会重复写入，去重完全靠上层
+- **完整元数据**：9 个字段全部持久化
+
+---
+
+### 4.6 去重规则汇总
+
+| 层级 | 位置 | 规则 | 适用后端 |
+|------|------|------|----------|
+| ① 空格前缀 | `submit_buffer()` (engine.rs) | 以 `history_exclusion_prefix` 开头的命令整个跳过 save | 全部 |
+| ② 空命令 / 零容量 | `History::save()` | 空字符串或 capacity=0 不存 | 全部 |
+| ③ 连续重复 | `FileBackedHistory::save()` | 与内存中最后一条相同则跳过 | **仅 Plaintext** |
+| ④ 导航去重 | `HistoryCursor` (cursor.rs) | `skip_dupes=true` 跳过与当前命令行相同的条目 | 全部（仅影响导航展示） |
+| ⑤ 补全去重 | `HistoryCompleter` | `HashSet` 去重相同命令行 | 全部（仅影响菜单展示） |
+
+> **重要差异**：SQLite 后端的 `save()` 不做任何去重。连续执行相同命令会在数据库中产生多条记录。但**历史导航**（上/下箭头）通过 `HistoryCursor.skip_dupes` 自动跳过重复，**历史菜单补全**通过 `HashSet` 去重。所以用户感知上似乎去重了，但数据库里实际有重复条目。
+
+---
+
+## 五、会话编号（session_id）对各功能的影响
+
+`isolation=true` 时，每个 Nu 会话生成唯一的 `history_session_id`。这个 ID 如何影响不同的历史消费方式？
+
+### 5.1 session_id 的设置与传递
+
+1. **生成**：`Reedline::create_history_session_id()` → 基于当前时间纳秒的 `i64`
+2. **存入引擎**：`with_history_session_id(session)` → `self.history_session_id = session`
+3. **保存时设置**：`submit_buffer()` 中 `entry.session_id = self.get_history_session_id()`
+4. **导航时使用**：`HistoryCursor::new(query, self.get_history_session_id())`
+
+---
+
+### 5.2 历史导航（上/下箭头、前缀搜索）：✅ 受隔离影响
+
+`HistoryCursor`（`cursor.rs`）是历史导航的核心状态机：
 
 ```rust
-fn save(&mut self, mut entry: HistoryItem) -> Result<HistoryItem> {
-    let ret: i64 = self
-        .db
-        .prepare(
-            "insert into history
-            (id, start_timestamp, command_line, session_id, hostname, cwd,
-             duration_ms, exit_status, more_info)
-            values (:id, :start_timestamp, :command_line, :session_id, :hostname,
-                    :cwd, :duration_ms, :exit_status, :more_info)
-            on conflict (history.id) do update set
-                start_timestamp = excluded.start_timestamp,
-                command_line    = excluded.command_line,
-                session_id      = excluded.session_id,
-                hostname        = excluded.hostname,
-                cwd             = excluded.cwd,
-                duration_ms     = excluded.duration_ms,
-                exit_status     = excluded.exit_status,
-                more_info       = excluded.more_info
-            returning id",
-        )?
-        .query_row(
-            named_params! {
-                ":id": entry.id.map(|id| id.0),
-                ":start_timestamp": entry.start_timestamp.map(|e| e.timestamp_millis()),
-                ":command_line": entry.command_line,
-                ":session_id": entry.session_id.map(|e| e.0),
-                ":hostname": entry.hostname,
-                ":cwd": entry.cwd,
-                ":duration_ms": entry.duration.map(|e| e.as_millis() as i64),
-                ":exit_status": entry.exit_status,
-                ":more_info": entry.more_info.as_ref()
-                    .map(|e| serde_json::to_string(e).unwrap())
-            },
-            |row| row.get(0),
-        )?;
-    entry.id = Some(HistoryItemId::new(ret));
-    Ok(entry)
+pub struct HistoryCursor {
+    query: HistoryNavigationQuery,  // Normal | PrefixSearch | SubstringSearch
+    current: Option<HistoryItem>,   // 当前指向的条目
+    skip_dupes: bool,               // 是否跳过重复（默认 true）
+    session: Option<HistorySessionId>,  // ★ 会话过滤
 }
 ```
 
-**SQLite 保存规则总结**：
-
-1. **无内置去重**：与 FileBackedHistory 不同，`save` 方法本身**不检查**命令是否与上一条重复。重复检查由上层（Reedline 引擎或 Nushell `ignore_space_prefixed`）负责
-2. **UPSERT 语义**：
-   - 若 `entry.id = None`（新条目）：执行 `INSERT`，自动生成自增 `id`
-   - 若 `entry.id = Some(...)`（已有条目）：执行 `UPDATE`，覆盖所有字段
-3. **两阶段写入利用 UPSERT**：Nushell 的 `prepare_history_metadata` 先 `INSERT`（id=None）得到 id，然后 `fill_in_result_related_history_metadata` 通过 `update` 方法（内部 load+save）用**相同 id** 补全剩余字段
-4. **完整元数据存储**：时间戳、session_id、hostname、cwd、duration_ms、exit_status、more_info(JSON) 全部持久化
-
-数据库表结构（`sqlite_backed.rs` 的 `from_connection` 中创建）：
-
-```sql
-create table if not exists history (
-    id            integer primary key autoincrement,
-    command_line  text not null,
-    start_timestamp integer,
-    session_id    integer,
-    hostname      text,
-    cwd           text,
-    duration_ms   integer,
-    exit_status   integer,
-    more_info     text
-) strict;
-```
-
-索引：`idx_history_time`、`idx_history_cwd`、`idx_history_exit_status`、`idx_history_cmd`、`idx_history_cmd`(session_id)。
-
-性能优化 PRAGMA：`journal_mode=wal`、`synchronous=normal`、`mmap_size=1000000000`、`foreign_keys=on`。
-
----
-
-## 五、重复命令处理规则（完整）
-
-重复命令过滤发生在**三个层级**，按顺序依次生效：
-
-### 层级 1：Nushell 配置 `ignore_space_prefixed`
-
-由 `HistoryConfig.ignore_space_prefixed`（默认 `true`）控制。在两处生效：
-
-1. **初始化时**：[update_line_editor_history](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-cli/src/repl.rs#L1374)
-2. **每轮循环时**：[loop_iteration](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-cli/src/repl.rs#L695-L696)
+每次 `back()` / `forward()` 调用时：
 
 ```rust
-line_editor = line_editor
-    .with_history_exclusion_prefix(
-        history.ignore_space_prefixed.then_some(" ".into())
-    );
-```
+fn navigate_in_direction(&mut self, history: &dyn History, direction: SearchDirection) -> Result<()> {
+    // ...
+    let next = history.search(SearchQuery {
+        start_id: self.current.as_ref().and_then(|e| e.id),
+        direction,
+        limit: Some(1),
+        filter: self.get_search_filter(),  // ★ 包含 session 过滤
+    })?;
+    // ...
+}
 
-效果：**以空格开头的命令**（如 ` secret_command`）在 Reedline 引擎层面就被排除，根本不会调用 `History::save()`。
-
-### 层级 2：Reedline 引擎内部
-
-Reedline 核心引擎在调用 `History::save()` 之前还会进行检查（如 `HISTORY_IGNORE` 模式匹配、是否已存在等）。
-
-### 层级 3：后端 `save()` 方法内部
-
-| 后端 | 去重行为 | 代码位置 |
-|------|----------|----------|
-| **Plaintext** (`FileBackedHistory`) | `self.entries.back() != Some(&entry)`：**连续相同**则不重复保存 | `file_backed.rs` 的 `save()` |
-| **SQLite** (`SqliteBackedHistory`) | **无内置去重**，相同命令会重复写入（除非上层已过滤） | `sqlite_backed.rs` 的 `save()` |
-
-**重要差异**：Plaintext 后端会在 `save()` 内对连续重复命令进行静默去重；而 SQLite 后端完全依赖上层过滤，`save()` 本身不做任何去重判断。
-
----
-
-## 六、读取与搜索流程详解
-
-### 6.1 查询构造（SearchQuery / SearchFilter）
-
-所有搜索都通过 `SearchQuery` 结构体（`base.rs`），它包含：
-
-- `direction`：`Forward`（从旧到新）或 `Backward`（从新到旧，默认）
-- `start_time` / `end_time`：时间范围过滤
-- `start_id` / `end_id`：ID 范围过滤
-- `limit`：结果条数限制
-- `filter`：`SearchFilter`，含 `command_line`(前缀/子串/精确)、`hostname`、`cwd_exact`、`cwd_prefix`、`exit_successful`、`session`
-
-常用查询构造函数：
-- `SearchQuery::everything(direction, session)` — 全量
-- `SearchQuery::all_that_contain_rev(contains)` — 反向子串搜索
-- `SearchQuery::last_with_prefix(prefix, session)` — 最近前缀匹配
-
----
-
-### 6.2 Plaintext 后端搜索（FileBackedHistory::search）
-
-Reedline `file_backed.rs`：
-
-```rust
-fn search(&self, query: SearchQuery) -> Result<Vec<HistoryItem>> {
-    // 1. 不支持的过滤直接报错
-    if query.start_time.is_some() || query.end_time.is_some() {
-        return Err(HistoryFeatureUnsupported { feature: "filtering by time" });
-    }
-    if query.filter.hostname.is_some() || query.filter.cwd_exact.is_some()
-        || query.filter.cwd_prefix.is_some() || query.filter.exit_successful.is_some()
-    {
-        return Err(HistoryFeatureUnsupported { feature: "filtering by extra info" });
-    }
-
-    // 2. 计算 ID 范围（min_id, max_id）
-    let (min_id, max_id) = { /* 根据 direction 交换 start_id/end_id */ };
-
-    // 3. 迭代 entries，应用过滤器
-    let filter = |(idx, cmd): (usize, &String)| {
-        // 命令行匹配：Prefix / Substring / Exact
-        if !match &query.filter.command_line {
-            Some(CommandLineSearch::Prefix(p)) => cmd.starts_with(p),
-            Some(CommandLineSearch::Substring(p)) => cmd.contains(p),
-            Some(CommandLineSearch::Exact(p)) => cmd == p,
-            None => true,
-        } { return None; }
-        // 排除当前命令（not_command_line，用于上箭头导航时避免重复）
-        if let Some(str) = &query.filter.not_command_line {
-            if cmd == str { return None; }
+fn get_search_filter(&self) -> SearchFilter {
+    let filter = match self.query.clone() {
+        HistoryNavigationQuery::Normal(_) => SearchFilter::anything(self.session),
+        HistoryNavigationQuery::PrefixSearch(prefix) => {
+            SearchFilter::from_text_search(CommandLineSearch::Prefix(prefix), self.session)
         }
-        Some(FileBackedHistory::construct_entry(
-            Some(HistoryItemId::new(idx as i64)),
-            cmd.to_string(),
-        ))
+        HistoryNavigationQuery::SubstringSearch(substring) => {
+            SearchFilter::from_text_search(CommandLineSearch::Substring(substring), self.session)
+        }
     };
+    // skip_dupes 处理 ...
+    filter
+}
+```
 
-    // 4. 根据方向 forward/rev 收集结果
-    let iter = self.entries.iter().enumerate()
-        .skip(min_id as usize).take(intrinsic_limit as usize);
-    if let SearchDirection::Backward = query.direction {
-        Ok(iter.rev().filter_map(filter).take(limit).collect())
-    } else {
-        Ok(iter.filter_map(filter).take(limit).collect())
+**三种导航模式**：
+- `Normal`：空 buffer 或光标不在末尾 → bash 风格逐条遍历
+- `PrefixSearch`：非空 buffer 且光标在末尾 → fish 风格前缀搜索
+- `SubstringSearch`：Ctrl+R 反向搜索模式
+
+**所有模式都传入 session**，所以：
+- `isolation=true` → 只能看到自己写入的 + 会话启动前的历史
+- `isolation=false` → `session=None`，看到全部历史
+
+---
+
+### 5.3 历史提示（Hinter）：✅ 受隔离影响
+
+Nushell 默认使用 `CwdAwareHinter`（`cwd_aware.rs`）：
+
+```rust
+fn handle(&mut self, line: &str, _pos: usize, history: &dyn History,
+          use_ansi_coloring: bool, cwd: &str) -> String {
+    let with_cwd = history
+        .search(SearchQuery::last_with_prefix_and_cwd(
+            line.to_string(),
+            cwd.to_string(),
+            history.session(),  // ★ 传入当前 session
+        ))
+        .or_else(|err| {
+            // Plaintext 不支持 cwd 过滤，回退到纯前缀
+            history.search(SearchQuery::last_with_prefix(
+                line.to_string(),
+                history.session(),  // ★ 仍然传入 session
+            ))
+        })
+        .unwrap_or_default();
+    // ... 取第一条的后半部分作为提示
+}
+```
+
+**两级回退**：
+1. 优先：带 CWD + session 的前缀匹配（SQLite 才支持）
+2. 回退：仅前缀 + session（Plaintext / SQLite 都支持）
+
+**两种都传入 session**，所以 hinter 受会话隔离影响。
+
+---
+
+### 5.4 历史菜单（HistoryMenu）：❌ 不受隔离影响
+
+默认 `history_menu` 使用 `ReedlineMenu::HistoryMenu`（当没有配置 `source` 时），内部使用 `HistoryCompleter`（`completion/history.rs`）：
+
+```rust
+fn search_unique(completer: &HistoryCompleter, line: &str) -> Result<impl Iterator<Item = HistoryItem>> {
+    let values = completer.0.search(SearchQuery::all_that_contain_rev(
+        parsed.remainder.to_string(),
+    ))?;
+    // HashSet 去重 ...
+}
+```
+
+**关键**：`SearchQuery::all_that_contain_rev(contains)` 的签名只有一个参数！内部实现：
+
+```rust
+pub fn all_that_contain_rev(contains: String) -> SearchQuery {
+    SearchQuery {
+        direction: SearchDirection::Backward,
+        // ...
+        filter: SearchFilter::from_text_search(CommandLineSearch::Substring(contains), None),
+        //                                                                         ↑
+        //                                                               session = None！
     }
 }
 ```
 
-**Plaintext 搜索能力限制**：
-- ✅ 支持：ID 范围、命令行前缀/子串/精确匹配、方向、limit、not_command_line
-- ❌ 不支持：时间范围、hostname、cwd（精确/前缀）、exit_status 成功过滤（这些字段根本没有存储）
+**历史菜单的 session 是 `None`**，意味着：
+- 即使 `isolation=true`，历史菜单（Ctrl+R 调出的列表）也能看到**所有会话**的历史
+- 这是一个有意的设计或已知的不一致
 
 ---
 
-### 6.3 SQLite 后端搜索（SqliteBackedHistory::search + construct_query）
+### 5.5 `history` 命令：❌ 不受隔离影响
 
-Reedline `sqlite_backed.rs` 的 `construct_query` 方法将 `SearchQuery` 动态翻译成 SQL，这是理解**会话过滤**和**跨会话合并**的关键：
+[history_.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-cli/src/commands/history/history_.rs) 中的实现：
 
-```rust
-fn construct_query<'a>(
-    &self,
-    query: &'a SearchQuery,
-    select_expression: &str,   // "*" 或 "coalesce(count(*), 0)"
-) -> (String, BoxedNamedParams<'a>)
-```
-
-以下逐步拆解 SQL 构造逻辑：
-
-**步骤 1：方向与排序**
-
-```rust
-let (is_asc, asc) = match query.direction {
-    SearchDirection::Forward  => (true, "asc"),
-    SearchDirection::Backward => (false, "desc"),
-};
-// ORDER BY id {asc}
-```
-
-**步骤 2：时间/ID 范围**
-
-```rust
-// start_time: Forward → "start_timestamp > :start_time"
-//             Backward → "start_timestamp < :start_time"
-// 类似处理 end_time、start_id、end_id
-```
-
-**步骤 3：命令行匹配**
-
-```rust
-match command_line {
-    CommandLineSearch::Exact(e)   => "command_line == :command_line"
-    CommandLineSearch::Prefix(prefix) => "instr(command_line, :command_line) == 1"
-    CommandLineSearch::Substring(cont) => "instr(command_line, :command_line) >= 1"
-}
-```
-
-**步骤 4：hostname / CWD / exit_status**
-
-```rust
-hostname: "hostname = :hostname"
-cwd_exact: "cwd = :cwd"
-cwd_prefix: "cwd like :cwd_like"   -- 如 "/home/me%"
-exit_successful: "exit_status = 0" 或 "exit_status != 0"
-```
-
-**步骤 5（核心）：会话过滤与跨会话合并**
-
-```rust
-if let (Some(session_id), Some(session_timestamp)) =
-    (query.filter.session, self.session_timestamp)
-{
-    // ★ 关键条件 ★
-    wheres.push("(session_id = :session_id OR start_timestamp < :session_timestamp)");
-    params.push((":session_id", Box::new(session_id)));
-    params.push((":session_timestamp",
-                 Box::new(session_timestamp.timestamp_millis())));
-}
-```
-
-这是整个历史系统最精妙的设计。完整 SQL 形如：
-
-```sql
-SELECT * FROM history
-WHERE (
-    -- 其他条件 AND
-    (session_id = :session_id OR start_timestamp < :session_timestamp)
-)
-ORDER BY id desc
-LIMIT :limit
-```
-
-**条件含义**：返回的历史条目满足以下**任一**条件：
-1. `session_id = :session_id` — **当前会话自己写入**的条目
-2. `start_timestamp < :session_timestamp` — **在当前会话启动之前**写入的条目（来自其他会话或历史会话）
-
-**最终效果**：
-- `isolation=false`（`session=None`）：`if let` 分支不执行，**无条件返回所有历史** → 完全跨会话共享
-- `isolation=true`（`session=Some(id)`）：只看自己写入的 + 自己启动前的历史 → **启动后其他新会话写入的条目不可见**，实现"软隔离"
-
-这解释了为什么 `SqliteBackedHistory::with_file` 需要同时接收 `session_id` **和** `session_timestamp` 两个参数。
-
----
-
-### 6.4 Nushell `history` 命令中的查询
-
-[history_.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-cli/src/commands/history/history_.rs) 中的 `run` 函数：
-
-**Plaintext**：
+**Plaintext 格式**：
 ```rust
 FileBackedHistory::with_file(history.max_size as usize, history_path)?
     .search(SearchQuery::everything(SearchDirection::Forward, None))
+//                                                              ↑
+//                                                       session = None
 ```
-调用 `SearchQuery::everything(Forward, None)` — `session=None`，无隔离，返回全部。
 
-**SQLite**：
+**SQLite 格式**：
 ```rust
-nu_command::SQLiteQueryBuilder::new(history_path, "history", signals)
-    .with_select("start_timestamp, command_line as command, cwd,
-                  duration_ms as duration, exit_status")
+SQLiteQueryBuilder::new(history_path, "history", signals)
+    .with_select("...")
     .with_order_by("rowid ASC")
 ```
-`SQLiteQueryBuilder` 直接裸查 `history` 表，**绕过** Reedline 的 `History::search()`，因此不受会话过滤条件约束 —— 这意味着 `history` 命令始终可以看到完整历史，不受 isolation 影响。
+直接裸查 `history` 表，**完全绕过** History trait 的 `search()` 方法，也就不受 session 过滤条件约束。
 
 ---
 
-## 七、同步到磁盘（sync）与跨会话共享
+### 5.6 各功能受隔离影响汇总
 
-### 7.1 Plaintext 后端同步（FileBackedHistory::sync）
+| 功能 | 受 isolation 影响？ | 查询函数 | session 参数 |
+|------|---------------------|----------|--------------|
+| 上/下箭头导航 | ✅ 是 | `SearchFilter::anything(session)` | `self.get_history_session_id()` |
+| 前缀搜索（fish 风格） | ✅ 是 | `SearchFilter::from_text_search(Prefix, session)` | 同上 |
+| Ctrl+R 反向搜索 | ✅ 是 | `SearchFilter::from_text_search(Substring, session)` | 同上 |
+| Hinter 提示（CwdAwareHinter） | ✅ 是 | `last_with_prefix_and_cwd(prefix, cwd, session)` / `last_with_prefix(prefix, session)` | `history.session()` |
+| 历史菜单（HistoryMenu） | ❌ 否 | `all_that_contain_rev(contains)` | **`None`** |
+| `history` 命令（Plaintext） | ❌ 否 | `everything(Forward, None)` | `None` |
+| `history` 命令（SQLite） | ❌ 否 | SQLiteQueryBuilder 直接查表 | 绕过 History trait |
 
-这是 Plaintext 实现跨会话共享的核心。Reedline `file_backed.rs`：
-
-```rust
-fn sync(&mut self) -> std::io::Result<()> {
-    if let Some(fname) = &self.file {
-        // 1. 计算尚未写入磁盘的内存条目
-        let own_entries = self.entries.range(self.len_on_disk..);
-
-        // 2. ★ 文件锁 ★ — 防止多进程并发写冲突
-        let mut f_lock = fd_lock::RwLock::new(
-            OpenOptions::new()
-                .create(true).write(true).read(true).truncate(false)
-                .open(fname)?,
-        );
-        let mut writer_guard = f_lock.write()?;
-
-        // 3. 读取磁盘上已有的全部条目（可能来自其他会话）
-        let (mut foreign_entries, truncate) = {
-            let reader = BufReader::new(writer_guard.deref());
-            let mut from_file: VecDeque<_> = reader.lines()
-                .map(|o| o.map(|i| decode_entry(&i)))
-                .collect::<std::io::Result<VecDeque<_>>>()?;
-            // 容量检查：总条目 > capacity 则截断旧的
-            if from_file.len() + own_entries.len() > self.capacity {
-                (from_file.split_off(
-                    from_file.len() - (self.capacity.saturating_sub(own_entries.len())),
-                ), true)
-            } else {
-                (from_file, false)
-            }
-        };
-
-        // 4. 写入
-        let mut writer = BufWriter::new(writer_guard.deref_mut());
-        if truncate {
-            // 需要截断：从头覆写
-            writer.rewind()?;
-            for line in &foreign_entries {
-                writer.write_all(encode_entry(line).as_bytes())?;
-                writer.write_all("\n".as_bytes())?;
-            }
-        } else {
-            // 无需截断：追加到末尾
-            writer.seek(SeekFrom::End(0))?;
-        }
-        for line in own_entries {
-            writer.write_all(encode_entry(line).as_bytes())?;
-            writer.write_all("\n".as_bytes())?;
-        }
-        writer.flush()?;
-
-        if truncate {
-            // 截断到当前写入位置
-            let file = writer_guard.deref_mut();
-            let file_len = file.stream_position()?;
-            file.set_len(file_len)?;
-        }
-
-        // 5. 合并到内存：foreign_entries（磁盘的） + own_entries（本会话新的）
-        let own_entries = self.entries.drain(self.len_on_disk..);
-        foreign_entries.extend(own_entries);
-        self.entries = foreign_entries;
-        self.len_on_disk = self.entries.len();
-    }
-}
-```
-
-**Plaintext sync 关键点**：
-
-| 步骤 | 作用 |
-|------|------|
-| **fd_lock::RwLock 写锁** | 多进程安全，防止两个 Nu 同时写乱文件 |
-| **先读后写** | 读取磁盘完整内容（含其他会话新增）再合并 |
-| **foreign_entries** | 磁盘上的已有条目（含其他会话写入的） |
-| **own_entries** | 本会话新增未刷盘的条目（`entries.range(len_on_disk..)`） |
-| **容量滚动** | `from_file + own_entries > capacity` 时丢弃最旧条目 |
-| **`self.entries = foreign_entries`** | sync 后内存包含磁盘的全部内容（跨会话合并完成） |
-| **`len_on_disk = entries.len()`** | 标记全量已同步 |
-
-**跨会话合并流程**（Plaintext）：
-```
-会话 A 写入 "ls" → entries = ["cd /", "ls"], len_on_disk=1
-    ↓ sync()
-    加锁 → 读文件得 ["cd /", "pwd"] (会话 B 追加了 "pwd")
-         → 合并 foreign_entries=["cd /", "pwd"] + own_entries=["ls"]
-         → 容量 OK，追加 "ls" 到文件
-         → entries = ["cd /", "pwd", "ls"], len_on_disk=3
-    解锁
-结果：会话 A 现在能看到会话 B 写入的 "pwd"
-```
-
-编码规则：多行命令中的 `\n` 在文件中转义为 `<\n>`（`encode_entry` / `decode_entry`）。
+> **结论**：只有「交互导航」（上箭头、前缀搜索、反向搜索、提示）受会话隔离影响。`history` 命令和历史菜单始终能看到完整历史。
 
 ---
 
-### 7.2 SQLite 后端同步（SqliteBackedHistory::sync）
+## 六、搜索查询与会话过滤机制
 
-Reedline `sqlite_backed.rs`：
+### 6.1 SearchFilter::anything(session) 的 SQL 展开
 
-```rust
-fn sync(&mut self) -> std::io::Result<()> {
-    // no-op (todo?)
-    Ok(())
-}
-```
-
-**SQLite 的 sync 是空操作**。为什么？因为：
-1. SQLite 本身使用 **WAL（Write-Ahead Logging）模式**（`journal_mode=wal`），写入已立即持久化
-2. 多进程通过 SQLite 内置的**文件锁机制**并发访问同一 DB 文件，不需要应用层加锁
-3. 每次 `search()` 查询都直接读取最新 DB 内容，天然包含其他会话已写入的条目
-
-**跨会话合并流程**（SQLite）：
-```
-会话 A 执行 "ls"
-    ↓ save() 立即 INSERT 到 DB（无需等 sync）
-会话 B 执行 history 命令或按上箭头
-    ↓ search() → SELECT * FROM history WHERE ...
-    直接看到会话 A 刚写入的 "ls"（无需 sync 拉取）
-```
-
-SQLite 的跨会话共享是**实时**的，不需要 `sync()` 做显式合并。
-
----
-
-## 八、会话隔离（isolation）完整机制
-
-### 8.1 隔离开启时的初始化流程
-
-当 `isolation=true`（仅 SQLite 可用）时，在 [setup_history](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-cli/src/repl.rs#L1280-L1284) 中：
-
-```rust
-let history_session_id = if history.isolation {
-    Reedline::create_history_session_id()  // 生成唯一会话 ID（i64）
-} else {
-    None
-};
-```
-
-生成的 `session_id` 会：
-1. 存入 `engine_state.history_session_id`
-2. 作为参数传入 `SqliteBackedHistory::with_file(file, session_id, Some(now))`
-   - `now` 即 `session_timestamp`，用于查询条件
-3. 通过 `history session` 命令查询
-
-### 8.2 隔离如何在查询中生效
-
-如 6.3 节所述，SQL 查询会自动附加：
+在 SQLite 后端的 `construct_query` 中，当 `session` 和 `session_timestamp` 都存在时，会附加：
 
 ```sql
 (session_id = :session_id OR start_timestamp < :session_timestamp)
 ```
 
-每个会话 `save()` 时，`HistoryItem` 上会带上自己的 `session_id`。因此：
+完整语义：
+- `session_id = :session_id` — 当前会话自己写入的
+- `start_timestamp < :session_timestamp` — 在本会话启动之前就存在的（来自其他会话的旧历史）
 
-| 场景 | `isolation=false` | `isolation=true` |
-|------|-------------------|------------------|
-| 看自己写入的 | ✅ | ✅ |
-| 看会话启动前的旧历史 | ✅ | ✅ |
-| 看**其他会话在本会话启动后**新写入的 | ✅ | ❌ |
-
-这是一种"**写时共享旧历史，之后互不干扰**"的软隔离模型。
-
-`FileBackedHistory` 不支持 isolation，因为它没有 `session_id` 字段，也无法在 `search()` 中按 session 过滤（Plaintext search 会报错 `HistoryFeatureUnsupported`）。
+**软隔离模型**：旧历史共享，新写入互不干扰。
 
 ---
 
-## 九、`history import` 命令的导入机制
+### 6.2 Plaintext 的 search 能力
 
-[history_import.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-cli/src/commands/history/history_import.rs) 实现两种导入模式：
+Plaintext 后端只支持部分过滤：
+- ✅ 命令行：前缀 / 子串 / 精确匹配
+- ✅ ID 范围
+- ✅ `not_command_line`（导航去重用）
+- ❌ 时间范围 → 返回 `HistoryFeatureUnsupported`
+- ❌ hostname、cwd、exit_status → 返回 `HistoryFeatureUnsupported`
+- ❌ session 过滤 → 根本不识别，等同于无过滤
 
-### 9.1 自动格式互转（无输入）
+---
 
+## 七、同步与跨会话共享
+
+### 7.1 Plaintext：sync() 合并
+
+`FileBackedHistory::sync()` 是跨会话共享的唯一通道：
+
+1. **加写锁**（`fd_lock::RwLock`）→ 防并发写乱
+2. **读磁盘全部内容** → `foreign_entries`（含其他会话新增的）
+3. **合并** → `foreign_entries + own_entries`（本会话未刷盘的）
+4. **容量检查** → 超了就截断最旧的
+5. **写回磁盘** → 追加 or 全量覆写
+6. **更新内存** → `self.entries = foreign_entries`（现在包含全部历史）
+
+`sync()` 调用时机：每轮 REPL 循环开始时（`sync_on_enter=true`）。
+
+---
+
+### 7.2 SQLite：sync() 是空操作
+
+```rust
+fn sync(&mut self) -> std::io::Result<()> {
+    Ok(())
+}
 ```
-当前 sqlite    → 从 history.txt  读取导入到 history.sqlite3
-当前 plaintext → 从 history.sqlite3 读取导入到 history.txt
+
+因为 SQLite 用 WAL 模式，写入即持久化；每次 `search()` 直接读最新数据，天然跨会话共享。不需要显式 sync。
+
+---
+
+## 八、`history import` 导入机制
+
+[history_import.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-cli/src/commands/history/history_import.rs)
+
+**自动格式互转**（无输入时）：
+```
+当前 sqlite    → 从 history.txt  导入到 history.sqlite3
+当前 plaintext → 从 history.sqlite3 导入到 history.txt
 ```
 
-### 9.2 管道输入导入
-
-```
-echo foo | history import              # 导入单条命令
-[[command cwd]; [foo /home]] | history import  # 导入带元数据的记录
-```
-
-核心导入逻辑（[import](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-cli/src/commands/history/history_import.rs#L149-L159)）：
-
+核心导入逻辑：
 ```rust
 fn import(dst: &mut dyn History,
           src: impl Iterator<Item = Result<HistoryItem, ShellError>>) {
     for item in src {
         let mut item = item?;
-        item.id = None;  // ★ 强制重置 ID，让后端重新分配自增 id
+        item.id = None;  // 强制重置 ID，后端重新分配自增 id
         dst.save(item)?;
     }
 }
 ```
 
-关键点：`item.id = None` 强制触发 INSERT 而非 UPDATE，保证导入数据作为新条目追加。
-
 ---
 
-## 十、启动初始化完整流程
+## 九、启动初始化完整流程
 
 ```
 nu 启动
   │
-  ├─► 读取 $env.config.history（env.nu / config.nu）
-  │       │
-  │       ├─► file_format: Plaintext(默认) | Sqlite
-  │       ├─► path: Default | Custom | Disabled
-  │       ├─► isolation: 仅 Sqlite 有效
-  │       └─► 编译特性检查（无 sqlite 特性则回退）
+  ├─► 读取 $env.config.history
   │
   ├─► setup_history()
   │       │
-  │       ├─► 若 isolation=true → create_history_session_id()
-  │       ├─► 计算实际文件路径（file_path()）
+  │       ├─► isolation=true → create_history_session_id()
+  │       ├─► 计算文件路径
   │       └─► update_line_editor_history()
   │               │
-  │               ├─► Plaintext → FileBackedHistory::with_file(max_size, path)
-  │               │       │        (内部立即 sync() 读入磁盘已有内容)
-  │               │       └─► with_history_exclusion_prefix(ignore_space_prefixed)
-  │               │
-  │               └─► Sqlite    → SqliteBackedHistory::with_file(path, session_id, now)
-  │                       │        (建表 + 设 PRAGMA，无需读历史)
-  │                       ├─► with_history_exclusion_prefix(ignore_space_prefixed)
-  │                       └─► store_history_id_in_engine()
+  │               ├─► 创建后端（FileBackedHistory / SqliteBackedHistory）
+  │               ├─► with_history_session_id(history_session_id)
+  │               ├─► with_history_exclusion_prefix(ignore_space_prefixed.then_some(" "))
+  │               ├─► 配置 hinter（默认 CwdAwareHinter，或自定义 ExternalHinter）
+  │               └─► store_history_id_in_engine()
   │
   └─► engine_state.history_locked_after_startup = true
-          （锁定 path/max_size/file_format/isolation 不再变更）
 ```
 
 ---
 
-## 十一、Text vs SQLite 全面对比
+## 十、Text vs SQLite 全面对比
 
-| 维度 | Plaintext (FileBackedHistory) | SQLite (SqliteBackedHistory) |
-|------|-------------------------------|-------------------------------|
-| **存储内容** | 仅 `command_line`（字符串） | 完整 9 字段含元数据 |
-| **多行编码** | `\n` → `<\n>` 转义 | 原生支持 TEXT |
-| **容量控制** | `capacity` 参数，`VecDeque` 滚动 | 无上限（SQLite 自行管理） |
-| **save 内去重** | ✅ 连续相同命令不重复存储 | ❌ 无内置去重 |
-| **update 支持** | ❌ 不支持 | ✅ UPSERT 覆盖 |
-| **sync 作用** | 加锁读文件→合并→写回→更新内存 | no-op（SQLite WAL 实时持久化） |
-| **跨会话共享** | sync 时通过文件锁合并 | search 时直接读 DB，天然共享 |
-| **会话隔离** | ❌ 不支持 | ✅ `session_id + session_timestamp` 软隔离 |
-| **过滤能力** | 仅命令行前缀/子串/精确匹配 | 时间、CWD、hostname、exit_status、session 全部支持 |
-| **文件锁** | `fd_lock::RwLock` 应用层 | SQLite 内置文件锁 |
-| **history 命令查询** | `FileBackedHistory.search()` 读文件 | `SQLiteQueryBuilder` 直接查 `history` 表（不过滤 session） |
+| 维度 | Plaintext | SQLite |
+|------|-----------|--------|
+| 存储内容 | 仅 `command_line` | 9 字段完整元数据 |
+| save 内去重 | ✅ 连续相同去重 | ❌ 无 |
+| update 支持 | ❌ | ✅ UPSERT |
+| sync 作用 | 加锁读→合并→写回→更新内存 | no-op（WAL 实时持久化） |
+| 跨会话共享 | sync 时合并 | search 时天然共享 |
+| 会话隔离 | ❌ | ✅（软隔离：旧共享新隔离） |
+| 过滤能力 | 仅命令行匹配 | 时间/CWD/hostname/exit_status/session |
+| 文件锁 | `fd_lock::RwLock` 应用层 | SQLite 内置 |
+| session_id 设置位置 | 引擎层 submit_buffer | 引擎层 submit_buffer |
+| 导航可见性 | 全量（session 被忽略） | 受 isolation 约束 |
+| 菜单可见性 | 全量 | 全量（菜单用 all_that_contain_rev，session=None） |
+| history 命令可见性 | 全量 | 全量（直接查表） |
 
 ---
 
-## 十二、文件路径解析
+## 十一、文件路径解析
 
-[HistoryConfig::file_path()](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-protocol/src/config/history.rs#L98-L114) 的解析规则：
+[HistoryConfig::file_path()](file:///d:/fz/0601-2/solo-dogfeeding/code/70-nushell/crates/nu-protocol/src/config/history.rs#L98-L114)：
 
-1. `HistoryPath::Disabled` → 返回 `None`（不持久化）
-2. `HistoryPath::Custom(path)` → 使用用户指定路径
-   - 若该路径是目录，则追加默认文件名（`history.txt` 或 `history.sqlite3`）
-3. `HistoryPath::Default` → 使用 `nu_config_dir()/默认文件名`
+1. `Disabled` → `None`（不持久化）
+2. `Custom(path)` → 用户指定路径；若为目录则追加默认文件名
+3. `Default` → `nu_config_dir()/默认文件名`
 
-默认文件名由 `HistoryFileFormat::default_file_name()` 返回：
+默认文件名：
 - Plaintext → `history.txt`
 - Sqlite → `history.sqlite3`
