@@ -709,9 +709,257 @@ match default_val {
 
 ---
 
-## 七、提示符与模式
+## 七、commandline 命令族与 ReplState 联动
 
-### 7.1 NushellPrompt 结构
+`commandline` 命令族是 Nushell 提供的一组核心命令，允许在钩子和 HostCommand 中程序化地操作 reedline 缓冲区。所有命令通过 `engine_state.repl_state`（`Arc<Mutex<ReplState>>`）间接读写 reedline 的状态。
+
+### 7.1 ReplState：命令族与编辑器之间的桥梁
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    ReplState (Arc<Mutex<...>>)                    │
+│                                                                  │
+│   buffer: String        ← commandline / commandline edit 读写    │
+│   cursor_pos: usize     ← commandline get-cursor / set-cursor   │
+│   accept: bool          ← commandline edit --accept 写入         │
+│                                                                  │
+│   ┌─────────────────┐          ┌───────────────────────┐         │
+│   │ commandline 命令 │ ──写入──▶│ ReplState             │         │
+│   │ (钩子/HostCmd)  │          │                       │         │
+│   └─────────────────┘          └───────────┬───────────┘         │
+│                                            │                     │
+│                                            │ flush               │
+│                                            ▼                     │
+│                                ┌───────────────────────┐         │
+│                                │ reedline 编辑器        │         │
+│                                │ (run_edit_commands)   │         │
+│                                └───────────────────────┘         │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**关键约束**：commandline 命令族**不直接**操作 reedline 实例。它们只修改 `ReplState`，由 `flush_engine_state_repl_buffer` 在下一次循环迭代的 `read_line` 之前将状态同步到编辑器。
+
+### 7.2 commandline — 读取缓冲区内容
+
+`commandline`（`crates/nu-cli/src/commands/commandline/commandline_.rs`）读取当前缓冲区内容：
+
+```rust
+fn run(&self, engine_state: &EngineState, _stack: &mut Stack, call: &Call, _input: PipelineData) -> Result<PipelineData, ShellError> {
+    let repl = engine_state.repl_state.lock().expect("repl state mutex");
+    Ok(Value::string(repl.buffer.clone(), call.head).into_pipeline_data())
+}
+```
+
+- 只读操作，获取 `repl.buffer` 的快照
+- 返回字符串值
+
+### 7.3 commandline edit — 修改缓冲区内容
+
+`commandline edit`（`crates/nu-cli/src/commands/commandline/edit.rs`）提供三种修改模式和可选的立即提交：
+
+```rust
+fn run(&self, engine_state: &EngineState, stack: &mut Stack, call: &Call, _input: PipelineData) -> Result<PipelineData, ShellError> {
+    let str: String = call.req(engine_state, stack, 0)?;
+    let mut repl = engine_state.repl_state.lock().expect("repl state mutex");
+    if call.has_flag(engine_state, stack, "append")? {
+        repl.buffer.push_str(&str);
+    } else if call.has_flag(engine_state, stack, "insert")? {
+        let cursor_pos = repl.cursor_pos;
+        repl.buffer.insert_str(cursor_pos, &str);
+        repl.cursor_pos += str.len();
+    } else {
+        repl.buffer = str;
+        repl.cursor_pos = repl.buffer.len();
+    }
+    repl.accept = call.has_flag(engine_state, stack, "accept")?;
+    Ok(Value::nothing(call.head).into_pipeline_data())
+}
+```
+
+**三种模式**：
+
+| 模式 | 标志 | 行为 | 光标位置 |
+|------|------|------|----------|
+| 替换（默认） | `--replace` / 无 | `repl.buffer = str` | 移到末尾（`buffer.len()`） |
+| 追加 | `--append` / `-a` | `repl.buffer.push_str(&str)` | 不变 |
+| 插入 | `--insert` / `-i` | `repl.buffer.insert_str(cursor_pos, &str)` | 前进 `str.len()` |
+
+**`--accept` / `-A` 标志**：设置 `repl.accept = true`，使得 flush 后 reedline 会立即提交缓冲区内容，等价于用户按下了 Enter。
+
+### 7.4 commandline get-cursor — 读取光标位置
+
+`commandline get-cursor`（`crates/nu-cli/src/commands/commandline/get_cursor.rs`）返回当前光标位置（以 Unicode grapheme 为单位）：
+
+```rust
+fn run(&self, engine_state: &EngineState, _stack: &mut Stack, call: &Call, _input: PipelineData) -> Result<PipelineData, ShellError> {
+    let repl = engine_state.repl_state.lock().expect("repl state mutex");
+    let char_pos = repl.buffer
+        .grapheme_indices(true)
+        .chain(std::iter::once((repl.buffer.len(), "")))
+        .position(|(i, _c)| i == repl.cursor_pos)
+        .expect("Cursor position isn't on a grapheme boundary");
+    Ok(Value::int(char_pos as i64, call.head).into_pipeline_data())
+}
+```
+
+**字节 vs grapheme 转换**：
+- `ReplState.cursor_pos` 存储的是**字节偏移**（与 reedline 内部的 `MoveToPosition` 一致）
+- `get-cursor` 返回的是**grapheme 索引**（用户视角的字符位置）
+- 通过 `grapheme_indices` 迭代器将字节偏移映射为 grapheme 索引
+
+### 7.5 commandline set-cursor — 设置光标位置
+
+`commandline set-cursor`（`crates/nu-cli/src/commands/commandline/set_cursor.rs`）设置光标位置：
+
+```rust
+fn run(&self, engine_state: &EngineState, stack: &mut Stack, call: &Call, _input: PipelineData) -> Result<PipelineData, ShellError> {
+    let mut repl = engine_state.repl_state.lock().expect("repl state mutex");
+    if let Some(pos) = call.opt::<i64>(engine_state, stack, 0)? {
+        repl.cursor_pos = if pos <= 0 {
+            0usize
+        } else {
+            repl.buffer.grapheme_indices(true)
+                .map(|(i, _c)| i)
+                .nth(pos as usize)
+                .unwrap_or(repl.buffer.len())
+        };
+    } else if call.has_flag(engine_state, stack, "end")? {
+        repl.cursor_pos = repl.buffer.len();
+    }
+    Ok(Value::nothing(call.head).into_pipeline_data()))
+}
+```
+
+**grapheme vs 字节转换**：
+- 输入参数是 **grapheme 索引**
+- 通过 `grapheme_indices` 映射为**字节偏移**存入 `repl.cursor_pos`
+- 负数或超出范围则夹紧到 0 或末尾
+
+### 7.6 commandline complete — 补全
+
+`commandline complete`（`crates/nu-cli/src/commands/commandline/complete.rs`）使用当前缓冲区内容和光标位置进行补全：
+
+```rust
+let (buffer, cursor_pos): (Cow<_>, _) = match &input {
+    PipelineData::Empty => {
+        // 从 ReplState 读取缓冲区和光标位置
+        let repl = engine_state.repl_state.lock().expect("repl state mutex");
+        (Cow::from(repl.buffer.clone()), repl.cursor_pos)
+    }
+    PipelineData::Value(Value::String { val, .. }, _) => (val.as_str().into(), val.len()),
+    _ => { ... }
+};
+// 使用 NuCompleter 获取补全建议
+let completions = completer.fetch_completions_at(&buffer, cursor_pos);
+```
+
+**特殊处理**：`complete` 读取 `ReplState` 后立即释放锁，避免在补全过程中（可能执行其他代码）持锁导致死锁。
+
+### 7.7 状态回到编辑器的完整流程
+
+commandline 命令对 `ReplState` 的修改不会立即反映到 reedline 编辑器。状态同步发生在下一次循环迭代中：
+
+```
+commandline 命令执行 (钩子或 HostCommand 中)
+        │
+        ▼
+  修改 ReplState
+  (buffer / cursor_pos / accept)
+        │
+        ▼
+  当前 read_line 返回 Signal
+        │
+        ▼
+  run_command 执行命令
+        │
+        ▼
+  回到主循环，进入下一次 loop_iteration
+        │
+        ▼
+  ┌─ is_hostcommand? ──────────────────────┐
+  │ 是                                      │ 否
+  │  跳过 flush，保留 reedline 内部缓冲区   │  执行 flush_engine_state_repl_buffer
+  │                                         │
+  │                                         ▼
+  │                                   line_editor.run_edit_commands([
+  │                                     EditCommand::Clear,
+  │                                     EditCommand::InsertString(repl.buffer),
+  │                                     EditCommand::MoveToPosition { repl.cursor_pos },
+  │                                   ])
+  │                                         │
+  │                                         ▼
+  │                                   if repl.accept {
+  │                                     line_editor.with_immediately_accept(true)
+  │                                   }
+  │                                   repl.accept = false
+  │                                   repl.buffer = ""
+  │                                   repl.cursor_pos = 0
+  └─────────────────────────────────────────┘
+        │
+        ▼
+  line_editor.read_line(nu_prompt)
+        │
+        ▼
+  reedline 以新的缓冲区内容和光标位置等待用户输入
+  （如果 accept=true，则立即提交，等价于自动按 Enter）
+```
+
+**HostCommand 场景的特殊性**：
+
+当 commandline 命令在 HostCommand 中执行时，下一次迭代跳过 flush。这意味着 commandline 对 `ReplState` 的修改**不会**通过 flush 传递到编辑器。但这并不影响，因为：
+
+1. HostCommand 中常用的模式是通过 `commandline edit` 设置内容后，再由 reedline 的缓冲区保持机制生效
+2. 如果 HostCommand 需要修改当前行并立即提交，可以组合使用 `--accept` 标志，但此时 `is_hostcommand` 为 true 会跳过 flush，所以需要靠 reedline 自身的 `with_immediately_accept` 来生效
+3. 在 pre_prompt / env_change 钩子中使用 commandline 时，由于这些钩子在 flush 之前执行，修改后的 ReplState 会在随后的 flush 中正确同步到编辑器
+
+### 7.8 典型使用场景
+
+**场景一：pre_prompt 钩子预填命令行**
+
+```nu
+$env.config = {
+    hooks: {
+        pre_prompt: [{
+            condition: { $nu.is-login }
+            code: { commandline edit --insert "echo 'Welcome!'" }
+        }]
+    }
+}
+```
+
+流程：pre_prompt 钩子 → `commandline edit` 写入 ReplState → flush 同步到 reedline → 用户看到预填内容
+
+**场景二：HostCommand 中修改当前行**
+
+```nu
+# keybindings 配置中
+{
+    name: fzf_history
+    modifier: control
+    keycode: char_r
+    mode: [emacs vi_normal vi_insert]
+    event: {
+        send: ExecuteHostCommand
+        cmd: "commandline edit -r (history | get command | reverse | uniq | str join (char -i 0) | fzf --read0 --scheme=history -q (commandline))"
+    }
+}
+```
+
+流程：Ctrl+R → HostCommand 执行 fzf → `commandline edit --replace` 写入 ReplState → 下一次迭代跳过 flush（is_hostcommand=true）→ 但 reedline 缓冲区保持不变，且如果 HostCommand 内部通过 `commandline edit -r` 设置了新内容，这些内容需要等待下一次**非** HostCommand 的迭代才能通过 flush 写入
+
+**场景三：accept 立即执行**
+
+```nu
+commandline edit --append " --help" --accept
+```
+
+流程：设置 buffer 和 accept=true → flush 时 InsertString + MoveToPosition + `with_immediately_accept(true)` → reedline 自动提交，效果等价于用户按了 Enter
+
+---
+
+## 八、提示符与模式
+
+### 8.1 NushellPrompt 结构
 
 `NushellPrompt`（`crates/nu-cli/src/prompt.rs`）实现了 reedline 的 `Prompt` trait，支持多种模式的提示符指示符：
 
@@ -727,7 +975,7 @@ pub struct NushellPrompt {
 }
 ```
 
-### 7.2 提示符更新
+### 8.2 提示符更新
 
 提示符内容通过 `update_prompt` 函数（`crates/nu-cli/src/prompt_update.rs`）从环境变量中动态获取：
 
@@ -760,7 +1008,7 @@ pub fn update_prompt(
 - `PROMPT_MULTILINE_INDICATOR`：多行输入指示器
 - `TRANSIENT_*`：瞬态提示符版本（命令执行后显示）
 
-### 7.3 模式指示器渲染
+### 8.3 模式指示器渲染
 
 `render_prompt_indicator` 方法根据当前编辑模式返回对应的指示器字符串：
 
@@ -784,7 +1032,7 @@ fn render_prompt_indicator(&self, edit_mode: PromptEditMode) -> Cow<'_, str> {
 - Vi Normal 模式：`> `
 - Vi Insert 模式：`: `
 
-### 7.4 模式切换与视觉反馈
+### 8.4 模式切换与视觉反馈
 
 提示符模式指示器与编辑模式联动：
 1. 用户切换编辑模式（如按 Esc 从 Insert 进入 Normal）
@@ -796,7 +1044,7 @@ fn render_prompt_indicator(&self, edit_mode: PromptEditMode) -> Cow<'_, str> {
 
 ---
 
-## 八、三者关系图
+## 九、三者关系图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -846,9 +1094,9 @@ fn render_prompt_indicator(&self, edit_mode: PromptEditMode) -> Cow<'_, str> {
 
 ---
 
-## 九、关键设计要点
+## 十、关键设计要点
 
-### 9.1 REPL：每次迭代重新配置
+### 10.1 REPL：每次迭代重新配置
 
 Reedline 的大部分配置（高亮、补全、菜单、键位、提示符等）在**每次循环迭代**时重新构建，而非一次性初始化。原因：
 
@@ -856,7 +1104,7 @@ Reedline 的大部分配置（高亮、补全、菜单、键位、提示符等�
 - 补全和高亮需要最新的 engine_state 和 stack 状态
 - 提示符内容需要动态更新
 
-### 9.2 REPL：Stack 引用管理
+### 10.2 REPL：Stack 引用管理
 
 由于 reedline 的插件（highlighter, completer, hinter 等）需要引用 stack，而 stack 在 REPL 循环中会被修改，因此采用了特殊的引用管理策略：
 
@@ -875,7 +1123,7 @@ line_editor = line_editor
     .with_completer(Box::<DefaultCompleter>::default())
 ```
 
-### 9.3 键位模式与光标形状
+### 10.3 键位模式与光标形状
 
 键位模式与光标形状配置联动，通过 `CursorConfig` 设置（`crates/nu-cli/src/repl.rs`）：
 
@@ -889,7 +1137,7 @@ let cursor_config = CursorConfig {
 
 不同模式下光标形状不同，提供视觉反馈。
 
-### 9.4 菜单与键位的松耦合设计
+### 10.4 菜单与键位的松耦合设计
 
 菜单和键位通过名称字符串关联，实现松耦合：
 - 菜单在 `add_menus` 中注册，键位在 `add_menu_keybindings` 中绑定
@@ -897,7 +1145,7 @@ let cursor_config = CursorConfig {
 - 用户也可以覆盖同名菜单来改变菜单行为，而无需修改键位绑定
 - Tab 键的 `UntilFound` 机制提供了优雅的降级策略
 
-### 9.5 HostCommand 的缓冲区保护机制
+### 10.5 HostCommand 的缓冲区保护机制
 
 通过 `is_hostcommand` 标志实现 HostCommand 后的缓冲区状态保留：
 - HostCommand 执行后设置标志
@@ -905,9 +1153,15 @@ let cursor_config = CursorConfig {
 - 保留 reedline 内部的缓冲区内容和光标位置
 - 确保用户可以继续在当前行上编辑
 
-### 9.6 input 命令：两种输入模式
+### 10.6 commandline 命令族的间接修改模式
 
-input 命令支持两种输入模式，通过是否启用 reedline 区分：
+commandline 命令族通过 ReplState 间接修改 reedline 状态，这种设计带来了几个关键特性：
+- **延迟生效**：修改不会立即反映到编辑器，需要等待下一次 flush
+- **线程安全**：通过 `Arc<Mutex<ReplState>>` 确保多线程安全访问
+- **字节/字符转换**：内部存储字节偏移，对外暴露 grapheme 索引
+- **accept 语义**：通过 `with_immediately_accept` 实现自动提交
+
+### 10.7 input 命令：两种输入模式
 
 - **Legacy 模式**：逐字符读取，不使用 reedline，功能简单
 - **Reedline 模式**：完整的行编辑能力，支持历史、多行编辑等
@@ -918,7 +1172,7 @@ input 命令支持两种输入模式，通过是否启用 reedline 区分：
 
 ---
 
-## 十、相关文件清单
+## 十一、相关文件清单
 
 | 文件 | 作用 |
 |------|------|
@@ -926,6 +1180,11 @@ input 命令支持两种输入模式，通过是否启用 reedline 区分：
 | `crates/nu-cli/src/reedline_config.rs` | 键位绑定创建、菜单配置、菜单与键位配合 |
 | `crates/nu-cli/src/prompt.rs` | Nushell 提示符实现（REPL 使用） |
 | `crates/nu-cli/src/prompt_update.rs` | 提示符更新逻辑、环境变量读取 |
+| `crates/nu-cli/src/commands/commandline/commandline_.rs` | commandline 命令 — 读取缓冲区 |
+| `crates/nu-cli/src/commands/commandline/edit.rs` | commandline edit 命令 — 修改缓冲区/光标/accept |
+| `crates/nu-cli/src/commands/commandline/get_cursor.rs` | commandline get-cursor 命令 — 读取光标位置 |
+| `crates/nu-cli/src/commands/commandline/set_cursor.rs` | commandline set-cursor 命令 — 设置光标位置 |
+| `crates/nu-cli/src/commands/commandline/complete.rs` | commandline complete 命令 — 补全 |
 | `crates/nu-protocol/src/config/reedline.rs` | reedline 相关配置数据结构 |
 | `crates/nu-protocol/src/engine/engine_state.rs` | ReplState 定义、engine_state 结构 |
 | `crates/nu-command/src/platform/input/input_.rs` | input 命令实现（含 reedline 模式） |
