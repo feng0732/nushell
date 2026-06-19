@@ -385,29 +385,29 @@ Nushell 对循环导入和重复导入有**两层机制**，且执行顺序非�
 ```rust
 pub fn absolute_with<P, Q>(path: P, relative_to: Q) -> io::Result<PathBuf> {
     let path = join_path_relative(path, relative_to, true); // 拼接相对路径
-    let path = expand_tilde(path);      // 展开 ~ 到用户主目录
-    let path = expand_ndots(path);   // 展开 ... → ../..，.... → ../../..（仅展开 3 点及以上
-    absolute(path)                   // 调用 std::path::absolute
+    let path = expand_tilde(path);    // 展开 ~ 到用户主目录
+    let path = expand_ndots(path);    // 展开 ndots：... → ../..，.... → ../../..（仅 3 点及以上）
+    absolute(path)                    // 调用 std::path::absolute
 }
 ```
 
-> **重要**：`expand_ndots` **只展开三个及以上点（`...`、`....` 等），普通的 `..` 和 `.` 不做词法展开，全部留给 `std::path::absolute` 处理，而后者的行为**跨平台不一致**。
+> **重要**：`expand_ndots` 只展开三个及以上点（`...`、`....` 等），普通的 `..` 和 `.` 不做词法展开，全部留给 `std::path::absolute` 处理，而后者的行为**跨平台不一致**。
 
 ##### 跨平台差异：`std::path::absolute` 对 `..` 的处理
 
-| 平台 | `..` 处理方式 | 代码依据 |
-|------|--------------|---------|
-| **Unix / POSIX | **保留 `..` 组件，不解析** | POSIX 语义认为 `..` 是一种"链接"（可能跨越符号链接），`absolute()` 只是做路径拼接但保留 `..` |
-| **Windows** | **解析 `..`，移除前一个组件** | 调用 `GetFullPathNameW`，在语法层面直接消解 `..` 和 `.` |
+| 平台 | `..` 处理方式 | 依据 |
+|------|--------------|------|
+| **Unix / POSIX** | 保留 `..` 组件，不解析 | POSIX 语义认为 `..` 是一种"链接"（可能跨越符号链接），`absolute()` 只做路径拼接但保留 `..` |
+| **Windows** | 解析 `..`，移除前一个组件 | 调用 `GetFullPathNameW`，在语法层面直接消解 `..` 和 `.` |
 
-**示例**（同样输入 `/foo/bar/../baz.nu`：
+**示例**（输入：`/foo/bar/../baz.nu`）：
 
 | 平台 | absolute_with 输出 |
 |------|-------------------|
 | Unix | `/foo/bar/../baz.nu`（`..` 保留） |
 | Windows | `C:\foo\baz.nu`（`bar\..` 被消解） |
 
-因此，到达 `parse_module_file` 的 `path: ParserPath` 中的 `RealPath(p)` **已经是一条经过绝对化处理但未做物理路径规范化的绝对路径**，且 **Unix 下可能包含 `..` 组件，Windows 下通常不包含。
+因此，到达 `parse_module_file` 的 `path: ParserPath` 中的 `RealPath(p)` **已经是一条经过绝对化处理但未做物理路径规范化的绝对路径**，且 **Unix 下可能包含 `..` 组件，Windows 下通常不包含**。
 
 #### 7.2.2 文件登记：文件名 + 内容字节逐字节比较（非哈希）
 
@@ -448,12 +448,12 @@ let file_id = working_set.add_file(&path.path().to_string_lossy(), &contents);
 | 场景 | Unix 下 | Windows 下 | 原因 |
 |------|---------|-----------|------|
 | 同一路径字符串 + 内容不变 | ✅ 复用 | ✅ 复用 | 路径+内容完全相同 |
-| 同一物理文件，通过 `./a.nu` vs `subdir/../a.nu` 访问 | ⚠️ **不复用**（`..` 保留在路径中） | ✅ 复用（`..` 被 `GetFullPathNameW` 消解） | Unix 下 `std::path::absolute` 保留 `..`；Windows 下 `GetFullPathNameW` 解析 `..` |
+| 同一物理文件，不同相对路径写法（含 `..`，如 `./a.nu` vs `sub/../a.nu`） | ❌ **不复用** | ✅ 复用 | Unix 下 `std::path::absolute` 保留 `..`，路径字符串不同；Windows 下 `GetFullPathNameW` 消解 `..`，路径归一化 |
+| 同一物理文件，`...`（三点）写法 vs 等价 `..` 写法（如 `a/b/.../c.nu` vs `a/b/../../c.nu`） | ✅ 复用 | ✅ 复用 | `expand_ndots` 统一将 `...` 展开为 `../..`，展开后与等价的 `..` 写法路径完全相同 |
 | 同一物理文件，通过软链 vs 真实路径分别访问 | ❌ 不复用 | ❌ 不复用 | `absolute_with` 不调用 canonicalize，软链路径保持原样，字符串不同 |
 | 同一路径 + 内容有 1 字节变更 | ❌ 不复用 | ❌ 不复用 | 内容字节逐字节比较失败 |
-| 大小写不同的同一路径（`A.nu` vs `a.nu`） | ❌ 不复用 | ❌ 不复用（即使文件系统不区分大小写） | PathBuf 和字符串比较都区分大小写，与文件系统无关 |
+| 大小写不同的同一路径（`A.nu` vs `a.nu`） | ❌ 不复用 | ❌ 不复用 | 字符串比较区分大小写，与文件系统是否大小写敏感无关 |
 | 不同路径但文件内容完全相同（两份拷贝） | ❌ 不复用 | ❌ 不复用 | 路径字符串不同，即使内容一样也视为不同文件 |
-| 通过 `...`（三点）访问（如 `a/b/.../c.nu`） | ✅ 复用 | ✅ 复用 | `expand_ndots` 会把 `...` 展开为 `../..`，之后由 `std::path::absolute` 按平台规则处理 |
 
 > **为什么 Unix 下 `./a.nu` 和 `../a.nu` 可能导致不同路径？**
 >
@@ -610,10 +610,10 @@ CircularImport(String, #[label = "detected circular import"] Span)
 
 | 场景 | Unix 下 | Windows 下 | 原因 |
 |------|---------|-----------|------|
-| A.nu → use B.nu → use A.nu（真正的循环） | ✅ 报错 | ✅ 报错 | A 在栈中，B 解析中再次 push A 被检测 |
+| A.nu → use B.nu → use A.nu（真正的循环） | ✅ 准确报错 | ✅ 准确报错 | A 在栈中，B 解析中再次 push A 被检测 |
 | A.nu → use B.nu → use C.nu；D.nu → use B.nu | ❌ 不触发 | ❌ 不触发 | B 首次解析完后已 pop 出栈；D→B 走缓存命中（第二层不被执行） |
 | 内联模块 `module foo { ... }` | ❌ 不触发 | ❌ 不触发 | 直接调用 `parse_module_block`，绕过 `parse_module_file`，不经过 FileStack |
-| 同文件通过不同 `..` 形式的路径导入 | ⚠️ **可能漏报** | ❌ 不漏报 | Unix 下 `..` 保留，路径字符串不同 → 栈中视为不同文件；Windows 下 `..` 消解，视为同一文件 |
+| 同文件通过不同 `..` 形式的相对路径导入 | ⚠️ 可能漏报 | ✅ 准确检测 | Unix 下 `..` 保留，路径字符串不同 → 栈中视为不同文件；Windows 下 `..` 消解，视为同一文件 |
 | 同物理文件通过软链和真实路径分别访问 | ⚠️ 可能漏报 | ⚠️ 可能漏报 | 路径未做 canonicalize，路径字符串不同（两平台都有此问题） |
 | `overlay use` 一个模块 | ✅ 经过检测 | ✅ 经过检测 | `overlay use` 内部同样调用模块解析流程 |
 
