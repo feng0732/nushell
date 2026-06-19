@@ -10,7 +10,7 @@ Nushell 为每个配置类型（环境配置 `env.nu` 和主配置 `config.nu`�
 
 | 层级 | 文件名模板 | 作用 | 加载时机 |
 |------|-----------|------|---------|
-| **默认配置** | `default_env.nu` / `default_config.nu` | 编译时嵌入的内置默认值，保证最小可用环境 | **每次**正常启动时先加载 |
+| **默认配置** | `default_env.nu` / `default_config.nu` | 编译时嵌入的内置默认值，保证最小可用环境 | `default_env.nu` **每次**正常启动都加载；`default_config.nu` 仅 REPL 模式、或命令/脚本模式指定 `--config`/`--login` 时加载 |
 | **脚手架配置** | `scaffold_env.nu` / `scaffold_config.nu` | 首次启动时写入用户配置目录的模板文件（仅注释无代码） | 首次启动**创建**用户配置时 |
 | **文档配置** | `doc_env.nu` / `doc_config.nu` | 带完整注释的文档，供 `config env --doc` 查看 | 从不自动加载，仅用户主动查阅 |
 | **用户配置** | `env.nu` / `config.nu` | 用户自定义配置（位于 `$nu.config-path` 目录） | 正常启动时**在默认配置之后**加载 |
@@ -18,19 +18,23 @@ Nushell 为每个配置类型（环境配置 `env.nu` 和主配置 `config.nu`�
 > 文件目录：crates/nu-utils/src/default_files/
 > 设计说明：crates/nu-utils/src/default_files/README.md
 
-`ConfigFileKind` 将四种文件通过 `include_str!` 在编译时嵌入二进制，运行时零文件依赖：
+`ConfigFileKind` 将三种编译时文件（默认、脚手架、文档）通过 `include_str!` 嵌入二进制；用户配置文件（`env.nu` / `config.nu`）**不内嵌**，由 `path()` 方法仅返回文件名字符串，运行时从文件系统读取：
 
 ```rust
-// crates/nu-utils/src/utils.rs#L97-L109
+// crates/nu-utils/src/utils.rs#L97-L131
 impl ConfigFileKind {
-    pub const fn default(self) -> &'static str {      // default_env.nu / default_config.nu
+    // 以下三种通过 include_str! 编译嵌入
+    pub const fn default(self) -> &'static str { ... }   // default_env.nu / default_config.nu
+    pub const fn scaffold(self) -> &'static str { ... }  // scaffold_env.nu / scaffold_config.nu
+    pub const fn doc(self) -> &'static str { ... }       // doc_env.nu / doc_config.nu
+
+    // 用户配置文件——仅返回文件名字符串，运行时从磁盘读取
+    pub const fn path(self) -> &'static str {
         match self {
-            Self::Config => include_str!("default_files/default_config.nu"),
-            Self::Env => include_str!("default_files/default_env.nu"),
+            ConfigFileKind::Config => "config.nu",
+            ConfigFileKind::Env => "env.nu",
         }
     }
-    pub const fn scaffold(self) -> &'static str { ... } // scaffold_env.nu / scaffold_config.nu
-    pub const fn doc(self) -> &'static str { ... }      // doc_env.nu / doc_config.nu
 }
 ```
 
