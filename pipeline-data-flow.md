@@ -382,3 +382,436 @@ match input {
 5. **信号的注入不对称**：有些路径（`into_iter_strict`、`Signals::empty()`）丢失了中断能力，导致某些看似等价的表达式在可中断性上差异巨大。
 
 6. **收集的隐式性**：`collect_reg`、`into_value`、`follow_cell_path` 等操作在开发者无感知的情况下触发了全量收集，破坏了惰性保证。
+
+---
+
+## 7. 命令协作链：select / columns / values 与 get / where / each
+
+这六条命令构成了 Nushell 中 Record 和 List 字段操作的核心工具链。它们在字段选择、数据收集、流式保留和错误传播上的行为差异，是理解 pipeline 数据流的关键。
+
+### 7.1 命令功能定位与输入输出类型
+
+| 命令 | 核心语义 | 输入类型 | 输出类型 | 操作粒度 |
+|------|---------|---------|---------|---------|
+| `get` | 按 cell path 提取值 | record / table / list | any（取决于路径） | **单值提取** |
+| `select` | 按 cell path 保留字段，删除其余 | record / table / list | 与输入同构（record→record, table→table） | **结构裁剪** |
+| `columns` | 提取所有列名 | record / table | `list<string>` | **元数据提取** |
+| `values` | 提取所有列值 | record / table | `list<any>` | **值提取** |
+| `where` | 按条件过滤行 | list / table | list / table | **行过滤** |
+| `each` | 对每个元素执行闭包 | list / table | list | **逐元素映射** |
+
+### 7.2 `get` 与 `select` 的根本区别
+
+`get` 和 `select` 都接受 cell path，但语义和实现截然不同。
+
+**`get`：提取路径指向的值，输出是裸值**
+
+- 单路径 + 列名（如 `get name`）→ 对 ListStream 逐元素 `follow_cell_path`，**保留流式**（[get.rs#L276-L308](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/get.rs#L276-L308)）
+- 单路径 + 行号（如 `get 0`）→ 走 `PipelineData::follow_cell_path`，**全量收集**
+- 多路径（如 `get a b c`）→ `into_value(span)` **全量收集**后再逐路径 `follow_cell_path`（[get.rs#L245-L267](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/get.rs#L245-L267)）
+
+```rust
+// get 单路径 → 流式保留
+pub fn follow_cell_path_into_stream(data, signals, cell_path, head) {
+    match data {
+        PipelineData::ListStream(stream, ..) if !has_int_member => {
+            stream.into_iter()
+                .map(|value| value.follow_cell_path(&cell_path)
+                    .map(Cow::into_owned)
+                    .unwrap_or_else(|err| Value::error(err, span)))  // 错误嵌入流
+                .into_pipeline_data(head, signals)
+        }
+        _ => data.follow_cell_path(&cell_path, head).map(|x| x.into_pipeline_data())
+    }
+}
+```
+
+**`select`：保留指定字段，删除其余，输出与输入同构**
+
+- 对 `Value::List`：逐元素 `follow_cell_path`，构建新 `Record`，输出为 `ListStream`（[select.rs#L302-L327](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/select.rs#L302-L327)）
+- 对 `Value::Record`：直接 `follow_cell_path` 构建新 `Record`，输出为 `Value`（[select.rs#L329-L343](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/select.rs#L329-L343)）
+- 对 `ListStream`：通过 `.map()` 逐元素构建 `Record`，**保留流式**（[select.rs#L345-L362](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/select.rs#L345-L362)）
+- 行选择（整数路径）：通过 `NthIterator` 跳过不需要的行，**保留流式**（[select.rs#L258-L274](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/select.rs#L258-L274)）
+
+```rust
+// select 对 ListStream 的处理 → 流式保留
+PipelineData::ListStream(stream, metadata, ..) => Ok(stream
+    .map(move |x| {
+        let mut record = Record::new();
+        for path in &columns {
+            match x.follow_cell_path(&path.members) {
+                Ok(value) => record.push(path.to_column_name(), value.into_owned()),
+                Err(e) => return Value::error(e, call_span),  // 错误嵌入流
+            }
+        }
+        Value::record(record, call_span)
+    })
+    .into_pipeline_data_with_metadata(call_span, engine_state.signals().clone(), metadata))
+```
+
+**关键差异对比**：
+
+| 维度 | `get` | `select` |
+|------|-------|----------|
+| 语义 | 提取路径指向的值 | 保留指定字段，删除其余 |
+| 输出类型 | 裸值（与路径深度有关） | 与输入同构（record→record, table→table） |
+| 多路径时 | 全量收集 | 流式保留（每个元素构建新 Record） |
+| 错误处理 | `Value::error` 嵌入流（单路径）或 `Err` 传播（多路径） | 统一用 `Value::error` 嵌入流 |
+| 行选择 | 全量收集 | `NthIterator` 流式跳过 |
+
+### 7.3 `columns` 与 `values` 的全量收集行为
+
+`columns` 和 `values` 都必须"看完整个输入"才能产出结果，这是它们语义上的内在需求：
+
+**`columns`：提取所有列名**
+
+- `Value::List`：调用 `get_columns(&input_vals)` 遍历所有元素收集列名（[columns.rs#L80-L86](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/columns.rs#L80-L86)）
+- `Value::Record`：直接迭代 `val.columns()`，**无需收集**（[columns.rs#L96-L100](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/columns.rs#L96-L100)）
+- `Value::Custom`：调用 `to_base_value()` **展开**后再提取列名（[columns.rs#L87-L95](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/columns.rs#L87-L95)）
+- `ListStream`：`stream.into_iter().collect::<Vec<_>>()` **全量收集**（[columns.rs#L117-L118](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/columns.rs#L117-L118)）
+- `Value::Error`：直接 `return Err(*error)` **短路提升**（[columns.rs#L102](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/columns.rs#L102)）
+
+**`values`：提取所有列值**
+
+- `Value::List`（即 table）：调用 `get_values(&vals)` 按**列优先**重组（[values.rs#L99-L130](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/values.rs#L99-L130)），输出为 `list<list<any>>`
+- `Value::Record`：直接 `val.values().cloned().collect()`，输出为 `list<any>`（[values.rs#L159-L163](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/values.rs#L159-L163)）
+- `Value::Custom`：调用 `to_base_value()` **展开**（[values.rs#L150-L152](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/values.rs#L150-L152)）
+- `ListStream`：`stream.into_iter().collect()` **全量收集**（[values.rs#L174-L175](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/values.rs#L174-L175)）
+- `Value::Error`：直接 `return Err(*error)` **短路提升**（[values.rs#L165](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/values.rs#L165)）
+- `get_values` 内部遇到 `Value::Error` 元素时 **提前终止** 并返回 `Err`（[values.rs#L117](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/values.rs#L117)）
+
+**`columns` 与 `values` 的关键区别**：
+
+| 维度 | `columns` | `values` |
+|------|-----------|----------|
+| Record 输入 | 直接迭代列名，**零收集** | `val.values().cloned()`，**克隆值** |
+| List（table）输入 | `get_columns` 遍历收集列名 | `get_values` 按**列优先**重组为 `list<list>` |
+| ListStream 输入 | **全量收集** | **全量收集** |
+| 遇到 Error 元素 | Record 级别短路（`Value::Error`→`Err`），元素级别不检查 | `get_values` 内部**逐元素检查**，遇 Error 立即 `Err` |
+| Custom 值 | **展开**后处理 | **展开**后处理 |
+
+### 7.4 `where` 与 `each` 的流式保留与错误传播
+
+`where` 和 `each` 是 pipeline 中最常用的流式处理命令，它们在流式保留和错误传播上的策略直接影响 pipeline 的行为。
+
+**`where`：条件过滤**
+
+- 输入通过 `into_iter_strict(head)` 转为迭代器（[where_.rs#L71](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/where_.rs#L71)）
+- `into_iter_strict` 对 `ListStream` 直接返回内部迭代器，**保留流式**；对 `Value::List` 和 `Value::Range` 创建新 `ListStream`
+- 闭包求值失败时，**不过滤掉该元素**，而是将原始值替换为 `Value::error(err, head)` 放入输出（[where_.rs#L77-L79](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/where_.rs#L77-L79)）
+- 闭包求值成功但条件为 false 时，元素被 `filter_map` 丢弃
+- 输出总是 `ListStream`（通过 `into_pipeline_data_with_metadata`）
+
+```rust
+// where 的核心逻辑
+.filter_map(move |value| {
+    match closure.run_with_value(value.clone())
+        .and_then(|data| data.into_value(head))
+    {
+        Ok(cond) => cond.is_true().then_some(value),
+        Err(err) => Some(Value::error(err, head)),  // 错误：保留元素但标记为 Error
+    }
+})
+```
+
+**`each`：逐元素映射**
+
+- 对 `Value::Range`、`Value::List`、`ListStream`：通过 `into_iter()` 转为迭代器，**保留流式**（[each.rs#L145-L147](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/each.rs#L145-L147)）
+- 对 `ByteStream`：通过 `stream.chunks()` 逐块处理，**保留流式**（[each.rs#L197-L222](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/each.rs#L197-L222)）
+- 对 `Value::Custom`（可迭代）：通过 `into_iter()` 展开，**保留流式**（[each.rs#L172-L196](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/each.rs#L172-L196)）
+- 对其他 `Value`（非迭代）：直接执行闭包一次，**不创建流**（[each.rs#L226-L229](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/each.rs#L226-L229)）
+- `--flatten` 模式：闭包返回的流被 `flat_map` 展开，而非 `map` + `into_value` 收集
+- 非 flatten 模式：`each_map` 通过 `pipeline_data.into_value(head)` **收集闭包输出**（[each.rs#L241-L248](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/each.rs#L241-L248)），如果闭包返回流则被全部收集
+- `--keep-empty` 为 false（默认）：结果通过 `PipelineData::filter` **过滤掉 Nothing 值**（[each.rs#L235](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/each.rs#L235)）
+
+```rust
+// each_map：非 flatten 模式下每个元素的处理
+fn each_map(value: Value, closure: &mut ClosureEval, head: Span) -> Result<Value, ShellError> {
+    let span = value.span();
+    let is_error = value.is_error();
+    closure.run_with_value(value)
+        .and_then(|pipeline_data| pipeline_data.into_value(head))  // 收集闭包输出
+        .map_err(|error| chain_error_with_input(error, is_error, span))  // 错误链式增强
+}
+```
+
+**`where` 与 `each` 的错误传播对比**：
+
+| 维度 | `where` | `each` |
+|------|---------|--------|
+| 闭包失败时 | `Value::error(err, head)` **替代原始值** | `Value::error(error, head)` **替代闭包返回值** |
+| 错误元素是否保留 | 是（`Some(Value::error)`） | 是（`unwrap_or_else` → `Value::error`） |
+| 错误链式增强 | 无（直接包装） | 有（`chain_error_with_input`，[utils.rs#L7-L19](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/utils.rs#L7-L19)），当输入本身不是错误时额外包装为 `EvalBlockWithInput` |
+| 闭包输出为流时 | `into_value(head)` 收集 | 非 flatten 模式：`into_value(head)` 收集；flatten 模式：`flat_map` 展开 |
+| 闭包输出 Nothing | 不适用（条件判断不产出 Nothing） | 默认过滤掉；`--keep-empty` 保留 |
+| 流式保留 | **始终保留**（`into_iter_strict` → `filter_map`） | **始终保留**（`into_iter` → `map`/`flat_map`） |
+| ByteStream 处理 | 不支持（`into_iter_strict` 对 ByteStream 报错） | 通过 `chunks()` 逐块处理 |
+
+### 7.5 Record 与 List 在字段选择上的行为差异
+
+Record 和 List 在 Nushell 中是两种不同的结构化容器，命令对它们的处理方式有根本区别。
+
+**字段选择（`select` / `get`）**：
+
+| 输入类型 | `select name` | `get name` |
+|---------|--------------|-----------|
+| `Record` | 返回只含 `name` 字段的 Record | 返回 `name` 字段的裸值 |
+| `List`（table） | 逐元素提取 `name`，返回只含 `name` 列的 table | 逐元素提取 `name`，返回 `list<any>`（所有行的 name 值） |
+| `ListStream` | 流式逐元素提取，输出 `ListStream` | 流式逐元素提取，输出 `ListStream`（单路径时） |
+
+**数据收集**：
+
+| 输入类型 | `columns` | `values` | `select` | `get`（多路径） |
+|---------|----------|---------|----------|-------------|
+| `Record` | 零收集（直接迭代列名） | 克隆值（`val.values().cloned()`） | 零收集（直接构建新 Record） | 零收集（`follow_cell_path` 借用） |
+| `Value::List` | 遍历所有元素收集列名 | `get_values` 按列优先重组 | 逐元素构建 Record，输出 `ListStream` | **全量收集**（`into_value`） |
+| `ListStream` | **全量收集** | **全量收集** | **流式保留** | **全量收集**（`into_value`） |
+
+**核心差异**：Record 作为单行结构，字段操作天然不需要收集；List（table）作为多行结构，列级操作需要遍历所有行；ListStream 的特殊性在于——`select` 和 `each`/`where` 可以逐元素处理保持流式，但 `columns`/`values` 和 `get`（多路径）因为需要全量视角，不得不收集。
+
+### 7.6 命令链组合中的数据流变迁
+
+以下典型命令链展示了数据在 pipeline 中的形态转换：
+
+**链 1：`ls | select name size` — 流式裁剪**
+
+```
+ls → PipelineData::ListStream(ListStream, metadata)
+  ↓ select
+  ListStream.map(逐元素构建新 Record {name, size})
+  → PipelineData::ListStream(ListStream, metadata)
+```
+
+- 流式保留：✅ 整个链路不发生全量收集
+- 错误传播：`follow_cell_path` 失败 → `Value::error` 嵌入流
+
+**链 2：`ls | get name size` — 多路径时全量收集**
+
+```
+ls → PipelineData::ListStream(ListStream, metadata)
+  ↓ get (多路径)
+  into_value(span) → Value::List  [全量收集！]
+  follow_cell_path("name") → Value::List
+  follow_cell_path("size") → Value::List
+  → PipelineData::ListStream([name_list, size_list], metadata)
+```
+
+- 流式保留：❌ `into_value` 触发全量收集
+- 错误传播：`follow_cell_path` 失败 → `Err(ShellError)` 立即中断
+
+**链 3：`ls | where type == file | select name` — 流式过滤 + 流式裁剪**
+
+```
+ls → PipelineData::ListStream(ListStream, metadata)
+  ↓ where
+  into_iter_strict → ListStream 的原始迭代器
+  filter_map(闭包求值) → ListStream [流式保留]
+  → PipelineData::ListStream(ListStream, metadata)
+  ↓ select
+  ListStream.map(构建 Record {name})
+  → PipelineData::ListStream(ListStream, metadata)
+```
+
+- 流式保留：✅ 全程流式
+- 错误传播：`where` 中闭包失败 → `Value::error` 替代原始值；`select` 中路径追踪失败 → `Value::error` 替代
+
+**链 4：`ls | columns` — 全量收集**
+
+```
+ls → PipelineData::ListStream(ListStream, metadata)
+  ↓ columns
+  into_iter().collect() → Vec<Value>  [全量收集！]
+  get_columns → 列名 Vec<String>
+  → PipelineData::Value(Value::List([col1, col2, ...]), metadata)
+```
+
+- 流式保留：❌ 必须收集全部元素才能确定列名
+- 错误传播：`Value::Error` 作为顶层值 → `Err` 短路；元素级 Error 不被 `get_columns` 检查（遇到非 Record 元素返回空列表）
+
+**链 5：`{a:1 b:2} | values` — Record 零收集**
+
+```
+{a:1 b:2} → PipelineData::Value(Value::Record, metadata)
+  ↓ values
+  val.values().cloned() → [1, 2]
+  → PipelineData::Value(Value::List([1, 2]), metadata)
+```
+
+- 流式保留：N/A（Record 是标量，不涉及流）
+- 错误传播：`Value::Error` 作为 Record 本身 → `Err` 短路
+
+**链 6：`ls | each { |r| $r.name }` vs `ls | get name` — 等价但错误传播不同**
+
+```
+ls | each { |r| $r.name }
+  → 闭包返回值通过 into_value 收集
+  → 闭包失败 → chain_error_with_input 增强错误信息
+  → 输出 Value::error（如果输入本身是 Error 则不增强）
+
+ls | get name
+  → follow_cell_path_into_stream 逐元素追踪
+  → 追踪失败 → Value::error(err, span)（无增强）
+  → 输出 ListStream
+```
+
+- 两者都保留流式，但 `each` 会通过 `chain_error_with_input` 在错误信息中附加上下文，`get` 则只保留原始错误
+
+### 7.7 错误传播策略的完整对比
+
+| 命令 | 错误来源 | 传播方式 | 是否中断流 | 错误增强 |
+|------|---------|---------|----------|---------|
+| `get`（单路径） | cell path 追踪失败 | `Value::error` 嵌入流 | 否 | 无 |
+| `get`（多路径） | cell path 追踪失败 | `Err(ShellError)` | 是 | 无 |
+| `select` | cell path 追踪失败 | `Value::error` 嵌入流 | 否 | 无 |
+| `columns` | 输入为 `Value::Error` | `Err(*error)` 短路 | 是 | 无 |
+| `columns` | `get_columns` 遇非 Record 元素 | 静默返回空列表 | 否 | N/A |
+| `values` | 输入为 `Value::Error` | `Err(*error)` 短路 | 是 | 无 |
+| `values` | `get_values` 遇 `Value::Error` 元素 | `Err(*error)` 提前终止 | 是 | 无 |
+| `values` | `get_values` 遇非 Record 元素 | `Err(OnlySupportsThisInputType)` | 是 | 无 |
+| `where` | 闭包求值失败 | `Value::error` 替代原始值 | 否 | 无 |
+| `each` | 闭包求值失败 | `Value::error` 替代闭包返回值 | 否 | `chain_error_with_input` |
+
+**关键发现**：
+
+1. `columns` 和 `values` 对 `Value::Error` 的处理比 `select` 和 `each` **更严格**：前者将顶层 `Value::Error` 立即提升为 `Err`，后者将其嵌入流中延迟传播
+2. `get` 在多路径模式下**最严格**：直接 `Err` 中断整个 pipeline
+3. `where` 的错误处理**最宽松**：闭包失败的元素被保留为 `Value::Error`，允许下游命令看到错误并决定如何处理
+4. `each` 的 `chain_error_with_input` 是唯一提供**错误上下文增强**的命令——当输入本身不是错误时，会包装为 `EvalBlockWithInput` 错误
+
+### 7.8 `into_stream_or_original` 与 `into_iter_strict` 的分水岭
+
+`columns` 和 `values` 都使用了 `PipelineData::into_stream_or_original`（[columns.rs#L70](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/columns.rs#L70)，[values.rs#L137](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/values.rs#L137)），而 `where` 使用了 `into_iter_strict`。这两个方法的行为差异决定了命令对流的态度：
+
+| 方法 | 语义 | `Value::List` 行为 | `ListStream` 行为 | `ByteStream` 行为 | `Value::Error` 行为 |
+|------|------|-------------------|-------------------|-------------------|-------------------|
+| `into_stream_or_original` | 尽量转为流，否则保持原样 | 转为 `ListStream` | 透传 | 保持 `ByteStream` | 保持 `Value` |
+| `into_iter_strict` | 必须转为迭代器 | 转为 `ListStream` | 透传 | **报错** | **报错** |
+
+`into_stream_or_original` 的关键代码（[pipeline_data.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/pipeline/pipeline_data.rs)）：
+
+```rust
+pub fn into_stream_or_original(self, engine_state: &EngineState) -> PipelineData {
+    match self {
+        PipelineData::Value(Value::List { .. }, ..) =>
+            self.into_iter().into_pipeline_data(...),  // Value::List → ListStream
+        PipelineData::Value(Value::Range { .. }, ..) =>
+            self.into_iter().into_pipeline_data(...),  // Value::Range → ListStream
+        PipelineData::Value(Value::Custom { ref val, .. }, ..) if val.is_iterable() =>
+            self.into_iter().into_pipeline_data(...),  // 可迭代 Custom → ListStream
+        other => other,  // 其余保持原样（包括 Record、ByteStream、Error）
+    }
+}
+```
+
+**不直观之处**：`columns` 和 `values` 对 `Value::List` 先转为 `ListStream` 再在 match 的 `ListStream` 分支中收集——等价于先拆再装，比直接在 `Value` 分支处理多了一次 `Box<dyn Iterator>` 的间接层。
+
+### 7.9 Record 与 List 在 `Record` 内部的结构差异
+
+`Record`（定义于 [record.rs#L17-L19](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/value/record.rs#L17-L19)）的底层是 `Vec<(String, Value)>`：
+
+```rust
+pub struct Record {
+    inner: Vec<(String, Value)>,
+}
+```
+
+这意味着：
+
+1. **Record 是紧凑的列式存储**：所有字段连续存储在 `Vec` 中，通过 `Deref` 到 `CasedRecord<CaseSensitive>` 提供大小写敏感的列查找（[record.rs#L130-L136](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/value/record.rs#L130-L136)）
+2. **列查找是 O(n) 线性扫描**：`CasedRecord::index_of` 使用 `rposition`（[record.rs#L49-L52](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/value/record.rs#L49-L52)），用 `rposition` 而非 `position` 是因为 `push` 可能重复键，取最后一个
+3. **Record 的 `push` 允许重复键**（[record.rs#L353-L355](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/value/record.rs#L353-L355)），但 `insert` 会替换（[record.rs#L77-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-protocol/src/value/record.rs#L77-L88)）。`select` 使用 `record.push` 构建新 Record，理论上可能产生重复列名
+4. **`get_columns` 提取列名时使用 `HashSet` 去重**（[column.rs#L4-L20](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-engine/src/column.rs#L4-L20)），遇到非 Record 元素直接返回空列表
+
+**`Value::List`（table）与 `Value::Record` 在字段选择上的结构性差异**：
+
+| 维度 | `Value::Record` | `Value::List`（table，即 `Vec<Record>`） |
+|------|-----------------|--------------------------------------|
+| 字段存储 | 单行：`Vec<(String, Value)>` | 多行：每行是独立的 `Record` |
+| `get name` | 返回单值 | 返回所有行的 `name` 值组成的 `List` |
+| `select name` | 返回单行 Record | 逐行构建 Record，返回 table |
+| `columns` | 直接迭代 `Record::columns()` | 遍历所有行，`HashSet` 去重合并列名 |
+| `values` | 直接 `Record::values()` | 按**列优先**重组（每列的值组成一个 List） |
+| 错误检查粒度 | 整个 Record | 逐元素（`get_values` 遇 Error 提前终止） |
+
+### 7.10 `select` 对行选择与列选择的分流
+
+`select` 是唯一同时支持行选择和列选择的命令，它通过 `NthIterator` 和 `follow_cell_path` 两条路径实现：
+
+**行选择**（整数 cell path，如 `select 0 2`）：
+
+```rust
+// [select.rs#L258-L274] 行选择 → NthIterator 流式跳过
+let pipeline_iter: PipelineIterator = input.into_iter();
+NthIterator {
+    input: pipeline_iter,
+    rows: unique_rows.into_iter().peekable(),
+    current: 0,
+}
+.into_pipeline_data_with_metadata(call_span, engine_state.signals().clone(), metadata)
+```
+
+`NthIterator`（[select.rs#L367-L393](file:///d:/fz/0601-2/solo-dogfeeding/code/65-nushell/crates/nu-command/src/filters/select.rs#L367-L393)）的逻辑：
+- 维护 `current` 计数器和 `rows` 有序集合的 peek 迭代器
+- 对每个输入元素：如果 `current == *row`，产出该元素并推进 `rows`；否则丢弃
+- 当 `rows` 耗尽后，返回 `None` 停止迭代——**不消费剩余输入**
+
+**列选择**（字符串 cell path，如 `select name size`）：
+
+在行选择之后的 input 上，对每个元素调用 `follow_cell_path` 提取指定字段，构建新 Record。
+
+**行+列混合**（如 `select 0 name size`）：
+
+先通过 `NthIterator` 选择行，再对筛选后的元素做列选择。两条路径都**保持流式**。
+
+**与 `get` 的行选择对比**：`get 0` 通过 `PipelineData::follow_cell_path` 收集整个流后索引，而 `select 0` 通过 `NthIterator` 流式跳过。对于大型流，`select 0` 远比 `get 0` 高效。
+
+### 7.11 完整协作链数据流图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Pipeline 数据流全景                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ls / open / 外部命令                                                    │
+│    │                                                                    │
+│    ├── PipelineData::ListStream ──────────────────────────────────┐     │
+│    │     │                                                        │     │
+│    │     ├── get (单路径, 列名) ── 流式保留 ──→ ListStream         │     │
+│    │     ├── get (单路径, 行号) ── 全量收集 ──→ Value              │     │
+│    │     ├── get (多路径)      ── 全量收集 ──→ ListStream          │     │
+│    │     │                                                        │     │
+│    │     ├── select (列名)     ── 流式保留 ──→ ListStream         │     │
+│    │     ├── select (行号)     ── 流式跳过 ──→ ListStream         │     │
+│    │     ├── select (行+列)    ── 流式保留 ──→ ListStream         │     │
+│    │     │                                                        │     │
+│    │     ├── where             ── 流式保留 ──→ ListStream         │     │
+│    │     ├── each              ── 流式保留 ──→ ListStream         │     │
+│    │     │                                                        │     │
+│    │     ├── columns           ── 全量收集 ──→ Value::List        │     │
+│    │     └── values            ── 全量收集 ──→ Value::List        │     │
+│    │                                                              │     │
+│    ├── PipelineData::Value(Value::Record) ──────────────────┐     │     │
+│    │     │                                                   │     │
+│    │     ├── get (单路径)     ── 零收集  ──→ Value (裸值)    │     │
+│    │     ├── select          ── 零收集  ──→ Value (Record)   │     │
+│    │     ├── columns         ── 零收集  ──→ Value::List      │     │
+│    │     ├── values          ── 克隆值  ──→ Value::List      │     │
+│    │     ├── where           ── 不适用  (Record 不是列表)    │     │
+│    │     └── each            ── 单次执行 ──→ 闭包返回值      │     │
+│    │                                                         │     │
+│    └── PipelineData::ByteStream ──────────────────────┐      │     │
+│          │                                             │      │     │
+│          ├── each           ── chunks() 流式 ──→ ListStream   │     │
+│          ├── where          ── 报错 (into_iter_strict) │      │     │
+│          ├── get/select/    ── 报错或不支持            │      │     │
+│          └── columns/values ── 报错 (OnlySupportsThis) │      │     │
+│                                                        │      │     │
+│  错误传播:                                              │      │     │
+│    Value::Error 在 Value 中 → Err 短路 (columns/values)│      │     │
+│    Value::Error 在 Stream 中 → 嵌入流延迟 (get/select/each/where)     │
+│    闭包失败            → Value::error 嵌入流 (each/where)             │
+│    cell path 失败      → Value::error 嵌入流 (get单路径/select)       │
+│    cell path 失败      → Err 中断 (get多路径)                        │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+```
