@@ -103,7 +103,7 @@ pub previous_env_vars: Arc<HashMap<EnvName, Value>>, // 上一次的环境变量
 - GitHub：[L531-L557](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-protocol/src/engine/stack.rs#L531-L557)
 
 **实际代码验证**（L531-L557）：
-- L531：`pub fn get_env_var<'a>(` — 函数签名
+- L531：`pub fn get_env_var<'a>(&'a self, engine_state: &'a EngineState, name: &str) -> Option<&'a Value>` — 完整函数签名
 - L538：`for scope in self.env_vars.iter().rev()` — 逆序遍历栈层
 - L539：`for active_overlay in self.active_overlays.iter().rev()` — 逆序遍历 overlay
 - L548：`for active_overlay in self.active_overlays.iter().rev()` — 逆序遍历 engine_state
@@ -303,6 +303,7 @@ fn with_env(engine_state: &EngineState, stack: &mut Stack, call: &Call, input: P
 
 2. **设置临时变量**：[Stack::add_env_var L273-L296](crates/nu-protocol/src/engine/stack.rs#L273-L296)
    - GitHub：[L273-L296](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-protocol/src/engine/stack.rs#L273-L296)
+   - 函数签名：`pub fn add_env_var(&mut self, var: String, value: Value)`
    - 总是写入 `env_vars.last_mut()`（最新层）
    - 实际验证：L278 `if let Some(scope) = self.env_vars.last_mut()`
 
@@ -352,7 +353,7 @@ let after = $env.FOO                 # "1" （自动回滚）
 - GitHub：[L368-L388](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-engine/src/eval.rs#L368-L388)
 
 **实际代码验证**（L368-L388）：
-- L369：`pub fn redirect_env(engine_state, caller_stack, callee_stack)` — 函数签名
+- L369：`pub fn redirect_env(engine_state: &EngineState, caller_stack: &mut Stack, callee_stack: &Stack)` — 完整函数签名
 - L371：`let caller_env_vars = caller_stack.get_env_var_names(engine_state)` — 获取 caller 全部变量
 - L375-L378：循环检测并隐藏 callee 中不存在的变量
 - L382：`for (var, value) in callee_stack.get_stack_env_vars()` — **只同步栈层**
@@ -366,7 +367,7 @@ let after = $env.FOO                 # "1" （自动回滚）
 - GitHub：[L1885-L1906](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-engine/src/eval_ir.rs#L1885-L1906)
 
 **实际代码验证**（L1885-L1906）：
-- L1886：`fn redirect_env(engine_state, caller_stack, callee_stack)`
+- L1886：`fn redirect_env(engine_state: &EngineState, caller_stack: &mut Stack, callee_stack: &Stack)` — 完整函数签名
 - L1889：`let caller_env_vars = caller_stack.get_env_var_names(engine_state)`
 - L1893-L1896：隐藏变量循环
 - L1900：`for (var, value) in callee_stack.get_stack_env_vars()`
@@ -396,6 +397,8 @@ fn redirect_env(engine_state: &EngineState, caller_stack: &mut Stack, callee_sta
 ```
 
 **源码核对链接**：
+- 获取调用者环境变量名：[Stack::get_env_var_names L493-L529](crates/nu-protocol/src/engine/stack.rs#L493-L529)
+  - GitHub：[L493-L529](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-protocol/src/engine/stack.rs#L493-L529)
 - 变量移除：[Stack::hide_env_var L684-L707](crates/nu-protocol/src/engine/stack.rs#L684-L707)
   - GitHub：[L684-L707](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-protocol/src/engine/stack.rs#L684-L707)
 - 变量同步：[Stack::get_stack_env_vars L423-L440](crates/nu-protocol/src/engine/stack.rs#L423-L440) — 只返回栈层
@@ -441,6 +444,7 @@ caller_stack                          callee_stack
 **源码核对链接**：
 - 新栈创建：[Stack::gather_captures L359-L393](crates/nu-protocol/src/engine/stack.rs#L359-L393)
   - GitHub：[L359-L393](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-protocol/src/engine/stack.rs#L359-L393)
+  - 函数签名：`pub fn gather_captures(&self, engine_state: &EngineState, captures: &[(VarId, Span)]) -> Stack`
   - 实际验证：L374-L375 `env_vars.clone()` + `push(HashMap::new())` 推入新层
 - 显式调用 redirect_env：[source_env.rs L101-L102](crates/nu-command/src/env/source_env.rs#L101-L102)
   - GitHub：[L101-L102](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-command/src/env/source_env.rs#L101-L102)
@@ -1108,7 +1112,7 @@ Overlay 是环境变量和命令的命名空间，可以激活/停用。
 
 > 以下引用均已在本地仓库逐行验证。格式说明：
 > - **相对路径**：可在本地仓库中直接跳转验证
-> - **GitHub 链接**：可在线查看（链接中的 `main` 分支可能需要根据实际情况调整）
+> - **GitHub 链接**：已固定至 commit `4f66ac1b00e93541e7f91a96649fc8e1efe4c672`，行号与该版本完全匹配
 
 ### 核心数据结构
 
@@ -1127,6 +1131,7 @@ Overlay 是环境变量和命令的命名空间，可以激活/停用。
 | 仅获取栈层环境 | method | L423-L440 | [stack.rs](crates/nu-protocol/src/engine/stack.rs#L423-L440) | [L423-L440](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-protocol/src/engine/stack.rs#L423-L440) |
 | 添加环境变量 | method | L273-L296 | [stack.rs](crates/nu-protocol/src/engine/stack.rs#L273-L296) | [L273-L296](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-protocol/src/engine/stack.rs#L273-L296) |
 | 隐藏环境变量 | method | L684-L707 | [stack.rs](crates/nu-protocol/src/engine/stack.rs#L684-L707) | [L684-L707](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-protocol/src/engine/stack.rs#L684-L707) |
+| 获取环境变量名集合 | method | L493-L529 | [stack.rs](crates/nu-protocol/src/engine/stack.rs#L493-L529) | [L493-L529](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-protocol/src/engine/stack.rs#L493-L529) |
 
 ### 作用域创建
 
@@ -1148,7 +1153,7 @@ Overlay 是环境变量和命令的命名空间，可以激活/停用。
 | **当前作用域导入** | export-env 命令 | method (run) | L40-L67 | [export_env.rs](crates/nu-command/src/env/export_env.rs#L40-L67) | [L40-L67](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-command/src/env/export_env.rs#L40-L67) |
 | **外部命令转换** | env_to_strings | pub fn | L175-L192 | [env.rs](crates/nu-engine/src/env.rs#L175-L192) | [L175-L192](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-engine/src/env.rs#L175-L192) |
 | **外部命令转换** | env_to_string | pub fn | L129-L172 | [env.rs](crates/nu-engine/src/env.rs#L129-L172) | [L129-L172](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-engine/src/env.rs#L129-L172) |
-| **外部命令转换** | run-external 命令设置环境 | method (create_command) | L174-L180 | [run_external.rs](crates/nu-command/src/system/run_external.rs#L174-L180) | [L174-L180](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-command/src/system/run_external.rs#L174-L180) |
+| **外部命令转换** | run-external 命令设置环境 | method (run) | L174-L180 | [run_external.rs](crates/nu-command/src/system/run_external.rs#L174-L180) | [L174-L180](https://github.com/feng0732/nushell/blob/4f66ac1b00e93541e7f91a96649fc8e1efe4c672/crates/nu-command/src/system/run_external.rs#L174-L180) |
 
 ### ENV_CONVERSIONS 转换
 
