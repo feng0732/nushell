@@ -361,26 +361,75 @@ Nushell 对循环导入和重复导入有**两层机制**，且执行顺序非�
 
 **目标**：避免同一个文件被**重复解析**。
 
-#### 7.2.1 文件内容 → Span 的映射
+#### 7.2.1 路径解析与绝对化
 
-`StateWorkingSet::add_file` 在 `crates/nu-protocol/src/engine/state_working_set.rs#L339-L359` 中：
+在调用 `add_file` 之前，用户输入的模块路径会先经过 **`find_in_dirs` → `find_in_dirs_with_id`** 解析（定义于 `crates/nu-parser/src/parse_source.rs#L621-L690`）：
+
+```
+用户输入路径（如 "./mymod" 或 "mymod"）
+    ↓
+① 先查 virtual paths（内置嵌入式模块）
+    ↓ 未命中
+② absolute_with(filename, actual_cwd)   ← 关键：路径绝对化
+    │  actual_cwd 来自 FileStack.top()（当前正在解析的文件的目录）
+    │  absolute_with 会：展开 ~ / 解析 .. / 调用 std::path::absolute
+    │  不会做 canonicalize（不解析软链/符号链接）
+    ↓ p.exists() 为真 → 返回 ParserPath::RealPath(绝对路径)
+    ↓ 否则
+③ 遍历 $NU_LIB_DIRS 中的每个目录，absolute_with 后查找
+    ↓ 命中 → 返回绝对化后的 ParserPath
+```
+
+因此，到达 `parse_module_file` 的 `path: ParserPath` 中的 `RealPath(p)` **已经是一条经过绝对化处理但未做物理路径规范化的绝对路径**。
+
+#### 7.2.2 文件登记：文件名 + 内容字节逐字节比较（非哈希）
+
+`StateWorkingSet::add_file` 在 `crates/nu-protocol/src/engine/state_working_set.rs#L339-L359` 中实现文件去重登记：
 
 ```rust
 pub fn add_file(&mut self, filename: &str, contents: &[u8]) -> FileId {
-    // 先检查：(文件名 + 文件内容) 完全一致的文件是否已存在
+    // 线性扫描已登记的所有文件（permanent_state.files + delta.files）
     for (idx, cached_file) in self.files().enumerate() {
-        if &*cached_file.name == filename && &*cached_file.content == contents {
-            return FileId::new(idx);  // 直接复用旧 FileId → 同一个 Span
+        // 逐字节字符串比较文件名（路径字符串）
+        if &*cached_file.name == filename
+            // 并且逐字节比较文件内容（整份文件字节切片）
+            && &*cached_file.content == contents
+        {
+            return FileId::new(idx);  // 命中：复用旧 FileId → 同一个 Span
         }
     }
-    // 否则分配新的 covered_span
+    // 未命中：分配新的 covered_span，追加 CachedFile
     ...
 }
 ```
 
-这意味着：**同一个物理文件（路径+内容一致）无论被导入多少次，始终获得相同的 Span**。这是缓存命中的前提。
+**核心事实**：
+- ❌ **不是哈希比较**：没有计算 MD5/SHA 等哈希值，是对 `&[u8]` 内容做**完整字节切片比较**（`slice == slice` 的 O(n) 逐字节比较）
+- ❌ **不是物理文件相等判断**：仅比较路径字符串（而非 inode / 文件句柄），因此同一物理文件通过不同路径形式访问可能被视为不同文件
+- ✅ **文件名来自 `path.path().to_string_lossy()`**：即上一步 absolute_with 后的绝对路径字符串（不是用户原始输入路径）
+- ✅ **文件名比较是字符串级别的**：区分大小写，逐字符完全一致才算匹配
 
-#### 7.2.2 Span → ModuleId 的查找
+`parse_module_file` 中的调用（`crates/nu-parser/src/parse_module.rs#L734`）：
+```rust
+let file_id = working_set.add_file(&path.path().to_string_lossy(), &contents);
+```
+
+#### 7.2.3 缓存复用的精确边界条件
+
+缓存复用的链路为：**文件登记去重 → Span 相同 → find_module_by_span 命中**
+
+| 场景 | add_file 是否复用 | find_module_by_span 是否命中 | 原因 |
+|------|-----------------|----------------------------|------|
+| 同一路径字符串 + 内容不变 | ✅ 复用 | ✅ 命中（模块已注册后） | 路径+内容完全相同 |
+| 同一物理文件，通过相对路径的不同写法（如 `./a.nu` vs `subdir/../a.nu`） | ✅ 复用 | ✅ 命中 | `absolute_with` 会解析 `..`，得到同一绝对路径 |
+| 同一物理文件，通过软链 vs 真实路径分别访问 | ❌ **不复用** | ❌ 未命中 | `absolute_with` 不调用 canonicalize，软链路径保持原样，字符串不同 |
+| 同一路径 + 内容有 1 字节变更 | ❌ 不复用 | ❌ 未命中 | 内容字节比较失败 |
+| Windows 下 `C:\A.nu` vs `c:\a.nu` | ⚠️ 取决于 PathBuf 语义 | ⚠️ 取决于 `to_string_lossy` | PathBuf 大小写敏感，字符串比较也区分大小写 |
+| 不同路径但文件内容完全相同（两份拷贝） | ❌ 不复用 | ❌ 未命中 | 路径字符串不同，即使内容一样也视为不同文件 |
+
+**关键边界**：`add_file` 的文件名来源是已经过 `absolute_with` 绝对化的路径字符串，因此相对路径的不同写法通常会被归一化为相同路径；但**软链、大小写差异、跨驱动器等情况会导致同一物理文件被登记为多条记录**。
+
+#### 7.2.4 Span → ModuleId 的查找
 
 `StateWorkingSet::find_module_by_span` 在 `crates/nu-protocol/src/engine/state_working_set.rs#L1029-L1040`：
 
@@ -403,25 +452,48 @@ pub fn find_module_by_span(&self, span: Span) -> Option<ModuleId> {
 ```
 
 **命中条件**（两者必须同时满足）：
-1. 已有一个 Module 的 `span` 与当前文件的 Span 相等
+1. 已有一个 Module 的 `span` 与当前文件的 Span 相等（Span 相等的前提是 `add_file` 内容+路径都匹配）
 2. `module_needs_reloading()` 返回 false（文件内容未变、子模块也未变）
 
-#### 7.2.3 缓存生效的边界条件
+#### 7.2.5 时间维度：解析完成前后的缓存行为差异
 
-缓存机制能避免重复解析，但**有严格的时间边界**：
+缓存机制能避免重复解析，但**有严格的时间边界**（Span 相同不代表 find_module_by_span 一定命中）：
 
-| 场景 | 是否命中缓存 | 原因 |
-|------|-------------|------|
-| 同一文件在解析完成后再次被 `use` | ✅ 命中 | 已完成 ⑥ `add_module()`，span→ModuleId 映射存在 |
-| 同一文件在**解析过程中**被循环引用 | ❌ 未命中 | 还没执行到 ⑥，模块还没注册到全局表 |
-| 文件内容发生变更 | ❌ 未命中 | `module_needs_reloading()` 返回 true |
-| 同一个目录通过不同路径（软链/别名）导入 | ⚠️ 视情况 | `add_file()` 比较的是路径字符串，非物理路径 |
+| 场景 | add_file 复用 Span | find_module_by_span 命中 | 原因 |
+|------|-------------------|------------------------|------|
+| 同一文件在解析完成后再次被 `use` | ✅ 复用 | ✅ 命中 | 已完成 ⑥ `add_module()`，span→ModuleId 映射存在 |
+| 同一文件在**解析过程中**被循环引用 | ✅ 复用（如果路径+内容相同） | ❌ 未命中 | 还没执行到 ⑥，模块还没注册到全局模块表 |
+| 文件内容发生变更 | ❌ 不复用 | ❌ 未命中 | 内容字节比较失败，add_file 分配新 Span |
+| 同一物理文件通过软链 vs 真实路径分别导入 | ❌ 不复用 | ❌ 未命中 | 路径字符串不同（未 canonicalize），add_file 认为是两个文件 |
+
+> **重要推论**：在真正的循环依赖（A→B→A）场景中，虽然 `add_file` 可能因为内容相同而复用 Span，但 **find_module_by_span 不会命中**（因为 A 尚未完成 add_module 注册），因此流程会继续走到 FileStack.push 的循环检测环节。这是两层机制的**协作关系**。
 
 ### 7.3 第二层：FileStack 显式循环检测
 
 **目标**：捕获"解析调用栈中的循环"——即 A 解析未完成时，B 通过 `use` 链再次请求解析 A。
 
-#### 7.3.1 FileStack 数据结构
+#### 7.3.1 入栈路径的来源：与 add_file 共享绝对化路径
+
+在 `parse_module_file` 中，FileStack 和 add_file 使用的路径是**同一个 `ParserPath` 对象的两种表达方式**：
+
+```rust
+// crates/nu-parser/src/parse_module.rs#L734, L743
+let file_id = working_set.add_file(&path.path().to_string_lossy(), &contents);
+//                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//                                 ParserPath.path() → &Path → to_string_lossy()
+// ...
+if let Err(e) = working_set.files.push(path.clone().path_buf(), path_span) {
+//                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//                                 ParserPath.path_buf() → PathBuf（消费 ParserPath）
+```
+
+两者都基于 `find_in_dirs` 返回的 `ParserPath::RealPath(绝对化路径)`，因此：
+- **add_file 比较的**：路径字符串（`&str`）+ 内容字节（`&[u8]`）
+- **FileStack 比较的**：`PathBuf`（Rust 标准库路径类型，使用平台原生的 `PartialEq` 实现）
+
+两者底层字节一致，但数据类型不同。
+
+#### 7.3.2 FileStack 数据结构与路径比较语义
 
 定义于 `crates/nu-protocol/src/engine/state_working_set.rs#L1180-L1240`：
 
@@ -437,11 +509,12 @@ pub fn find_module_by_span(&self, span: Span) -> Option<ModuleId> {
 pub struct FileStack(Vec<PathBuf>);
 ```
 
-#### 7.3.2 循环检测核心算法
+#### 7.3.3 循环检测核心算法
 
 ```rust
 pub fn push(&mut self, path: PathBuf, span: Span) -> Result<(), ParseError> {
     // 从栈顶逆序查找：找到最近一次出现该路径的位置
+    // p == &path 使用 PathBuf 的 PartialEq 实现（按字节比较原始路径组件）
     if let Some(i) = self.0.iter().rposition(|p| p == &path) {
         // 构造错误消息，展示完整的循环链
         let filenames: Vec<String> = self.0[i..]
@@ -463,7 +536,26 @@ pub fn push(&mut self, path: PathBuf, span: Span) -> Result<(), ParseError> {
 CircularImport(String, #[label = "detected circular import"] Span)
 ```
 
-#### 7.3.3 入栈/出栈的精确位置
+**`PathBuf == PathBuf` 的比较语义**：
+- 逐组件（component）比较字节，不做规范化
+- 不解析符号链接 / 软链
+- Windows 上大小写敏感（`C:\A.nu` ≠ `C:\a.nu`）
+- 尾随路径分隔符不影响比较（`/a/b` ≡ `/a/b/`）
+
+因此，和 `add_file` 一样，FileStack 也是**字符串级别的路径等价**，非物理文件级别的等价。
+
+#### 7.3.4 FileStack 与 add_file 路径比较的对齐性
+
+| 场景 | add_file（字符串比较） | FileStack（PathBuf 比较） | 是否一致 |
+|------|----------------------|--------------------------|---------|
+| 相对路径不同写法（`./a` vs `dir/../a`） | ✅ 相等（absolute_with 归一化） | ✅ 相等（absolute_with 归一化） | ✅ 一致 |
+| 软链 vs 真实路径 | ❌ 不等（字符串不同） | ❌ 不等（PathBuf 字节不同） | ✅ 一致 |
+| Windows 大小写不同 | ❌ 不等（字符串不同） | ❌ 不等（PathBuf 比较也区分大小写） | ✅ 一致 |
+| 同文件不同驱动器路径映射 | ❌ 不等 | ❌ 不等 | ✅ 一致 |
+
+**结论**：由于两者的路径都源自同一个 `ParserPath`（经过 `absolute_with` 处理），因此 FileStack 和 add_file 的路径判断结果在实际中是**一致**的——如果 add_file 认为是同一文件（复用 Span），FileStack 也会认为是同一路径（触发循环检测），反之亦然。
+
+#### 7.3.5 入栈/出栈的精确位置
 
 在文件模块解析（`parse_module_file`）中：
 - **入栈**：`crates/nu-parser/src/parse_module.rs#L743`，在缓存检查**之后**、实际解析**之前**
@@ -473,14 +565,15 @@ CircularImport(String, #[label = "detected circular import"] Span)
 - 入栈：`#L119` / `#L317`
 - 出栈：`#L135` / `#L333`
 
-#### 7.3.4 FileStack 的边界
+#### 7.3.6 FileStack 的边界
 
 | 场景 | 是否触发 CircularImport | 原因 |
 |------|------------------------|------|
 | A.nu → use B.nu → use A.nu（真正的循环） | ✅ 报错 | A 在栈中，B 解析中再次 push A 被检测 |
 | A.nu → use B.nu → use C.nu；D.nu → use B.nu | ❌ 不触发 | B 首次解析完后已 pop 出栈；D→B 走缓存命中（第二层不被执行） |
 | 内联模块 `module foo { ... }` | ❌ 不触发 | 直接调用 `parse_module_block`，绕过 `parse_module_file`，不经过 FileStack |
-| 同文件通过不同路径字符串导入（`./a.nu` vs `../dir/a.nu`） | ⚠️ 可能漏报 | `PathBuf` 比较是逐字节字符串比较，不做路径规范化 |
+| 同文件通过不同路径字符串导入（`./a.nu` vs `../dir/a.nu`） | ❌ 不会漏报（正常不触发） | 经过 `absolute_with` 归一化为同一路径 |
+| 同物理文件通过软链和真实路径分别访问 | ⚠️ 可能漏报 | 路径未做 canonicalize，路径字符串不同 |
 | `overlay use` 一个模块 | ✅ 经过检测 | `overlay use` 内部同样调用模块解析流程 |
 
 ### 7.4 典型场景推演
@@ -604,9 +697,12 @@ pub struct ScopeData<'e, 's> {
 | **名称前缀** | `decls_with_head` 将导出名包装为 `<module> <decl>` | `crates/nu-protocol/src/module.rs#L352-L369` |
 | **可见性控制** | `Visibility` 哈希表，hide 只是标记不可见而非删除 | `crates/nu-protocol/src/engine/overlay.rs#L8-L44` |
 | **前向引用** | 两阶段解析：先预声明所有 def，再解析函数体 | `crates/nu-parser/src/parse_module.rs#L510-L514` |
-| **重复导入复用** | `add_file()` 内容哈希 + `find_module_by_span()` 线性扫描，模块注册后后续导入直接复用 | `crates/nu-protocol/src/engine/state_working_set.rs#L339-L359`、`#L1029-L1040` |
-| **循环导入检测** | `FileStack` 栈式跟踪当前解析链，`push()` 时检测重复并抛出 `CircularImport` | `crates/nu-protocol/src/engine/state_working_set.rs#L1180-L1240` |
-| **检测优先级** | 先查 span 缓存（已解析完成的模块）→ 再查 FileStack（解析中循环） | `crates/nu-parser/src/parse_module.rs#L737-L746` |
+| **路径绝对化** | `absolute_with` 展开 `~`、解析 `..`、调用 `std::path::absolute`；**不做** canonicalize（不解析软链） | `crates/nu-path/src/expansions.rs#L73-L82`、`crates/nu-parser/src/parse_source.rs#L661-L685` |
+| **文件登记去重** | `add_file()` 线性扫描，**逐字节比较**（路径字符串 `&str == &str` + 文件内容 `&[u8] == &[u8]`），无哈希 | `crates/nu-protocol/src/engine/state_working_set.rs#L339-L359` |
+| **重复导入复用** | `find_module_by_span()` 线性扫描已注册模块的 span（要求模块已完成 `add_module` 注册） | `crates/nu-protocol/src/engine/state_working_set.rs#L1029-L1040` |
+| **循环导入检测** | `FileStack` 栈式跟踪当前解析链，`push()` 时 `PathBuf == PathBuf` 比较，命中抛出 `CircularImport` | `crates/nu-protocol/src/engine/state_working_set.rs#L1180-L1240` |
+| **检测优先级** | `add_file` → `find_module_by_span`（时间维度：解析完成后命中）→ `files.push`（时间维度：解析中循环检测） | `crates/nu-parser/src/parse_module.rs#L734-L746` |
 | **别名实现** | Alias 实现 Command trait，是命令包装器而非文本替换 | `crates/nu-protocol/src/alias.rs#L22-L68` |
 | **热重载** | `module_needs_reloading` 递归检查文件内容 + imported_modules 链 | `crates/nu-parser/src/parse_module.rs#L666-L704` |
 | **Overlay 系统** | 每个 ScopeFrame 可有多个 Overlay，支持动态激活/移除 | `crates/nu-protocol/src/engine/overlay.rs#L47-L177` |
+| **路径比较一致性** | add_file（字符串）和 FileStack（PathBuf）共享同一 `ParserPath` 来源，实际行为一致（软链/大小写场景同时不命中） | `crates/nu-parser/src/parse_module.rs#L734, L743` |
