@@ -411,6 +411,14 @@ pub struct ErrorSource(Arc<dyn StdError + Send + Sync>);
 
 `GenericError::diagnostic_source()` 返回 `self.source` 中的引用，miette 可以递归展示错误链。
 
+**GenericError 的 code 回退链（最完整）：**
+1. `GenericError::new()` 时 `self.code` 默认设为 `DEFAULT_CODE = "nu::shell::error"`（[generic.rs#L15](crates/nu-protocol/src/errors/shell_error/generic.rs#L15)、[generic.rs#L74](crates/nu-protocol/src/errors/shell_error/generic.rs#L74)）
+2. 可通过 `.with_code("nu::custom::code")` 覆盖 `self.code`
+3. `GenericError::code()` 总是返回 `Some(Box::new(self.code.as_ref()))`（[generic.rs#L169-L171](crates/nu-protocol/src/errors/shell_error/generic.rs#L169-L171)），**从不返回 None**
+4. 因此 CliError 的 `default_code` 对 GenericError 永远不会触发——GenericError 自己已经有了默认 code
+
+对比 `LabeledError`：它的 `self.code` 是 `Option<String>`，若创建时未设置则返回 `None`，这才会触发 CliError 的 default_code 回退。
+
 ### 4.4 LabeledError — 协议级错误
 
 [labeled_error.rs#L15-L34](crates/nu-protocol/src/errors/labeled_error.rs#L15-L34) 用于与插件和脚本交互，所有字段都是可序列化的：
@@ -451,8 +459,15 @@ impl From<ErrorLabel> for LabeledSpan {
             val.span.end - val.span.start,                // 长度
         )
     }
+```
+
+**LabeledError 的 code 转发**（[labeled_error.rs#L395-L396](crates/nu-protocol/src/errors/labeled_error.rs#L395-L396)）：
+```rust
+fn code<'a>(&'a self) -> Option<Box<dyn fmt::Display + 'a>> {
+    self.code.as_ref().map(Box::new).map(|b| b as _)
 }
 ```
+由于 `self.code` 是 `Option<String>`，创建时若未传 code 则返回 `None`，触发 CliError 的 `default_code` 回退机制。这与 GenericError 不同——GenericError 总有默认 code。
 
 空标签文本时 `then_some` 返回 `None`，miette 只显示下划线不显示文字。
 
@@ -469,6 +484,8 @@ impl From<ErrorLabel> for LabeledSpan {
 | `report_compile_error` | `CompileError` | `nu::compile::error` | 无 |
 | `report_shell_warning` | `ShellWarning` | `nu::shell::warning` | 去重（ReportLog / ReportMode） |
 | `report_parse_warning` | `ParseWarning` | `nu::parser::warning` | 去重 |
+| `report_experimental_option_warning` | `dyn Diagnostic` | `nu::experimental_option::warning` | 无 |
+| `format_cli_error` | `dyn Diagnostic` | 调用方传入（可选 `None`） | 仅格式化不打印 |
 
 所有入口最终调用 `report_error` 或 `report_warning`，流程相同：
 
@@ -497,9 +514,16 @@ struct CliError<'src> {
 }
 ```
 
-它实现 `Diagnostic` 时转发所有方法到 `self.diagnostic`，唯独重写 `source_code()`：
+它实现 `Diagnostic` 时，大部分方法透明转发到 `self.diagnostic`，但重写了两个关键方法：`code()`（补充默认值回退）和 `source_code()`（延迟绑定 working_set）：
 
 ```rust
+fn code<'a>(&'a self) -> Option<Box<dyn Display + 'a>> {
+    self.diagnostic.code().or_else(|| {
+        self.default_code
+            .map(|code| Box::new(code) as Box<dyn Display>)
+    })
+}
+
 fn source_code(&self) -> Option<&dyn SourceCode> {
     if let Some(source_code) = self.diagnostic.source_code() {
         Some(source_code)       // 错误自己提供源码（如 ErrorSite::Location）
@@ -509,7 +533,83 @@ fn source_code(&self) -> Option<&dyn SourceCode> {
 }
 ```
 
+**code() 回退逻辑（优先级从高到低）：**
+1. 错误自身通过 `#[diagnostic(code(...))]` 或 `self.code` 字段提供的具体错误码（如 `nu::parser::extra_tokens`）
+2. 入口函数传入的 `default_code`（如 `report_shell_error` 传入 `"nu::shell::error"`）
+3. 若以上都为 `None`，则不显示错误码（极少发生）
+
 **为什么需要延迟绑定？** 错误类型需要 `Clone` + `Serialize`（用于跨线程、跨插件传递），无法持有 `&StateWorkingSet` 引用。在报告阶段才将错误和源码关联起来。
+
+### 5.2.1 各诊断包装器的 code() 转发
+
+Nushell 的错误类型层层嵌套，每种包装器的 `code()` 行为不同，共同决定了最终输出的错误码：
+
+| 包装器 | code() 行为 | 调用位置 |
+|--------|------------|---------|
+| `ShellError` / `ParseError` / `CompileError` | 绝大多数变体通过 `#[diagnostic(code(nu::*))]` 属性宏提供具体错误码，由 miette derive 自动生成返回 `Some(Box::new("nu::*"))` | [shell_error/mod.rs#L30](crates/nu-protocol/src/errors/shell_error/mod.rs#L30) |
+| `GenericError` | 总是返回 `Some(Box::new(self.code.as_ref()))`，`self.code` 在 `new()` 时默认设为 `DEFAULT_CODE = "nu::shell::error"`，可通过 `with_code()` 覆盖 | [generic.rs#L15-L171](crates/nu-protocol/src/errors/shell_error/generic.rs#L15-L171) |
+| `ChainedError::first=true` | 透明转发 `self.sources[0].code()`，和首元素行为一致 | [chained_error.rs#L64-L66](crates/nu-protocol/src/errors/chained_error.rs#L64-L66) |
+| `ChainedError::first=false` | 返回固定字符串 `"chained_error"`，不再向下转发 | [chained_error.rs#L68](crates/nu-protocol/src/errors/chained_error.rs#L68) |
+| `LabeledError` | `self.code.as_ref().map(Box::new)`，若创建时未传 `code` 则返回 `None`，触发 CliError 的 default_code 回退 | [labeled_error.rs#L395-L396](crates/nu-protocol/src/errors/labeled_error.rs#L395-L396) |
+| `IoError` | 根据 `self.kind` 动态构造，如 `nu::shell::io::not_found`、`nu::shell::io::permission_denied` | [io.rs#L490-L530](crates/nu-protocol/src/errors/shell_error/io.rs#L490-L530) |
+| `DnsError` | 转发 `self.kind.code()`，每种 DNS 错误有独立 code | [network.rs#L32-L33](crates/nu-protocol/src/errors/shell_error/network.rs#L32-L33) |
+
+**关键结论：** `CliError.code()` 是整个链路的最后一关——它先问"错误自己有 code 吗？"，没有的话再用入口函数给的 `default_code` 兜底。这意味着：
+- `ShellError::ExtraTokens`（带 `#[diagnostic(code(nu::parser::extra_tokens))]`）→ 显示 `nu::parser::extra_tokens`
+- 未设置 `code` 的 `LabeledError` → 回退到入口 default_code（如 `nu::shell::error`）
+- `ChainedError::first=false` → 显示固定 `chained_error`
+- `GenericError::new()`（未 with_code）→ 显示 `nu::shell::error`
+
+### 5.2.2 错误码生成完整路径
+
+从错误产生到最终显示，错误码经过四层决策链：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  1. 报告入口 — 传入 default_code 兜底值                      │
+│     report_shell_error   → "nu::shell::error"                │
+│     report_parse_error   → "nu::parser::error"               │
+│     report_compile_error → "nu::compile::error"              │
+│     report_parse_warning → "nu::parser::warning"             │
+│     ...                                                     │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  2. 错误类型自身 — 通过多种方式提供具体 code                  │
+│                                                             │
+│  a) #[diagnostic(code(...))] 过程宏（最常见）                │
+│     ShellError::ExtraTokens → "nu::parser::extra_tokens"    │
+│                                                             │
+│  b) 字段存储 + 手动实现                                      │
+│     GenericError.code  → 总是 Some(DEFAULT_CODE)             │
+│     LabeledError.code  → Option<String>（可能 None）         │
+│                                                             │
+│  c) 动态构造                                                │
+│     IoError → "nu::shell::io::not_found" 等                  │
+│     DnsError → "nu::shell::network::dns::fail" 等           │
+│                                                             │
+│  d) 包装器转发                                              │
+│     ChainedError::first=true  → 转发 sources[0].code()       │
+│     ChainedError::first=false → 固定 "chained_error"         │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  3. CliError.code() — 优先级决策                            │
+│     self.diagnostic.code()      ← 先试错误自身               │
+│         .or_else(default_code)  ← 没有就用入口兜底           │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  4. miette 渲染 — 若 Some(code) 则显示在 Error: 后           │
+│     Error: nu::parser::extra_tokens                         │
+│            ↑ 就是这里                                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**设计意图：** 两层默认值机制（GenericError 内部 DEFAULT_CODE + CliError 入口 default_code）确保了**错误码永不缺失**——即使开发者忘了设置具体 code，用户也至少能看到 `nu::shell::error` 这样的分类码，便于搜索和问题定位。
 
 ### 5.3 Debug trait 触发渲染
 
@@ -802,12 +902,12 @@ report_parse_error(stack, working_set, &parse_error);
 
 **4. Debug 格式化** — 读取配置，创建 `MietteHandler`
 
-**5. miette 收集诊断信息**
-- `diagnostic.code()` → `Some("nu::parser::extra_tokens")` （由 `#[diagnostic(code(...))]` 提供，覆盖 default_code）
-- `diagnostic.to_string()` → `"Extra tokens in code."`
-- `diagnostic.help()` → `Some("Try removing them.")`
-- `diagnostic.labels()` → 一个 `LabeledSpan { offset: span.start, len: span.end - span.start, label: Some("extra tokens") }`
-- `diagnostic.source_code()` → `None`，回退到 `working_set`
+**5. miette 收集诊断信息（经 CliError 转发）**
+- `CliError.code()` → 先调 `ParseError.code()` 返回 `Some("nu::parser::extra_tokens")`（由 `#[diagnostic(code(...))]` 提供，不为 None，因此跳过 default_code 回退）
+- `CliError.to_string()` → 转发 `diagnostic.to_string()` → `"Extra tokens in code."`
+- `CliError.help()` → 转发 → `Some("Try removing them.")`
+- `CliError.labels()` → 转发 → 一个 `LabeledSpan { offset: span.start, len: span.end - span.start, label: Some("extra tokens") }`
+- `CliError.source_code()` → `diagnostic.source_code()` 返回 `None`，回退到 `&self.working_set`
 
 **6. 源码读取** — miette 调用 `working_set.read_span(span, context_lines_before, context_lines_after)`
 - 遍历 `files()` 找到 `covered_span` 包含该 span 的 CachedFile
