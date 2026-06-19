@@ -252,9 +252,124 @@ ReedlineEvent::ViChangeMode(mode.as_str()?.to_owned())
 
 ---
 
-## 三、输入循环
+## 三、菜单加载与键位触发的配合
 
-### 3.1 REPL 主循环
+### 3.1 菜单加载
+
+REPL 中通过 `add_menus` 函数（`crates/nu-cli/src/reedline_config.rs`）在每次循环迭代时重新加载所有菜单：
+
+```rust
+pub(crate) fn add_menus(
+    mut line_editor: Reedline,
+    engine_state_ref: Arc<EngineState>,
+    stack: &Stack,
+    config: Arc<Config>,
+) -> Result<Reedline, ShellError> {
+    // 先清空已有菜单
+    line_editor = line_editor.clear_menus();
+
+    // 加载用户配置的菜单
+    for menu in &config.menus {
+        line_editor = add_menu(line_editor, menu, ...)?
+    }
+
+    // 检查并加载默认菜单（如果用户未覆盖）
+    let default_menus = [
+        ("completion_menu", DEFAULT_COMPLETION_MENU),
+        ("ide_completion_menu", DEFAULT_IDE_COMPLETION_MENU),
+        ("history_menu", DEFAULT_HISTORY_MENU),
+        ("help_menu", DEFAULT_HELP_MENU),
+    ];
+    // ... 解析并添加默认菜单
+}
+```
+
+**默认菜单**：
+- `completion_menu`：常规补全菜单（Tab 触发）
+- `ide_completion_menu`：IDE 风格补全菜单（Ctrl+Space 触发）
+- `history_menu`：历史搜索菜单（Ctrl+R 触发）
+- `help_menu`：帮助菜单（F1 触发）
+
+### 3.2 菜单键位绑定
+
+`add_menu_keybindings` 函数（`crates/nu-cli/src/reedline_config.rs`）为菜单添加默认键位绑定：
+
+```rust
+fn add_menu_keybindings(keybindings: &mut Keybindings) {
+    // Tab：补全菜单（优先菜单，其次下一项，最后默认补全）
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("completion_menu".to_string()),
+            ReedlineEvent::MenuNext,
+            ReedlineEvent::Edit(vec![EditCommand::Complete]),
+        ]),
+    );
+
+    // Ctrl+Space：IDE 补全菜单
+    keybindings.add_binding(
+        KeyModifiers::CONTROL,
+        KeyCode::Char(' '),
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("ide_completion_menu".to_string()),
+            ReedlineEvent::MenuNext,
+            ReedlineEvent::Edit(vec![EditCommand::Complete]),
+        ]),
+    );
+
+    // Shift+Tab：上一个菜单项
+    keybindings.add_binding(
+        KeyModifiers::SHIFT,
+        KeyCode::BackTab,
+        ReedlineEvent::MenuPrevious,
+    );
+
+    // Ctrl+R：历史菜单
+    keybindings.add_binding(
+        KeyModifiers::CONTROL,
+        KeyCode::Char('r'),
+        ReedlineEvent::Menu("history_menu".to_string()),
+    );
+
+    // F1：帮助菜单
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::F(1),
+        ReedlineEvent::Menu("help_menu".to_string()),
+    );
+    // ...
+}
+```
+
+### 3.3 配合机制
+
+菜单加载和键位触发通过**菜单名称**关联，形成完整的交互链路：
+
+```
+┌─────────────────┐     名称匹配      ┌─────────────────┐
+│   菜单键位绑定   │ ───────────────▶ │   菜单实例       │
+│ (keybindings)   │                   │ (add_menus)      │
+└─────────────────┘                   └─────────────────┘
+         ▲                                      │
+         │                                      ▼
+┌─────────────────┐                   ┌─────────────────┐
+│  用户按键触发    │ ───────────────▶ │  菜单显示/交互   │
+│  (reedline 内部) │                   │  (reedline 内部) │
+└─────────────────┘                   └─────────────────┘
+```
+
+**关键点**：
+1. **名称一致**：键位绑定中的菜单名（如 `"completion_menu"`）必须与 `add_menus` 中注册的菜单名完全一致
+2. **UntilFound 机制**：Tab 键使用 `UntilFound` 事件链，依次尝试打开菜单、切换到下一项、执行默认补全，保证降级可用
+3. **每次迭代重建**：菜单和键位都在每次循环迭代时重新构建，确保配置变更立即生效
+4. **用户可覆盖**：用户可以在配置文件中定义同名菜单来覆盖默认菜单，也可以添加新的键位绑定
+
+---
+
+## 四、输入循环
+
+### 4.1 REPL 主循环
 
 #### 主循环结构
 
@@ -338,7 +453,7 @@ loop {
    prompt_update::update_prompt(config, engine_state, &mut Stack::with_parent(stack_arc.clone()), nu_prompt);
    ```
 
-7. **预填缓冲区**（从 engine_state 恢复）
+7. **预填缓冲区**（从 engine_state 恢复，HostCommand 后跳过）
    ```rust
    if !*is_hostcommand {
        line_editor = flush_engine_state_repl_buffer(engine_state, line_editor);
@@ -364,6 +479,46 @@ loop {
 - `Signal::CtrlC`：用户按下 Ctrl+C，取消当前输入
 - `Signal::CtrlD`：用户按下 Ctrl+D，退出 REPL
 
+#### HostCommand 与缓冲区处理
+
+`Signal::HostCommand` 是一种特殊的输入信号，由用户按下绑定了 `ExecuteHostCommand` 事件的键触发。它会影响下一次循环迭代的缓冲区处理：
+
+```rust
+// 读取输入后
+match input {
+    Ok(Signal::HostCommand(command)) => {
+        *is_hostcommand = true;  // 标记为 HostCommand
+        line_editor = run_command(RunContext { ... });
+    }
+    // ...
+}
+```
+
+在下一次循环迭代中：
+
+```rust
+// 预填缓冲区前检查 is_hostcommand 标志
+if !*is_hostcommand {
+    line_editor = flush_engine_state_repl_buffer(engine_state, line_editor);
+}
+*is_hostcommand = false;  // 重置标志
+```
+
+**为什么 HostCommand 后要跳过缓冲区预填？**
+
+根据代码注释（`crates/nu-cli/src/repl.rs`）：
+
+> If we don't flush the engine state, then the pre_prompt and env_change hooks cannot modify the commandline. But if we always flush the engine state, then the modification to the commandline done in ExecuteHostCommand will be overridden.
+
+原因分析：
+1. **reedline 缓冲区是有状态的**：reedline 实例跨循环迭代复用，其内部缓冲区在 `read_line` 返回后仍然保留着用户输入的内容
+2. **正常情况需要清空**：普通命令（Success 信号）执行后，下一次迭代应该从空行开始，因此需要 `flush_engine_state_repl_buffer` 来清空缓冲区（此时 `repl.buffer` 为空）
+3. **HostCommand 语义特殊**：HostCommand 通常用于在不提交当前行的情况下执行辅助操作（如打开外部选择器、修改当前行内容等）。执行后用户应该继续在当前行上编辑，而不是开始新的一行
+4. **flush 会覆盖内容**：如果 HostCommand 执行后调用 flush，会用 `engine_state.repl_state.buffer`（可能是空的）覆盖 reedline 内部缓冲区，导致用户之前输入的内容丢失
+5. **pre_prompt 钩子的冲突**：pre_prompt / env_change 钩子可能修改 `repl_state.buffer`，这些修改通过 flush 生效。但在 HostCommand 场景下，这些钩子的修改可能与 HostCommand 对缓冲区的修改产生冲突
+
+因此，`is_hostcommand` 标志作为一种保护机制，确保 HostCommand 执行后 reedline 的缓冲区状态被完整保留到下一次编辑会话中。
+
 #### 命令执行
 
 输入处理后，通过 `run_command` 函数（`crates/nu-cli/src/repl.rs`）执行命令：
@@ -379,7 +534,7 @@ fn run_command(ctx: RunContext) -> Reedline
 4. 更新历史记录结果元数据
 5. 运行 shell integration ANSI 序列
 
-### 3.2 input 命令输入循环
+### 4.2 input 命令输入循环
 
 input 命令的输入循环非常简单，只有单次 read_line 调用：
 
@@ -409,15 +564,15 @@ match line_editor.read_line(&prompt) {
 
 ---
 
-## 四、历史记录预填路径
+## 五、历史记录预填路径
 
-### 4.1 REPL 历史记录
+### 5.1 REPL 历史记录
 
 REPL 的历史记录在 `get_line_editor` 阶段初始化后持续存在，跨循环迭代复用。历史条目自动从文件加载，新的输入自动追加。
 
 关键文件：`crates/nu-cli/src/repl.rs` 中的 `setup_history` 和 `update_line_editor_history` 函数。
 
-### 4.2 input 命令历史记录
+### 5.2 input 命令历史记录
 
 input 命令有两种历史记录来源：
 
@@ -456,9 +611,9 @@ let file_history = match history_file_val {
 
 ---
 
-## 五、默认值预填路径
+## 六、默认值预填路径
 
-### 5.1 REPL 缓冲区恢复
+### 6.1 REPL 缓冲区恢复
 
 REPL 使用 `ReplState` 机制在循环迭代间传递缓冲区内容，通过 `flush_engine_state_repl_buffer` 函数（`crates/nu-cli/src/repl.rs`）预填：
 
@@ -501,7 +656,9 @@ pub struct ReplState {
 - `ExecuteHostCommand` 等特殊操作后保留缓冲区状态
 - 实现跨迭代的缓冲区状态传递
 
-### 5.2 input 命令默认值预填
+**注意**：HostCommand 执行后的下一次迭代会跳过 flush，保留 reedline 内部的缓冲区状态。
+
+### 6.2 input 命令默认值预填
 
 input 命令通过 `prefill_reedline_buffer` 函数（`crates/nu-command/src/platform/input/input_.rs`）预填默认值：
 
@@ -539,7 +696,7 @@ match default_val {
 }
 ```
 
-### 5.3 预填技术对比
+### 6.3 预填技术对比
 
 | 特性 | REPL (flush_engine_state_repl_buffer) | input (prefill_reedline_buffer) |
 |------|--------------------------------------|----------------------------------|
@@ -548,35 +705,125 @@ match default_val {
 | 光标位置 | 可指定位置 | 自动在末尾 |
 | 额外功能 | 支持立即提交（accept） | 无 |
 | 数据来源 | engine_state.repl_state | 命令参数 `--default` |
-| 调用频率 | 每次循环迭代 | 仅在 input 命令执行时 |
+| 调用频率 | 每次循环迭代（HostCommand 后跳过） | 仅在 input 命令执行时 |
 
 ---
 
-## 六、三者关系图
+## 七、提示符与模式
+
+### 7.1 NushellPrompt 结构
+
+`NushellPrompt`（`crates/nu-cli/src/prompt.rs`）实现了 reedline 的 `Prompt` trait，支持多种模式的提示符指示符：
+
+```rust
+pub struct NushellPrompt {
+    left_prompt: Option<String>,
+    right_prompt: Option<String>,
+    prompt_indicator: Option<String>,       // Emacs/Default 模式指示器
+    vi_insert_prompt_indicator: Option<String>,  // Vi Insert 模式指示器
+    vi_normal_prompt_indicator: Option<String>,  // Vi Normal 模式指示器
+    multiline_indicator: Option<String>,    // 多行指示器
+    render_right_prompt_on_last_line: bool,
+}
+```
+
+### 7.2 提示符更新
+
+提示符内容通过 `update_prompt` 函数（`crates/nu-cli/src/prompt_update.rs`）从环境变量中动态获取：
+
+```rust
+pub fn update_prompt(
+    config: &Config,
+    engine_state: &EngineState,
+    stack: &mut Stack,
+    nu_prompt: &mut NushellPrompt,
+) {
+    // 从环境变量读取提示符配置
+    let left_prompt_string = get_prompt_string(PROMPT_COMMAND, config, engine_state, stack);
+    let right_prompt_string = get_prompt_string(PROMPT_COMMAND_RIGHT, config, engine_state, stack);
+    let prompt_indicator_string = get_prompt_string(PROMPT_INDICATOR, config, engine_state, stack);
+    let prompt_multiline_string = get_prompt_string(PROMPT_MULTILINE_INDICATOR, config, engine_state, stack);
+    let prompt_vi_insert_string = get_prompt_string(PROMPT_INDICATOR_VI_INSERT, config, engine_state, stack);
+    let prompt_vi_normal_string = get_prompt_string(PROMPT_INDICATOR_VI_NORMAL, config, engine_state, stack);
+
+    // 应用到 NushellPrompt
+    nu_prompt.update_all_prompt_strings(...);
+}
+```
+
+**环境变量列表**：
+- `PROMPT_COMMAND`：左侧提示符（字符串或闭包）
+- `PROMPT_COMMAND_RIGHT`：右侧提示符
+- `PROMPT_INDICATOR`：Emacs/Default 模式指示器
+- `PROMPT_INDICATOR_VI_INSERT`：Vi Insert 模式指示器
+- `PROMPT_INDICATOR_VI_NORMAL`：Vi Normal 模式指示器
+- `PROMPT_MULTILINE_INDICATOR`：多行输入指示器
+- `TRANSIENT_*`：瞬态提示符版本（命令执行后显示）
+
+### 7.3 模式指示器渲染
+
+`render_prompt_indicator` 方法根据当前编辑模式返回对应的指示器字符串：
+
+```rust
+fn render_prompt_indicator(&self, edit_mode: PromptEditMode) -> Cow<'_, str> {
+    let indicator: &str = match edit_mode {
+        PromptEditMode::Default => self.prompt_indicator.as_deref().unwrap_or("> "),
+        PromptEditMode::Emacs => self.prompt_indicator.as_deref().unwrap_or("> "),
+        PromptEditMode::Vi(vi_mode) => match vi_mode {
+            PromptViMode::Normal => self.vi_normal_prompt_indicator.as_deref().unwrap_or("> "),
+            PromptViMode::Insert => self.vi_insert_prompt_indicator.as_deref().unwrap_or(": "),
+        },
+        PromptEditMode::Custom(str) => &self.default_wrapped_custom_string(str),
+    };
+    indicator.to_string().into()
+}
+```
+
+**默认值**（用户未配置环境变量时使用）：
+- Emacs/Default 模式：`> `
+- Vi Normal 模式：`> `
+- Vi Insert 模式：`: `
+
+### 7.4 模式切换与视觉反馈
+
+提示符模式指示器与编辑模式联动：
+1. 用户切换编辑模式（如按 Esc 从 Insert 进入 Normal）
+2. reedline 内部更新模式状态
+3. 重绘提示符时，reedline 调用 `render_prompt_indicator` 并传入当前模式
+4. `NushellPrompt` 根据模式返回对应的指示器字符串
+
+这为用户提供了即时的视觉反馈，让用户知道当前处于哪种编辑模式。
+
+---
+
+## 八、三者关系图
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        evaluate_repl (主循环)                         │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │                     loop_iteration (单次迭代)                   │  │
-│  │                                                               │  │
-│  │  ┌─────────────┐    ┌──────────────────┐    ┌──────────┐     │  │
-│  │  │  环境/钩子  │───▶│ Reedline 配置构建 │───▶│ read_line│     │  │
-│  │  │  预处理     │    │ (键位/高亮/补全…) │    │  (阻塞)  │     │  │
-│  │  └─────────────┘    └──────────────────┘    └────┬─────┘     │  │
-│  │                                                  │            │  │
-│  │  ┌─────────────┐    ┌─────────────┐             │            │  │
-│  │  │  命令执行   │◀───│  信号分发   │◀────────────┘            │  │
-│  │  └─────────────┘    └─────────────┘                          │  │
-│  │                                                               │  │
-│  │  ┌───────────────────────────────────────────┐                │  │
-│  │  │  缓冲区预填: flush_engine_state_repl_buffer│                │  │
-│  │  │  来源: engine_state.repl_state            │                │  │
-│  │  └───────────────────────────────────────────┘                │  │
-│  └───────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-│  历史记录: setup_history (REPL 启动时一次性初始化, 跨迭代复用)       │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          evaluate_repl (主循环)                           │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                       loop_iteration (单次迭代)                     │  │
+│  │                                                                   │  │
+│  │  ┌─────────────┐    ┌──────────────────┐    ┌──────────┐         │  │
+│  │  │  环境/钩子  │───▶│ Reedline 配置构建 │───▶│ read_line│         │  │
+│  │  │  预处理     │    │ (键位/菜单/高亮…) │    │  (阻塞)  │         │  │
+│  │  └─────────────┘    └──────────────────┘    └────┬─────┘         │  │
+│  │                                                  │                │  │
+│  │  ┌─────────────┐    ┌─────────────┐             │                │  │
+│  │  │  命令执行   │◀───│  信号分发   │◀────────────┘                │  │
+│  │  └─────────────┘    └─────────────┘                              │  │
+│  │                                                                   │  │
+│  │  ┌─────────────────────────────────────────────┐                  │  │
+│  │  │  缓冲区预填: flush_engine_state_repl_buffer  │                  │  │
+│  │  │  来源: engine_state.repl_state              │                  │  │
+│  │  │  条件: 上一次不是 HostCommand (!is_hostcommand)│                  │  │
+│  │  └─────────────────────────────────────────────┘                  │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│  历史记录: setup_history (REPL 启动时一次性初始化, 跨迭代复用)           │
+│  菜单&键位: 每次迭代重新构建 (add_menus + setup_keybindings)              │
+│  提示符:   每次迭代从环境变量更新 (update_prompt)                          │
+└─────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         input 命令 (单次)                            │
@@ -593,22 +840,23 @@ match default_val {
 │    - 管道输入列表 (history_entries)                                 │
 │    - --history-file 文件                                            │
 │  默认值来源: --default 参数                                         │
+│  无菜单、无自定义键位、使用 reedline 默认配置                       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 七、关键设计要点
+## 九、关键设计要点
 
-### 7.1 REPL：每次迭代重新配置
+### 9.1 REPL：每次迭代重新配置
 
-Reedline 的大部分配置（高亮、补全、菜单、键位等）在**每次循环迭代**时重新构建，而非一次性初始化。原因：
+Reedline 的大部分配置（高亮、补全、菜单、键位、提示符等）在**每次循环迭代**时重新构建，而非一次性初始化。原因：
 
 - 配置可能在运行时改变（如修改键位绑定）
 - 补全和高亮需要最新的 engine_state 和 stack 状态
 - 提示符内容需要动态更新
 
-### 7.2 REPL：Stack 引用管理
+### 9.2 REPL：Stack 引用管理
 
 由于 reedline 的插件（highlighter, completer, hinter 等）需要引用 stack，而 stack 在 REPL 循环中会被修改，因此采用了特殊的引用管理策略：
 
@@ -627,7 +875,7 @@ line_editor = line_editor
     .with_completer(Box::<DefaultCompleter>::default())
 ```
 
-### 7.3 键位模式与光标形状
+### 9.3 键位模式与光标形状
 
 键位模式与光标形状配置联动，通过 `CursorConfig` 设置（`crates/nu-cli/src/repl.rs`）：
 
@@ -641,24 +889,23 @@ let cursor_config = CursorConfig {
 
 不同模式下光标形状不同，提供视觉反馈。
 
-### 7.4 提示符与模式
+### 9.4 菜单与键位的松耦合设计
 
-`NushellPrompt`（`crates/nu-cli/src/prompt.rs`）实现了 reedline 的 `Prompt` trait，根据编辑模式显示不同的提示符指示器：
+菜单和键位通过名称字符串关联，实现松耦合：
+- 菜单在 `add_menus` 中注册，键位在 `add_menu_keybindings` 中绑定
+- 用户可以单独添加新键位来触发已有菜单
+- 用户也可以覆盖同名菜单来改变菜单行为，而无需修改键位绑定
+- Tab 键的 `UntilFound` 机制提供了优雅的降级策略
 
-```rust
-fn render_prompt_indicator(&self, edit_mode: PromptEditMode) -> Cow<'_, str> {
-    match edit_mode {
-        PromptEditMode::Default | PromptEditMode::Emacs => "> ",
-        PromptEditMode::Vi(vi_mode) => match vi_mode {
-            PromptViMode::Normal => "> ",   // vi normal 模式
-            PromptViMode::Insert => ": ",   // vi insert 模式
-        },
-        PromptEditMode::Custom(str) => format!("({str})"),
-    }
-}
-```
+### 9.5 HostCommand 的缓冲区保护机制
 
-### 7.5 input 命令：两种输入模式
+通过 `is_hostcommand` 标志实现 HostCommand 后的缓冲区状态保留：
+- HostCommand 执行后设置标志
+- 下一次迭代跳过 `flush_engine_state_repl_buffer`
+- 保留 reedline 内部的缓冲区内容和光标位置
+- 确保用户可以继续在当前行上编辑
+
+### 9.6 input 命令：两种输入模式
 
 input 命令支持两种输入模式，通过是否启用 reedline 区分：
 
@@ -671,13 +918,14 @@ input 命令支持两种输入模式，通过是否启用 reedline 区分：
 
 ---
 
-## 八、相关文件清单
+## 十、相关文件清单
 
 | 文件 | 作用 |
 |------|------|
 | `crates/nu-cli/src/repl.rs` | REPL 主循环、输入处理、reedline 初始化与配置 |
-| `crates/nu-cli/src/reedline_config.rs` | 键位绑定创建、菜单配置 |
+| `crates/nu-cli/src/reedline_config.rs` | 键位绑定创建、菜单配置、菜单与键位配合 |
 | `crates/nu-cli/src/prompt.rs` | Nushell 提示符实现（REPL 使用） |
+| `crates/nu-cli/src/prompt_update.rs` | 提示符更新逻辑、环境变量读取 |
 | `crates/nu-protocol/src/config/reedline.rs` | reedline 相关配置数据结构 |
 | `crates/nu-protocol/src/engine/engine_state.rs` | ReplState 定义、engine_state 结构 |
 | `crates/nu-command/src/platform/input/input_.rs` | input 命令实现（含 reedline 模式） |
