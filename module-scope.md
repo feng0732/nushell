@@ -372,7 +372,7 @@ Nushell 对循环导入和重复导入有**两层机制**，且执行顺序非�
     ↓ 未命中
 ② absolute_with(filename, actual_cwd)   ← 关键：路径绝对化
     │  actual_cwd 来自 FileStack.top()（当前正在解析的文件的目录）
-    │  absolute_with 会：展开 ~ / 解析 .. / 调用 std::path::absolute
+    │  absolute_with 处理链：join_path_relative → expand_tilde → expand_ndots → std::path::absolute
     │  不会做 canonicalize（不解析软链/符号链接）
     ↓ p.exists() 为真 → 返回 ParserPath::RealPath(绝对路径)
     ↓ 否则
@@ -380,7 +380,34 @@ Nushell 对循环导入和重复导入有**两层机制**，且执行顺序非�
     ↓ 命中 → 返回绝对化后的 ParserPath
 ```
 
-因此，到达 `parse_module_file` 的 `path: ParserPath` 中的 `RealPath(p)` **已经是一条经过绝对化处理但未做物理路径规范化的绝对路径**。
+**`absolute_with` 的核心步骤**（定义于 `crates/nu-path/src/expansions.rs#L73-L82`）：
+
+```rust
+pub fn absolute_with<P, Q>(path: P, relative_to: Q) -> io::Result<PathBuf> {
+    let path = join_path_relative(path, relative_to, true); // 拼接相对路径
+    let path = expand_tilde(path);      // 展开 ~ 到用户主目录
+    let path = expand_ndots(path);   // 展开 ... → ../..，.... → ../../..（仅展开 3 点及以上
+    absolute(path)                   // 调用 std::path::absolute
+}
+```
+
+> **重要**：`expand_ndots` **只展开三个及以上点（`...`、`....` 等），普通的 `..` 和 `.` 不做词法展开，全部留给 `std::path::absolute` 处理，而后者的行为**跨平台不一致**。
+
+##### 跨平台差异：`std::path::absolute` 对 `..` 的处理
+
+| 平台 | `..` 处理方式 | 代码依据 |
+|------|--------------|---------|
+| **Unix / POSIX | **保留 `..` 组件，不解析** | POSIX 语义认为 `..` 是一种"链接"（可能跨越符号链接），`absolute()` 只是做路径拼接但保留 `..` |
+| **Windows** | **解析 `..`，移除前一个组件** | 调用 `GetFullPathNameW`，在语法层面直接消解 `..` 和 `.` |
+
+**示例**（同样输入 `/foo/bar/../baz.nu`：
+
+| 平台 | absolute_with 输出 |
+|------|-------------------|
+| Unix | `/foo/bar/../baz.nu`（`..` 保留） |
+| Windows | `C:\foo\baz.nu`（`bar\..` 被消解） |
+
+因此，到达 `parse_module_file` 的 `path: ParserPath` 中的 `RealPath(p)` **已经是一条经过绝对化处理但未做物理路径规范化的绝对路径**，且 **Unix 下可能包含 `..` 组件，Windows 下通常不包含。
 
 #### 7.2.2 文件登记：文件名 + 内容字节逐字节比较（非哈希）
 
@@ -418,16 +445,27 @@ let file_id = working_set.add_file(&path.path().to_string_lossy(), &contents);
 
 缓存复用的链路为：**文件登记去重 → Span 相同 → find_module_by_span 命中**
 
-| 场景 | add_file 是否复用 | find_module_by_span 是否命中 | 原因 |
-|------|-----------------|----------------------------|------|
-| 同一路径字符串 + 内容不变 | ✅ 复用 | ✅ 命中（模块已注册后） | 路径+内容完全相同 |
-| 同一物理文件，通过相对路径的不同写法（如 `./a.nu` vs `subdir/../a.nu`） | ✅ 复用 | ✅ 命中 | `absolute_with` 会解析 `..`，得到同一绝对路径 |
-| 同一物理文件，通过软链 vs 真实路径分别访问 | ❌ **不复用** | ❌ 未命中 | `absolute_with` 不调用 canonicalize，软链路径保持原样，字符串不同 |
-| 同一路径 + 内容有 1 字节变更 | ❌ 不复用 | ❌ 未命中 | 内容字节比较失败 |
-| Windows 下 `C:\A.nu` vs `c:\a.nu` | ⚠️ 取决于 PathBuf 语义 | ⚠️ 取决于 `to_string_lossy` | PathBuf 大小写敏感，字符串比较也区分大小写 |
-| 不同路径但文件内容完全相同（两份拷贝） | ❌ 不复用 | ❌ 未命中 | 路径字符串不同，即使内容一样也视为不同文件 |
+| 场景 | Unix 下 | Windows 下 | 原因 |
+|------|---------|-----------|------|
+| 同一路径字符串 + 内容不变 | ✅ 复用 | ✅ 复用 | 路径+内容完全相同 |
+| 同一物理文件，通过 `./a.nu` vs `subdir/../a.nu` 访问 | ⚠️ **不复用**（`..` 保留在路径中） | ✅ 复用（`..` 被 `GetFullPathNameW` 消解） | Unix 下 `std::path::absolute` 保留 `..`；Windows 下 `GetFullPathNameW` 解析 `..` |
+| 同一物理文件，通过软链 vs 真实路径分别访问 | ❌ 不复用 | ❌ 不复用 | `absolute_with` 不调用 canonicalize，软链路径保持原样，字符串不同 |
+| 同一路径 + 内容有 1 字节变更 | ❌ 不复用 | ❌ 不复用 | 内容字节逐字节比较失败 |
+| 大小写不同的同一路径（`A.nu` vs `a.nu`） | ❌ 不复用 | ❌ 不复用（即使文件系统不区分大小写） | PathBuf 和字符串比较都区分大小写，与文件系统无关 |
+| 不同路径但文件内容完全相同（两份拷贝） | ❌ 不复用 | ❌ 不复用 | 路径字符串不同，即使内容一样也视为不同文件 |
+| 通过 `...`（三点）访问（如 `a/b/.../c.nu`） | ✅ 复用 | ✅ 复用 | `expand_ndots` 会把 `...` 展开为 `../..`，之后由 `std::path::absolute` 按平台规则处理 |
 
-**关键边界**：`add_file` 的文件名来源是已经过 `absolute_with` 绝对化的路径字符串，因此相对路径的不同写法通常会被归一化为相同路径；但**软链、大小写差异、跨驱动器等情况会导致同一物理文件被登记为多条记录**。
+> **为什么 Unix 下 `./a.nu` 和 `../a.nu` 可能导致不同路径？**
+>
+> 因为 `find_in_dirs_with_id` 中，相对路径是和 `actual_cwd`（FileStack.top() 的父目录）拼接后再调用 `absolute_with`。如果用户在不同文件中以不同方式引用同一文件（例如 A 用相对路径、B 用包含 `..` 的路径），且最终路径中仍含有 `..` 组件（Unix 特有），则 add_file 会视为不同文件。
+>
+> 而在 Windows 上，`GetFullPathNameW` 会在语法层面彻底消解所有 `.` 和 `..`，因此只要指向同一物理文件（不考虑软链），路径字符串就会相同。
+
+**关键边界总结**：
+- `add_file` 的文件名来源是已经过 `absolute_with` 绝对化的路径字符串
+- **Windows 下**：`..` 被完全消解，路径归一化程度高，缓存复用更可靠
+- **Unix 下**：`..` 被保留，路径归一化依赖于用户输入形式，存在同一物理文件被登记多次的可能
+- 两平台下**均不**解析符号链接 / 不做 canonicalize
 
 #### 7.2.4 Span → ModuleId 的查找
 
@@ -546,14 +584,17 @@ CircularImport(String, #[label = "detected circular import"] Span)
 
 #### 7.3.4 FileStack 与 add_file 路径比较的对齐性
 
-| 场景 | add_file（字符串比较） | FileStack（PathBuf 比较） | 是否一致 |
-|------|----------------------|--------------------------|---------|
-| 相对路径不同写法（`./a` vs `dir/../a`） | ✅ 相等（absolute_with 归一化） | ✅ 相等（absolute_with 归一化） | ✅ 一致 |
-| 软链 vs 真实路径 | ❌ 不等（字符串不同） | ❌ 不等（PathBuf 字节不同） | ✅ 一致 |
-| Windows 大小写不同 | ❌ 不等（字符串不同） | ❌ 不等（PathBuf 比较也区分大小写） | ✅ 一致 |
-| 同文件不同驱动器路径映射 | ❌ 不等 | ❌ 不等 | ✅ 一致 |
+由于两者的路径都源自**同一个 `ParserPath`**（经过 `absolute_with` 处理），因此 FileStack 和 add_file 的路径判断结果在实际中是**一致**的——如果 add_file 认为是同一文件（复用 Span），FileStack 也会认为是同一路径（触发循环检测），反之亦然。
 
-**结论**：由于两者的路径都源自同一个 `ParserPath`（经过 `absolute_with` 处理），因此 FileStack 和 add_file 的路径判断结果在实际中是**一致**的——如果 add_file 认为是同一文件（复用 Span），FileStack 也会认为是同一路径（触发循环检测），反之亦然。
+| 场景 | Unix 下是否一致 | Windows 下是否一致 | 原因 |
+|------|---------------|------------------|------|
+| 同一路径字符串 | ✅ 一致 | ✅ 一致 | 路径完全相同 |
+| 相对路径不同写法（含 `..`） | ✅ 一致（同时不相等） | ✅ 一致（同时相等） | Unix 下 `..` 保留，两者都不同；Windows 下 `..` 消解，两者都相同 |
+| 软链 vs 真实路径 | ✅ 一致（同时不等） | ✅ 一致（同时不等） | 都不做 canonicalize，路径字符串都不同 |
+| 大小写不同 | ✅ 一致（同时不等） | ✅ 一致（同时不等） | 字符串/PathBuf 比较都区分大小写 |
+| 不同驱动器映射同文件 | ✅ 一致（同时不等） | ✅ 一致（同时不等） | 路径不同，都视为不同文件 |
+
+> **跨平台对齐原理**：add_file 用的是 `path.path().to_string_lossy()`，FileStack 用的是 `path.path_buf()`。两者都来自同一个 `ParserPath::RealPath(p)` 的 `p: PathBuf`，只是类型表达方式不同。**`PathBuf` 的 `PartialEq` 和 `&str` 的 `==` 在字节层面是等价的**，因此两者的比较结果永远一致，不受平台差异影响。
 
 #### 7.3.5 入栈/出栈的精确位置
 
@@ -567,14 +608,16 @@ CircularImport(String, #[label = "detected circular import"] Span)
 
 #### 7.3.6 FileStack 的边界
 
-| 场景 | 是否触发 CircularImport | 原因 |
-|------|------------------------|------|
-| A.nu → use B.nu → use A.nu（真正的循环） | ✅ 报错 | A 在栈中，B 解析中再次 push A 被检测 |
-| A.nu → use B.nu → use C.nu；D.nu → use B.nu | ❌ 不触发 | B 首次解析完后已 pop 出栈；D→B 走缓存命中（第二层不被执行） |
-| 内联模块 `module foo { ... }` | ❌ 不触发 | 直接调用 `parse_module_block`，绕过 `parse_module_file`，不经过 FileStack |
-| 同文件通过不同路径字符串导入（`./a.nu` vs `../dir/a.nu`） | ❌ 不会漏报（正常不触发） | 经过 `absolute_with` 归一化为同一路径 |
-| 同物理文件通过软链和真实路径分别访问 | ⚠️ 可能漏报 | 路径未做 canonicalize，路径字符串不同 |
-| `overlay use` 一个模块 | ✅ 经过检测 | `overlay use` 内部同样调用模块解析流程 |
+| 场景 | Unix 下 | Windows 下 | 原因 |
+|------|---------|-----------|------|
+| A.nu → use B.nu → use A.nu（真正的循环） | ✅ 报错 | ✅ 报错 | A 在栈中，B 解析中再次 push A 被检测 |
+| A.nu → use B.nu → use C.nu；D.nu → use B.nu | ❌ 不触发 | ❌ 不触发 | B 首次解析完后已 pop 出栈；D→B 走缓存命中（第二层不被执行） |
+| 内联模块 `module foo { ... }` | ❌ 不触发 | ❌ 不触发 | 直接调用 `parse_module_block`，绕过 `parse_module_file`，不经过 FileStack |
+| 同文件通过不同 `..` 形式的路径导入 | ⚠️ **可能漏报** | ❌ 不漏报 | Unix 下 `..` 保留，路径字符串不同 → 栈中视为不同文件；Windows 下 `..` 消解，视为同一文件 |
+| 同物理文件通过软链和真实路径分别访问 | ⚠️ 可能漏报 | ⚠️ 可能漏报 | 路径未做 canonicalize，路径字符串不同（两平台都有此问题） |
+| `overlay use` 一个模块 | ✅ 经过检测 | ✅ 经过检测 | `overlay use` 内部同样调用模块解析流程 |
+
+> **循环检测在 Unix 下的盲点**：如果模块 A 用 `use ../lib/utils`，模块 B 用 `use ./utils`，而两者实际上指向同一个文件，且构成循环依赖链，在 Unix 下 FileStack 可能因为路径字符串不同（含/不含 `..`）而**漏检**循环。在 Windows 下则不会有此问题，因为 `GetFullPathNameW` 会消解所有 `..`。
 
 ### 7.4 典型场景推演
 
@@ -697,12 +740,18 @@ pub struct ScopeData<'e, 's> {
 | **名称前缀** | `decls_with_head` 将导出名包装为 `<module> <decl>` | `crates/nu-protocol/src/module.rs#L352-L369` |
 | **可见性控制** | `Visibility` 哈希表，hide 只是标记不可见而非删除 | `crates/nu-protocol/src/engine/overlay.rs#L8-L44` |
 | **前向引用** | 两阶段解析：先预声明所有 def，再解析函数体 | `crates/nu-parser/src/parse_module.rs#L510-L514` |
-| **路径绝对化** | `absolute_with` 展开 `~`、解析 `..`、调用 `std::path::absolute`；**不做** canonicalize（不解析软链） | `crates/nu-path/src/expansions.rs#L73-L82`、`crates/nu-parser/src/parse_source.rs#L661-L685` |
+| **路径绝对化总览** | `absolute_with` 处理链：`join_path_relative` → `expand_tilde` → `expand_ndots` → `std::path::absolute`；**不做** canonicalize（不解析软链） | `crates/nu-path/src/expansions.rs#L73-L82` |
+| **ndots 展开** | `expand_ndots` 只展开 `...` 及以上（`...`→`../..`，`....`→`../../..`），普通 `..` 和 `.` 不做词法展开 | `crates/nu-path/src/dots.rs#L11-L50` |
+| **`..` 的跨平台差异** | **Unix**：`std::path::absolute` 保留 `..` 组件（POSIX 语义，`..` 视为一种链接）；**Windows**：`GetFullPathNameW` 消解所有 `..` 和 `.` | `crates/nu-path/src/expansions.rs#L67-L68`、Rust std `path::absolute` 文档 |
 | **文件登记去重** | `add_file()` 线性扫描，**逐字节比较**（路径字符串 `&str == &str` + 文件内容 `&[u8] == &[u8]`），无哈希 | `crates/nu-protocol/src/engine/state_working_set.rs#L339-L359` |
+| **缓存复用边界** | **Windows 下**：`..` 被消解，路径归一化程度高，复用可靠；**Unix 下**：`..` 保留，同一物理文件可能因路径写法不同而不命中 | 由 `std::path::absolute` 平台行为决定 |
 | **重复导入复用** | `find_module_by_span()` 线性扫描已注册模块的 span（要求模块已完成 `add_module` 注册） | `crates/nu-protocol/src/engine/state_working_set.rs#L1029-L1040` |
-| **循环导入检测** | `FileStack` 栈式跟踪当前解析链，`push()` 时 `PathBuf == PathBuf` 比较，命中抛出 `CircularImport` | `crates/nu-protocol/src/engine/state_working_set.rs#L1180-L1240` |
+| **循环导入检测** | `FileStack` 栈式跟踪当前解析链，`push()` 时 `PathBuf == PathBuf` 逐字节比较，命中抛出 `CircularImport` | `crates/nu-protocol/src/engine/state_working_set.rs#L1180-L1240` |
+| **循环检测跨平台差异** | **Windows 下**：`..` 消解，循环检测更准确；**Unix 下**：`..` 保留，同文件不同路径写法可能漏检 | 由 `absolute_with` 输出路径形式决定 |
 | **检测优先级** | `add_file` → `find_module_by_span`（时间维度：解析完成后命中）→ `files.push`（时间维度：解析中循环检测） | `crates/nu-parser/src/parse_module.rs#L734-L746` |
+| **路径比较一致性** | add_file（字符串）和 FileStack（PathBuf）共享同一 `ParserPath` 来源，两平台下行为均一致（同时命中/同时不命中） | `crates/nu-parser/src/parse_module.rs#L734, #L743` |
 | **别名实现** | Alias 实现 Command trait，是命令包装器而非文本替换 | `crates/nu-protocol/src/alias.rs#L22-L68` |
 | **热重载** | `module_needs_reloading` 递归检查文件内容 + imported_modules 链 | `crates/nu-parser/src/parse_module.rs#L666-L704` |
 | **Overlay 系统** | 每个 ScopeFrame 可有多个 Overlay，支持动态激活/移除 | `crates/nu-protocol/src/engine/overlay.rs#L47-L177` |
-| **路径比较一致性** | add_file（字符串）和 FileStack（PathBuf）共享同一 `ParserPath` 来源，实际行为一致（软链/大小写场景同时不命中） | `crates/nu-parser/src/parse_module.rs#L734, L743` |
+| **大小写敏感性** | 路径比较（字符串/PathBuf）均区分大小写，与文件系统是否大小写敏感无关（两平台一致） | `crates/nu-protocol/src/engine/state_working_set.rs#L344-L345` |
+| **软链/符号链接** | 两平台均不解析（不调用 canonicalize），软链路径与真实路径视为不同文件 | `crates/nu-path/src/expansions.rs#L67-L68` |
