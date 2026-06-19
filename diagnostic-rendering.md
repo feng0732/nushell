@@ -64,13 +64,31 @@ pub struct CachedFile {
 
 **字段说明：**
 
-- **`name: Arc<str>`** — 使用 `Arc<str>` 而非 `String`，因为同一文件名可能被多个 CachedFile 共享（如重复 source 同一文件）。`Arc` 的引用计数语义避免了重复分配。对于 REPL 交互式输入，固定为 `"<cli>"`。
+- **`name: Arc<str>`** — 使用 `Arc<str>` 而非 `String`，因为同一文件名可能被多个 CachedFile 共享（如重复 source 同一文件）。`Arc` 的引用计数语义避免了重复分配。文件名按**场景动态分配**（详见下表），并非固定值。
 
 - **`content: Arc<[u8]>`** — 使用 `Arc<[u8]>` 而非 `Vec<u8>`。源码内容是不可变的（解析后不会被修改），`Arc` 切片在 clone 时只增加引用计数，不复制数据。这对频繁 clone 的 `StateDelta` 很重要。
 
 - **`covered_span: Span`** — 该文件在**全局偏移空间**中占据的 `[start, end)` 范围。Nushell 将所有已解析文件的源码在逻辑上拼接成一个连续地址空间，`covered_span` 记录了本文件的字节范围。
 
-### 2.2 全局偏移分配
+### 2.2 文件名分配规则
+
+`name` 字段并非固定值，而是由调用方在 `add_file(filename, contents)` 时传入。不同入口场景使用不同的命名约定，直接决定了诊断渲染时文件名框中的显示内容：
+
+| 场景 | 实际调用位置 | name 值 | 说明 |
+|------|------------|---------|------|
+| **REPL 逐条输入** | [repl.rs#L114](crates/nu-cli/src/repl.rs#L114), [repl.rs#L1086](crates/nu-cli/src/repl.rs#L1086) | `"repl_entry #0"`、`"repl_entry #1"` … | 每条输入递增编号，`entry_num` 从 0 开始 |
+| **`nu script.nu` 脚本执行** | [eval_file.rs#L205](crates/nu-cli/src/eval_file.rs#L205) | 脚本文件实际路径（经 `expand_to_real_path` 展开） | 如 `C:/dev/test.nu` |
+| **`nu -c "cmd"` 命令行参数** | [eval_file.rs#L200](crates/nu-cli/src/eval_file.rs#L200) | `"<commandline>"` | 带尖括号的伪文件名 |
+| **文件读取失败时构造伪源码** | [eval_file.rs#L54](crates/nu-cli/src/eval_file.rs#L54) | `"<commandline>"` | 将 `nu script.nu args…` 整体作为伪命令行 |
+| **`parse()` 无文件名默认** | [parse_captures_compile.rs#L523](crates/nu-parser/src/parse_captures_compile.rs#L523) | `"source"` | `fname == None` 时的兜底 |
+| **`use mod` 模块导入** | [parse_module.rs#L734](crates/nu-parser/src/parse_module.rs#L734) | 模块文件实际路径（经 `to_string_lossy`） | 如 `C:/dev/mymod.nu` |
+| **Tab 补全器内部解析** | [complete.rs#L95](crates/nu-cli/src/commands/commandline/complete.rs#L95) | `"completer"` | 补全时的临时源码 |
+| **环境变量伪文件** | [util.rs#L98](crates/nu-cli/src/util.rs#L98) | `"Host Environment Variables"` | 启动时收集环境变量的伪文件 |
+| **banner 显示命令** | [repl.rs#L166](crates/nu-cli/src/repl.rs#L166), [repl.rs#L176](crates/nu-cli/src/repl.rs#L176) | `"show short banner"` / `"show_banner"` | 内部短命令 |
+
+> **关于 `"<cli>"` 的澄清：** [state_working_set.rs#L1148](crates/nu-protocol/src/engine/state_working_set.rs#L1148) 中确实存在 `if &**filename == "<cli>"` 的特殊分支，但是**在当前版本全仓库中没有任何一处调用 `add_file("<cli>", …)`** —— 该分支属于历史保留代码，是一条实际上永不触发的死路径。当前 REPL 输入走的是 `"repl_entry #N"` 命名（会走到 `else` 分支，使用 `MietteSpanContents::new_named`，因此用户能看到 `repl_entry #N` 字样）。
+
+### 2.3 全局偏移分配
 
 文件被添加到工作集时，全局偏移按顺序递增分配。入口是 [state_working_set.rs#L338-L359](crates/nu-protocol/src/engine/state_working_set.rs#L338-L359)：
 
@@ -135,7 +153,7 @@ StateDelta.files:     [file_3] [file_4]
                               next_span_start = 100
 ```
 
-### 2.3 文件存储的两层结构
+### 2.4 文件存储的两层结构
 
 CachedFile 存储在两个位置：
 
@@ -273,7 +291,7 @@ fn read_span<'b>(
 
 4. **局部→全局** — `content_span.offset() + start` 将 miette 返回的（可能因上下文扩展而调整过的）span 重新翻译回全局坐标系。
 
-5. **命名差异** — `<cli>` 是交互式输入，没有文件名，用 `MietteSpanContents::new` 创建无名内容；其他文件用 `new_named` 附带文件名，miette 渲染时会显示文件名。
+5. **命名分支** — 代码中特殊判断 `if &**filename == "<cli>"` 时走无名 `MietteSpanContents::new`（不显示文件名），其他所有情况（包括 REPL 的 `"repl_entry #N"`、脚本路径、`"<commandline>"`、`"source"` 等）都走 `MietteSpanContents::new_named(filename, …)`，miette 渲染时会在文件名框中显示该名字。如前所述，`"<cli>"` 分支在当前版本中没有实际入口，用户几乎总是看到命名输出。
 
 ### 3.3 Span 与 miette 的转换
 
@@ -796,14 +814,15 @@ report_parse_error(stack, working_set, &parse_error);
 - 全局→局部偏移：`local_span = (span.offset() - file_start, span.len())`
 - 获取文件全部内容，委托 `SpanContents::read_span` 计算行号/列号/上下文
 - 局部→全局偏移：`retranslated = (content_span.offset() + file_start, content_span.len())`
-- 文件名为 `"<cli>"` → 无名 `MietteSpanContents`
+- 文件名为 `"repl_entry #1"` → 走 `new_named` 分支，携带文件名到 miette
 
 **7. 格式化输出**
+（REPL 环境中，文件名来自 `"repl_entry #1"`，miette 按传入名字原样显示；以下方括号中的文件名会随实际场景变化：`"<commandline>"` 会显示为 `<commandline>`，脚本路径会显示为完整文件路径）
 ```
 Error: nu::parser::extra_tokens
 
   × Extra tokens in code.
-   ╭─[entry #1:1:1]
+   ╭─[repl_entry #1:1:1]
  1 │ echo hello world extra
    ·              ─────┬────
    ·                   ╰── extra tokens
