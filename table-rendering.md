@@ -34,12 +34,13 @@ colorize_space                          (第 2 遍空格着色，仅 list_table)
 configure_table                         (加载主题、footer、边框色)
         ↓
 NuTable::draw(termwidth)                ← 核心渲染
-  ├─ table_truncate                     (列宽估计 + 截断策略)
+  ├─ table_truncate                     (列宽估计，输出 WidthEstimation)
   ├─ draw_table
-  │   ├─ set_styles (对齐 + 着色)
-  │   ├─ load_theme                    (边框字符 + 边框色)
-  │   ├─ DimensionCtrl::change         (应用 Truncate/Wrap)
-  │   └─ table_set_border_header       (header-on-separator 模式)
+  │   ├─ set_styles                     (对齐 + 单元格颜色配置)
+  │   ├─ set_indent                     (左右 padding)
+  │   ├─ load_theme                     (边框字符 + 边框色)
+  │   ├─ truncate_table → DimensionCtrl (应用 Truncate/Wrap 策略)
+  │   └─ table_set_border_header        (header-on-separator 模式)
   └─ table.to_string()
 ```
 
@@ -198,29 +199,61 @@ impl TableOption<...> for DimensionCtrl {
 
 ### 4.1 样式计算链
 
-颜色来源于 `StyleComputer`（由 `$env.config.color_config` 生成）。单元格着色有两条独立路径：
+颜色来源于 `StyleComputer`（由 `$env.config.color_config` 生成）。单元格着色存在**两条独立路径**，分别服务于不同的表格类型。两条路径的共同点是：`clean_charset`（字符集规整化）都发生在**颜色写入文本之前**。
 
-**路径 A：构建时着色（`nu_value_to_string_colored`）**
+#### 路径 A：直接着色路径（`nu_value_to_string_colored`）
+
 位置：`crates/nu-table/src/common.rs` 第 42–59 行
+
+用于单值表、Record 表等非 list 类型的表格构建。颜色直接写入字符串，tabled 把它当普通文本处理。
 
 ```
 1. val.to_abbreviated_string()        → 纯文本
-2. style_computer.style_primitive()   → 拿到 nu_ansi_term::Style
-3. color.paint(text).to_string()      → 包裹 ANSI 前缀/后缀
-4. clean_charset (替换 \t 为 4 空格) → 文本形态规整化
-5. colorize_space_str                 → 行首尾空格再包一层颜色
+2. style_computer.style_primitive()   → 拿到 nu_ansi_term::Style（样式信息）
+3. clean_charset                      → 文本形态规整化（\t→4空格、去 \r）【仅 String 类型】
+4. color.paint(text).to_string()      → 包裹 ANSI 前缀/后缀（真正上色）
+5. colorize_space_str                 → 行首尾空格再包一层颜色【仅 String 类型】
 ```
 
-这条路径应用于 `create_table_with_*` 等常规表构建流程中。
+代码证据（第 46–48 行先 clean，第 50–52 行再 paint）：
 
-**路径 B：构建后二次着色（`colorize_space`）**
-位置：`crates/nu-table/src/types/general.rs` 第 35 行
+```rust
+if is_string {
+    text = clean_charset(&text);        // ← 先规整
+}
+if let Some(color) = style.color_style {
+    text = color.paint(text).to_string(); // ← 后上色
+}
+```
 
-在 `list_table` 函数中，`create_table` 完成后又调了一遍 `colorize_space(out.table.get_records_mut(), ...)`。代码注释写明 `// TODO: It would be WAY more effitient to do right away instead of second pass over the data.` —— 这是一次独立的全表扫描。
+#### 路径 B：样式分离路径（`get_value_style` + `colorize_table` + `colorize_space`）
 
-> **⚠️ 推断**：两遍 colorize_space 可能是历史遗留：路径 A 处理字符串值的空格，路径 B 兜底所有类型的单元格空格着色。
+用于 `create_table_with_*` 系列的常规 list 表格（`table` 命令的主路径）。文本与样式分离存储，渲染阶段再合并。
 
-**颜色来源汇总**：
+**构建阶段**（`crates/nu-table/src/types/general.rs` 第 220–229 行）：
+```
+1. get_value_style()                  → 返回 (text, style) 元组，文本与样式分离
+2. clean_charset                      → 文本规整化【仅 String 类型】
+3. table.insert(pos, text)            → 写入纯文本
+4. table.insert_style(pos, style)     → 写入样式（独立存储）
+```
+
+**第二遍空格着色**（`crates/nu-table/src/types/general.rs` 第 34–35 行）：
+```
+5. colorize_space(out.table.get_records_mut(), ...)
+                                       → 全表扫描，对单元格内首尾空格着色
+```
+代码注释明确写着 `// TODO: It would be WAY more effitient to do right away instead of second pass over the data.`
+
+**渲染阶段**（`crates/nu-table/src/table.rs` 第 579–583 行 `set_styles`）：
+```
+6. colorize_table(table, colors, structure)
+                                       → 通过 tabled 的 Color 配置把样式应用到单元格
+```
+
+> **⚠️ 推断**：路径 A 是直接上色（字符串里带 ANSI），路径 B 是样式分离存到 tabled config。两条路径的存在可能是历史演进的结果：路径 A 更简单直接，路径 B 更利于 tabled 内部对齐和宽度计算。
+
+**颜色来源汇总**（代码事实）：
 - `style_primitive()`：基础类型颜色（int/float/string/bool/...）
 - `compute("row_index", _)`：索引列
 - `compute("header", _)`：表头
