@@ -331,16 +331,6 @@ tokens → lite_parse() → LiteBlock
 
 对于 `SyntaxShape::Any`，使用**试错回溯**策略：依次尝试 `Binary`、`Range`、`Filesize`、`Duration`、`DateTime`、`Int`、`Number`、`String`，第一个无错的形状胜出。
 
-### 递归解析与嵌套
-
-解析过程中会产生递归的 lex → lite_parse → parse_block 循环。例如：
-
-- 列表表达式 `[1, 2, 3]`：内部内容重新 lex + lite_parse
-- 闭包表达式 `{ |x| $x + 1 }`：内部内容重新 lex + parse_block
-- 记录表达式 `{ a: 1 }`：逐 token 增量 lex（`lex_n_tokens`）
-
-这意味着 Nushell 的解析器不是传统的"一次性 lex 完再 parse"，而是**按需 lex**——某些复合结构会在解析时重新对子区域执行词法分析。
-
 ### AST 构建层的错误记录边界
 
 **错误载体**：`StateWorkingSet.parse_errors: Vec<ParseError>` — 全局累积列表，**所有 AST 层函数共享**。
@@ -375,119 +365,495 @@ pub fn parse_block(working_set: &mut StateWorkingSet, ...) -> Block
 
 ---
 
-## 错误恢复机制详解
+## 嵌套结构中的递归解析与错误传播
 
-Nushell 的错误恢复贯穿三个层次，每层有独立的错误载体和恢复策略。核心理念是**继续解析，不因错误中断**。
+Nushell 的复合结构（闭包、块、子表达式、列表、表、记录等）在解析时会触发**递归的 lex → lite_parse → parse_block 循环**，每一层循环都会经历自己的三层解析，并产生独立的错误处理路径。
 
-### 三层错误载体对比
+### 嵌套结构的入口分发
 
-| 层次 | 错误载体 | 累积方式 | 访问 WorkingSet | 注入到全局的位置 |
-|---|---|---|---|---|
-| 词法层 | `Option<ParseError>`（返回值） | 只保留第一个 | 不访问 | `parse()` 第 536-538 行 |
-| 轻量语法层 | `Option<ParseError>`（返回值） | 只保留第一个 | 只读（`&StateWorkingSet`） | `parse_block()` 第 118-121 行 |
-| AST 构建层 | `Vec<ParseError>`（`StateWorkingSet` 字段） | 全部追加 | 可变（`&mut StateWorkingSet`） | 直接追加 |
+所有嵌套结构从 [parse_value()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L804-L828) 的首字符分派开始：
 
-**关键区别**：词法层和轻量语法层各自独立记录错误（都只记第一个），它们的错误由上层调用方注入到全局 `parse_errors` 中。AST 层则直接操作全局列表，可以累积多个错误。
-
-### AST 层的错误恢复策略
-
-#### 策略一：Garbage 节点替代
-
-[garbage()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_helpers.rs#L5-L7) 函数产出一个 `Expr::Garbage` 表达式，类型为 `Type::Any`：
-
-```rust
-pub fn garbage(working_set: &mut StateWorkingSet, span: Span) -> Expression {
-    Expression::garbage(working_set, span)  // Expr::Garbage, Type::Any
-}
+```
+首字符 $ → parse_dollar_expr()   （可能含嵌套子表达式）
+首字符 ( → parse_paren_expr()    （子表达式 / Range 试探）
+首字符 { → parse_brace_expr()    （闭包 / 块 / 记录 歧义和分发）
+首字符 [ → parse_table_expression → parse_list_expression （列表/表）
+         或 parse_signature （签名）
 ```
 
-所有无法解析的位置都用 `Garbage` 填充，确保 AST 结构完整。例如：
-- 不完整的数学表达式 `1 +` → 缺失的右操作数用 `Garbage` 填充
-- 类型不匹配的参数 → 用 `Garbage` 替换
-- 语法错误 → 整个 span 替换为 `Garbage`
+### 每一种嵌套结构的完整递归路径
 
-#### 策略二：错误累积，不中断
+#### 路径一：闭包 `{ |x| ... }`
 
-解析函数的签名几乎全部返回值本身（`Expression`、`Pipeline`、`Block`），而非 `Result`：
+**入口**：首字符 `{` → [parse_brace_expr()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_literals.rs#L518-L590) → `parse_closure_expression()`
 
-```rust
-// 典型模式
-if bad_condition {
-    working_set.error(ParseError::Expected("something", span));
-    return garbage(working_set, span);  // 返回占位，而非 Err
-}
+完整流程：
+```
+parse_brace_expr()
+  │
+  │ ① 探测性 lex（只看结构，不处理错误）
+  │   let (tokens, _) = lex(bytes, ...);   // 第二个返回值被丢弃 !
+  │
+  │ ② 根据 tokens 形状判断是闭包
+  │   [Pipe, ..] → 肯定是闭包
+  │   SyntaxShape::Any → 默认走闭包路径
+  ▼
+parse_closure_expression(working_set, shape, span)
+  │
+  │ ③ 提取内部字节（去掉首尾 {}）
+  │   bytes = strip_curly_braces(bytes)
+  │
+  │ ④ 真正的 lex（处理错误并注入）
+  │   let (output, err) = lex(source, start, ...);
+  │   if let Some(err) = err {
+  │       working_set.error(err);   ←─── 错误跨层注入点 A
+  │   }
+  │
+  │ ⑤ enter_scope() 进入新作用域
+  │
+  │ ⑥ 参数签名解析 |x, y|
+  │   如出错 → working_set.error(err)
+  │
+  │ ⑦ 递归进入 parse_block（再次经历完整的三层）
+  ▼
+parse_block(working_set, &tokens, ...)
+  │
+  │ ⑧ 第二层 lite_parse
+  │   let (lite_block, err) = lite_parse(tokens, working_set);
+  │   if let Some(err) = err {
+  │       working_set.error(err);   ←─── 错误跨层注入点 B
+  │   }
+  │
+  │ ⑨ 递归解析每个 pipeline/expression
+  │   （可能包含更多嵌套结构）
+  │
+  │ ⑩ type_check（追加类型错误）
+  ▼
+返回 Block
+  │
+  │ ⑪ 闭包编译门槛（只看 parse_errors）
+  │   if working_set.parse_errors.is_empty() {
+  │       compile_block(working_set, &mut output);  ←─── 编译门槛 C
+  │   }
+  │
+  │ ⑫ exit_scope()
+  │
+  │ ⑬ add_block() 存入块表
+  ▼
+Expr::Closure(block_id)
 ```
 
-这确保了无论解析过程中遇到多少错误，最终总能产出一个结构完整的 AST。
+**关键特征**：`parse_brace_expr()` 的第一步 **lex 探测不处理错误**（`let (tokens, _) = lex(...)`），它只用 token 形状判断结构类型，错误完全丢弃。真正的 lex 在 `parse_closure_expression()` 中重新执行，那一次才处理错误。
 
-#### 策略三：试错回溯（Speculative Parsing）
+#### 路径二：块表达式 `{ ... }`
 
-当解析器遇到歧义（不知道该按哪种语法形状解析）时，会依次尝试多种可能性，通过 `parse_errors` 的长度快照判断哪种尝试"更成功"。
+**入口**：首字符 `{` → `parse_brace_expr()` → 当 shape 为 `SyntaxShape::Block` 时 → [parse_block_expression()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L384-L444)
 
-**情形一：`parse_value(SyntaxShape::Any)` — 按顺序尝试，首个成功即返回**
+与闭包的区别：
+- **没有立即编译**（编译留给父 Block 的统一编译）
+- 遇到 `|` 开头会报错（`Expected("block but found closure")`）
+- 同样经历自己的 lex → parse_block 递归
 
-[parse_value()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L889-L928) 中的 `Any` 分支：
+#### 路径三：子表达式 `( expr )`
 
-```rust
-let shapes = [Binary, Range, Filesize, Duration, DateTime, Int, Number, String];
-for shape in shapes.iter() {
-    let starting_error_count = working_set.parse_errors.len();
-    let s = parse_value(working_set, span, shape);
+**入口**：首字符 `(` → [parse_paren_expr()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_literals.rs#L472-L516)
 
-    if starting_error_count == working_set.parse_errors.len() {
-        return s;  // 无新错误 → 成功，直接返回
-    } else {
-        match working_set.parse_errors.get(starting_error_count) {
-            // Expected 类错误 → 回溯，继续尝试下一个形状
-            Some(ParseError::Expected(_, _) | ParseError::ExpectedWithStringMsg(_, _)) => {
-                working_set.parse_errors.truncate(starting_error_count);
-                continue;
-            }
-            // 其他类型错误 → 认为是确定性错误，直接返回
-            _ => return s,
-        }
-    }
-}
+完整流程：
+```
+parse_paren_expr(working_set, span, shape)
+  │
+  │ ① 快照 A，先试探 Range
+  │   let starting_error_count = working_set.parse_errors.len();
+  │   if let Some(expr) = parse_range(working_set, span) {
+  │       return expr;                 // Range 成功，直接返回
+  │   }
+  │   working_set.parse_errors.truncate(starting_error_count);  ←─── 回滚①
+  │   // 注意：truncate 回滚的包括 parse_range 内部所有嵌套产生的注入错误
+  │
+  │ ② 按 shape 分流（Signature / ExternalSignature）
+  │
+  │ ③ 快照 B，试探 FullCellPath（含 parse_block 递归）
+  │   let fcp_expr = parse_full_cell_path(working_set, None, span);
+  │   // parse_full_cell_path 内部会：
+  │   //   - lex 一次（注入词法错误）
+  │   //   - 若 head 是 (expr)，则重新 lex + parse_block
+  │   //       * parse_block 内又有 lite_parse 注入
+  │   //       * type_check 错误
+  │   // 所有这些都追加到 parse_errors 中
+  │
+  │ ④ 判断是否是"结构损坏"的子表达式
+  │   if fcp_error_count > starting_error_count {
+  │       let malformed_subexpr = 检查首个新增错误是否是 Unclosed(")") 或 Unbalanced
+  │       if malformed_subexpr {
+  │           working_set.parse_errors.truncate(starting_error_count);  ←─── 回滚②
+  │           // 把结构损坏的 () 当作字符串插值或 glob 处理
+  │           parse_glob_pattern(span) 或 parse_string_interpolation(span)
+  │       } else {
+  │           fcp_expr  // 保留其他类型的错误（非结构性的）
+  │       }
+  │   } else {
+  │       fcp_expr  // 无错误，直接返回
+  │   }
 ```
 
-回溯条件：只有当新产生的错误是 `Expected` 或 `ExpectedWithStringMsg` 类型时才回溯。这是因为 Expected 类错误通常表示"形状不匹配"而非"代码有问题"，而其他类型的错误（如 `Unbalanced`、`UnexpectedEof`）即使形状不对也说明代码本身有错，应该保留。
+**关键特征**：`parse_paren_expr()` 有**两层试探**，每层试探都可能触发深层嵌套解析（里面可能经历 lex→lite_parse→parse_block→更深层递归），产生的错误全部追加到全局 `parse_errors`，然后通过 `truncate()` 一次性回滚到快照点。
 
-**情形二：`parse_oneof(SyntaxShape::OneOf)` — 全部尝试，选最优**
+回滚条件很严格：只有当首个新增错误**恰好是** `Unclosed(")")` 或 `Unbalanced("(", ")")` 时才回滚。其他类型错误（如变量未定义、类型不匹配等）说明 `()` 虽然语法结构正确但语义有错，不应被当作"格式错了的 glob"处理。
 
-[parse_oneof()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_calls.rs#L682-L741) 更复杂：
+#### 路径四：列表和表 `[1, 2, 3]`
 
-```rust
-for shape in possible_shapes {
-    let starting_error_count = working_set.parse_errors.len();
-    let value = parse_multispan_value(working_set, spans, spans_idx, shape);
-    
-    let new_errors = &working_set.parse_errors[starting_error_count..];
-    let Some(first_error_offset) = new_errors.iter().map(|e| e.span().start).min() else {
-        return value;  // 无新错误 → 成功，直接返回
-    };
-    
-    if first_error_offset > max_first_error_offset {
-        // 记录"走得更远"的结果
-        max_first_error_offset = first_error_offset;
-        best_guess = Some(value);
-        best_guess_errors.clear();
-        best_guess_errors.extend_from_slice(new_errors);
-    }
-    working_set.parse_errors.truncate(starting_error_count);  // 回溯
-}
+**入口**：首字符 `[` → [parse_table_expression()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L222-L347) → 检查是否为表结构，否则回退到 `parse_list_expression()`
 
-// 所有形状都失败 → 选择"最优猜测"的错误
-if max_first_error_offset > spans[starting_spans_idx].start || propagate_error {
-    working_set.parse_errors.extend(best_guess_errors);
-    best_guess.unwrap()
-}
+完整流程：
+```
+parse_table_expression(working_set, span, list_element_shape)
+  │
+  │ ① 剥离 []，提取内部 span
+  │
+  │ ② lex（错误注入）
+  │   let (tokens, err) = lex(source, ...);
+  │   if let Some(err) = err {
+  │       working_set.error(err);   ←─── 错误注入点 D
+  │   }
+  │
+  │ ③ 判断是否为表格式：[[a b]; [1 2]; [3 4]]
+  │   匹配：[first, second, rest @ ..]
+  │          条件：first starts_with [ ; second == Semicolon ; !rest.is_empty()
+  │
+  │ ④ 不匹配 → parse_list_expression()（逐元素 parse_value）
+  │   匹配   → parse_table_row() 解析表头和每行
+  │
+  │ ⑤ 表行解析中：
+  │   - 错误行数不对 → working_set.error(MissingColumns / ExtraColumns)
+  │   - 行不是列表形式 → working_set.error("Table item not list")
+  │
+  │ ⑥ 快照 C：表类型推断
+  │   let errors = working_set.parse_errors.len();
+  │   if parse_errors.len() == errors {
+  │       // 无新错误 → 精确计算列类型
+  │       let (ty, errs) = table_type(&head, &rows);
+  │       working_set.parse_errors.extend(errs);
+  │   } else {
+  │       Type::table()  // 有错误 → 退化为泛型表类型
+  │   }
 ```
 
-策略：尝试所有候选形状，选择**首个错误位置最靠后**（即解析"走得最远"）的结果作为最终答案。其余尝试产生的错误通过 `truncate` 回溯掉。
+**关键特征**：表解析使用**"有错误就退化"**策略——如果解析过程中已经有错误，那么列类型就直接用 `Type::table()`，不再做精确推断。
+
+#### 路径五：记录 `{ a: 1, b: 2 }`
+
+**入口**：首字符 `{` → `parse_brace_expr()` → 当探测到 `:` 分隔符或 shape 为 Any 且不是闭包时 → [parse_record()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L1795-L19xx)
+
+完整流程：
+```
+parse_record(working_set, span)
+  │
+  │ ① 增量词法循环（与其他结构不同！）
+  │   while !lex_state.input.is_empty() {
+  │
+  │       lex_n_tokens(... 1);  // 读 1 个 token（键）
+  │       if Unbalanced("{","}") → extra_tokens，结束
+  │
+  │       lex_n_tokens(... 1);  // 读 1 个 token（冒号 :）
+  │       lex_n_tokens(... 1);  // 读 1 个 token（值）
+  │   }
+  │
+  │ ② 词法层错误处理
+  │   unclosed { → working_set.error(Unclosed("}"))
+  │   extra_tokens → working_set.error(ExtraTokensAfterClosingDelimiter)
+  │   lex_state.error → working_set.error(err)
+  │
+  │ ③ 解析键值对（递归！）
+  │   for each 键值对：
+  │       普通对 → parse_value(working_set, value_span, &SyntaxShape::Any)
+  │                ↑ 这里可能递归触发任何嵌套结构
+  │
+  │       Spread → parse_value(working_set, inner_span, &SyntaxShape::record())
+  │                ↑ 这里可能递归解析另一个记录
+```
+
+**关键特征**：记录使用**增量 lex**（`lex_n_tokens` 每次只 lex 1 个 token）而非一次性 lex，这是因为记录中 `:` 分隔符和 `,` 分隔符的位置需要精确控制。循环的终止通过检查 `lex_state.error` 中的 `Unbalanced("{","}")` 来实现——当闭合 `}` 被过度消费时触发此错误。
 
 ---
 
-## IR 编译的前置条件
+## 试探解析（Speculative Parsing）的回滚边界
+
+Nushell 的试探解析基于一个简单机制：**对 `parse_errors` 做快照 + `truncate` 回滚**。但这个简单机制在嵌套递归的环境中会产生复杂的交互。
+
+### 三类试探解析模式
+
+| 试探函数 | 快照粒度 | 回滚条件 | 失败时的行为 |
+|---|---|---|---|
+| `parse_value(SyntaxShape::Any)` | 每个 shape 尝试前快照 | 只在 `Expected`/`ExpectedWithStringMsg` 时回滚 | 其他类型错误直接保留（认为是确定性错误） |
+| `parse_oneof(SyntaxShape::OneOf)` | 每个 shape 尝试前快照 | 无条件回滚（总是 truncate） | 保留走得最远的尝试的错误 |
+| `parse_paren_expr()` | 两次快照（Range 前、FCP 前） | 仅结构性错误（Unclosed/Unbalanced）回滚 | 其他错误保留，返回 FCP 结果 |
+
+### 回滚的边界与嵌套错误的保留
+
+**核心问题**：当试探一个 shape 时，内部可能触发深层嵌套（例如解析 `Closure(Any)` 参数时会经历 lex→lite_parse→parse_block→...），产生多个层级的错误。这些错误全部追加到同一个全局 `Vec` 中，那么哪些会被回滚、哪些会保留？
+
+**精确答案**：
+
+1. **全部被回滚**——除非显式判断"某些错误不该回滚"。
+   `truncate(starting_error_count)` 是一个绝对操作：它把数组截断到快照长度，**所有**在快照后追加的错误（无论来自词法注入、lite_parse 注入、深层递归解析、还是 type_check）都会被删除。
+
+2. **`parse_value(Any)` 的选择性保留**：它不总是执行 `truncate`。执行 `truncate` 前提是 `new_errors[0]` 是 `Expected`/`ExpectedWithStringMsg` 类型。如果不是（例如是嵌套解析内部产生的 `Unclosed` 或 `UnexpectedEof`），则**完全不回滚**，直接返回有错误的结果。
+
+3. **`parse_oneof` 的"最优猜测"恢复**：每次尝试后无条件 `truncate`，但在最后会把"走得最远"的那次尝试的错误**重新追加**回来。这样全局 `Vec` 最终只包含最优猜测的错误，而不是每次尝试累积的错误叠加。
+
+### 为什么 Expected 类错误可以回溯，其他不行？
+
+看 [parse_value() Any 分支](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L912-L923)：
+```rust
+match working_set.parse_errors.get(starting_error_count) {
+    // Expected 类错误 → 回溯，继续尝试下一个形状
+    Some(ParseError::Expected(_, _) | ParseError::ExpectedWithStringMsg(_, _)) => {
+        working_set.parse_errors.truncate(starting_error_count);
+        continue;
+    }
+    // 其他类型错误 → 认为是确定性错误，直接返回
+    _ => return s,
+}
+```
+
+**原理**：
+- `Expected("integer", span)` 这类错误的含义是"在当前 shape 约束下，span 内容不符合预期"——但**换一个 shape 就可能正确**。它是"形状不匹配"信号而非"代码错误"信号。
+- 而 `Unclosed("}", span)` 的含义是"代码写到这里少了一个 }"——**不管换什么 shape 解析，这个代码都是错的**。
+- 更进一步：如果深层嵌套内部产生了非 Expected 类错误（例如在解析 Closure shape 时，闭包体内部有语法错误），说明代码确实有问题，应该把这些错误暴露给用户，而不是换个 shape 再试。
+
+### 试探解析与深层递归的协作图
+
+以 `parse_value(Any, span)` 解析形如 `{ a: (1 + ) }` 的代码为例：
+
+```
+parse_value(Any, span="{ a: (1 + ) }")
+  │
+  ├── 尝试 SyntaxShape::Binary
+  │    快照 N = parse_errors.len()
+  │    parse_value(Binary, span) → 失败
+  │    错误 Expected("binary", span) 追加（位于 N）
+  │    first error 是 Expected → truncate(N) 回滚  ←─ 干干净净
+  │
+  ├── 尝试 SyntaxShape::Range
+  │    快照 N = parse_errors.len()
+  │    parse_range(working_set, span) → 失败
+  │    错误 Expected("at least one range bound set", span) 追加
+  │    truncate(N) 回滚
+  │
+  ├── ...（Filesize, Duration, DateTime, Int, Number 都类似）
+  │
+  └── 尝试 SyntaxShape::String
+       快照 N = parse_errors.len()
+       parse_value(String, span)
+         parse_brace_expr()
+           探测 lex（不处理错误）
+           决定走 parse_record()
+             parse_record()
+               增量 lex（3 个 token: `a`, `:`, `(1 + )`）
+               parse_value(Any, value_span="(1 + )")
+                 parse_paren_expr()
+                   快照 N2 = parse_errors.len()
+                   parse_range() 失败 → truncate(N2) 回滚
+                   parse_full_cell_path()
+                     lex("(1 + )", ...) → 产生 token，但不完整
+                     parse_block(内部 tokens, ...)
+                       lite_parse(tokens, ...) → 错误 Option
+                         if let Some(err) = err → working_set.error(err)  追加 ①
+                       parse_pipeline(...)
+                         parse_pipeline_element(...)
+                           parse_math_expression("1 + ", ...)
+                             缺少右操作数 → garbage()
+                             working_set.error(Expected("expression"))   追加 ②
+                       type_check → 可能追加 ③
+                   判断 fcp 新增错误
+                     错误①是 lite_parse 注入的 Expected？
+                     错误②是 math expr 注入的 Expected？
+                     错误① start span > 起始 → 不是 Unclosed/Unbalanced
+                     → 结构正确，不回滚（保留 ①②③）
+
+       parse_errors 新增了 [①, ②, ③]
+       first error ① 的类型 = ?
+         如果 ① 是 Expected 类型 → truncate 回滚！继续下一个 shape？
+           但已经没有下一个 shape 了（String 是 shapes 数组最后一个）
+           → 最终走 Expected("any shape") + garbage()
+         如果 ① 不是 Expected 类型（如 UnexpectedEof）
+           → 直接返回 s，不做进一步尝试
+```
+
+**关键洞察**：当深层嵌套产生的错误被外层试探看到时，试探解析会根据**新增错误的第一个**的类型决定是否回溯。这个第一个错误可能来自：词法层注入、lite_parse 注入、或深层 AST 解析本身——它是**递归路径中最早出错的点**。
+
+---
+
+## 跨层注入、错误保留与编译门槛的全局配合
+
+### 跨层注入点全景图
+
+全局 `StateWorkingSet.parse_errors` 中的错误来源可以精确归类：
+
+| 注入点 | 来源层 | 注入代码 | 产生场景 |
+|---|---|---|---|
+| **注入点 A** | 词法层 | 各嵌套结构入口：`parse_closure_expression` L676-678、`parse_block_expression` L411-413、`parse_table_expression` L248-250、`parse_record` L1870-1872、`parse_full_cell_path` L1046-1048、`parse_match_block_expression` L471-473 | 嵌套结构内部 lex 时检测到未闭合字符串/定界符 |
+| **注入点 B** | 轻量语法层 | `parse_block()` L118-121（每次递归 parse_block 都会触发） | 嵌套块内部 lite_parse 时检测到重定向缺目标 / `||` / 管道不完整 |
+| **注入点 C** | AST 层（作用域） | `working_set.error()` 直接调用 | 变量未定义、重复定义、参数约束违规、Signature 不匹配等语义错误 |
+| **注入点 D** | AST 层（表达式） | `parse_math_expression`、`parse_internal_call` 等 | 缺少操作数、参数数量不对、类型不匹配等语法错误 |
+| **注入点 E** | AST 层（类型检查） | `parse_block()` L177-180 `type_check::check_block_input_output` | Pipeline 输入输出类型不兼容 |
+
+**关键理解**：每一次递归进入 `parse_block()`（解析闭包体、子表达式体、`do` 块体等），都会再次执行 `lite_parse` → 注入点 B 就会被触发一次。也就是说，在整个解析过程中，注入点 B 可能被执行 N 次（N = Block 的嵌套层数）。
+
+### 编译门槛的层级分布与条件
+
+编译门槛（是否执行 `compile_block`）的判断条件是：**全局 `parse_errors.is_empty()`**。
+
+需要特别注意：**所有编译门槛都检查同一个全局变量**——不是"当前块有没有错误"，而是"整个解析过程中累计的所有错误都为空"。
+
+这意味着：
+- 顶层块有 1 个错误 → 所有子闭包**都不编译**
+- 某个嵌套很深的闭包内部有 1 个错误 → 顶层块和所有兄弟闭包**都不编译**
+
+让我们看所有编译触发点的行为：
+
+| 触发位置 | 调用形式 | 调用方是否检查 | `compile_block` 内部检查 | 行为 |
+|---|---|---|---|---|
+| [parse()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_captures_compile.rs#L546-L548) 顶层 | `compile_block(working_set, &mut block)` | **是**：`if parse_errors.is_empty()` | 是 | 双重保险，正确 |
+| [parse_closure_expression()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L767-L769) | `compile_block(working_set, &mut block)` | **是**：`if parse_errors.is_empty()` | 是 | 双重保险，正确 |
+| [parse_def.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_def.rs#L495) 函数体 | `compile_block_with_id(working_set, block_id)` | **否**：直接调用 | 是 | 依赖内部检查，有错误时只打 log |
+| [parse_module.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_module.rs#L449) 模块体 | `compile_block_with_id(working_set, block_id)` | **否**：直接调用 | 是 | 同上 |
+| [parse_signatures.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_signatures.rs#L507) RowCondition | `compile_block(working_set, &mut block)` | **否**：直接调用 | 是 | 同上 |
+| [parse_source.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_source.rs#L130-L132) source 命令 | `compile_block(working_set, block_mut)` | **间接**：检查 `ir_block.is_none()`（暗示可能没编译） | 是 | 有额外判断 |
+
+**一个重要的实际效果**：`parse_def.rs` 和 `parse_module.rs` 等入口**不检查** `parse_errors` 就调用 `compile_block_with_id`。但是 `compile_block_with_id` 内部会做同样的检查，如果有错误就 `return`（并打 error log）。从功能角度是等价的，只是 log 中会出现 `compile_block_with_id called with parse errors`——这被注释认为"可能是 parser 的一个 bug，但不会致命"。
+
+### 编译门槛与试探回溯的交互
+
+试探回溯通过 `truncate` 删除错误，**可能让本来不为空的 `parse_errors` 重新变为空**。这个顺序很重要。
+
+看这个场景：
+```
+初始：parse_errors = []  ← 空
+  │
+  ▼
+parse_value(Any, span)
+  尝试 Int：快照 N=0
+    parse_value(Int, "(1+2)")
+      parse_paren_expr()
+        parse_full_cell_path()
+          lex 出错 → working_set.error(Unclosed(")"))  追加 ①
+          parse_block()
+            lite_parse 出错 → working_set.error(Expected(...))  追加 ②
+        parse_errors = [①, ②]
+      first error ① = Unclosed，不是 Expected
+      → 不回溯，直接返回这个结果（Int 尝试"失败"但保留错误）
+    注意：此时 parse_errors != [], 因为 first error 不是 Expected
+    这个分支实际上立即 return s，不继续尝试其他 shape
+  parse_errors = [①, ②]
+  返回 s（带错误）
+  │
+  ▼
+parse_closure_expression 末尾编译检查：
+  if parse_errors.is_empty() → FALSE（有 ① ②）
+  → 不编译
+```
+
+如果场景变成 first error 是 Expected：
+```
+初始：parse_errors = []
+  │
+  ▼
+parse_value(Any, span)
+  尝试 Int：快照 N=0
+    parse_value(Int, "0x123")  ← 十六进制 Int 识别不出来
+      working_set.error(Expected("integer"))  追加 ①
+    first error ① = Expected("integer")
+    → truncate(0) 回滚！
+  parse_errors = []  ← 回到空！
+  │
+  继续尝试 Number：
+    快照 N=0
+    parse_value(Number, "0x123")
+      working_set.error(Expected("number"))  追加 ①
+    → truncate(0) 回滚！
+  parse_errors = []
+  ...
+  │
+  最终尝试 String 成功
+  parse_errors = []  ← 仍然为空
+  │
+  ▼
+parse_closure_expression 末尾编译检查：
+  if parse_errors.is_empty() → TRUE
+  → 编译！✓
+```
+
+**顺序依赖**：回溯必须发生在编译门槛检查之前。由于回溯发生在 `parse_value` / `parse_oneof` / `parse_paren_expr` 内部，这些都是**解析阶段**的操作，而编译发生在**解析完成之后**（parse_block 返回后），所以顺序天然满足。
+
+### 全局机制的全景时序图
+
+```
+parse() 顶层入口
+  │
+  │ parse_errors 初始: []
+  │
+  ├─ ① lex(顶层) → err: Option
+  │      if Some → working_set.error(err)  ←─ 词法层顶层注入
+  │
+  ├─ ② parse_block(顶层 tokens)
+  │      │
+  │      ├─ lite_parse(tokens) → err: Option
+  │      │      if Some → working_set.error(err)  ←─ B (顶层)
+  │      │
+  │      ├─ parse_def_predecl()
+  │      │
+  │      ├─ for each pipeline:
+  │      │      parse_pipeline()
+  │      │        parse_pipeline_element()
+  │      │          parse_expression()
+  │      │            parse_call()
+  │      │              parse_internal_call()
+  │      │                parse_value(Any)  ←─ 试错回溯 1
+  │      │                parse_value(Closure)
+  │      │                  parse_brace_expr()  ←─ 探测性 lex (丢弃错误)
+  │      │                    parse_closure_expression()
+  │      │                      │
+  │      │                      ├─ lex(closure body) → err
+  │      │                      │   if Some → error(err)  ←─ A (闭包1)
+  │      │                      │
+  │      │                      ├─ parse_block(closure tokens)
+  │      │                      │     │
+  │      │                      │     ├─ lite_parse → err
+  │      │                      │     │   if Some → error(err)  ←─ B (闭包1)
+  │      │                      │     │
+  │      │                      │     ├─ for pipeline in closure:
+  │      │                      │     │    parse_pipeline()
+  │      │                      │     │      parse_expression()
+  │      │                      │     │        parse_value(Any)
+  │      │                      │     │          parse_paren_expr() ← 试错回溯 2
+  │      │                      │     │            truncate ←─ 删除 N3..N 的所有错误
+  │      │                      │     │
+  │      │                      │     └─ type_check → errors
+  │                      │              working_set.parse_errors.extend(errors)  ←─ E
+  │                      │
+  │                      ├─ 闭包编译门槛:
+  │                      │    if parse_errors.is_empty() {
+  │                      │        compile_block()  ← 内部再次检查 is_empty()
+  │                      │    }
+  │                      │
+  │                      └─ 返回 Expr::Closure(block_id)
+  │
+  ├─ ③ 顶层编译门槛:
+  │      if parse_errors.is_empty() {
+  │          compile_block(working_set, &mut output)
+  │      }
+  │
+  ├─ ④ discover_captures_in_closure() 计算捕获
+  │      (发生错误也 working_set.error(err) 追加)
+  │
+  └─ ⑤ 返回 Arc<Block>
+      最终 parse_errors 在 StateWorkingSet 中供上层使用
+```
+
+---
+
+## IR 编译的前置条件（补充细节）
 
 ### compile_block() 的自我保护
 
@@ -541,101 +907,47 @@ if working_set.parse_errors.is_empty() {
 
 原因：闭包的 `Block` 存储在 `StateWorkingSet` 的块表中，而 IR 编译器只有 `&StateWorkingSet` 不可变访问权，无法回填 `IrBlock`。因此闭包必须在解析阶段（此时 working_set 是可变的）就完成编译。
 
-### 其他编译触发点
+---
 
-`compile_block` 和 `compile_block_with_id` 在多处被调用，包括：
-- `parse_def.rs` — 函数定义的体块
-- `parse_module.rs` — 模块体
-- `parse_signatures.rs` — 签名相关块
-- `parse_source.rs` — source 命令的块
+## 三层错误载体对比总结
 
-大多数调用方都会检查 `parse_errors.is_empty()`，但由于 `compile_block` 内部有保护，即使漏检查也不会崩溃（只是会打一条 error log）。
+| 层次 | 错误载体 | 累积方式 | 访问 WorkingSet | 注入到全局的位置 |
+|---|---|---|---|---|
+| 词法层 | `Option<ParseError>`（返回值） | 只保留第一个 | 不访问 | 顶层 `parse()` L535-538 + 各嵌套结构入口 Lx（共 6+ 处） |
+| 轻量语法层 | `Option<ParseError>`（返回值） | 只保留第一个 | 只读（`&StateWorkingSet`） | `parse_block()` L118-121（每次递归 parse_block 都会注入） |
+| AST 构建层 | `Vec<ParseError>`（`StateWorkingSet` 字段） | 全部追加 | 可变（`&mut StateWorkingSet`） | 直接追加，分散各处 + 试探回滚用 truncate |
 
 ---
 
-## 递归解析的特例：嵌套结构
+## 总结：核心机制协作关系
 
-Nushell 中复合结构（列表、表、记录、闭包、块、子表达式）的解析会触发递归的 lex + parse：
+### 1. 错误收集的层级关系
 
-| 结构 | 词法方式 | 解析入口 |
-|---|---|---|
-| 列表 `[a, b]` | `lex()` 一次性 | `parse_list_expression()` |
-| 表 `[[a b]; [1 2]]` | `lex()` 一次性 | `parse_table_expression()` |
-| 记录 `{a: 1}` | `lex_n_tokens()` 增量 | `parse_record()` |
-| 闭包 `{ \|x\| ... }` | `lex()` 一次性 | `parse_closure_expression()` |
-| 块 `{ ... }` | `lex()` 一次性 | `parse_block_expression()` |
-| 子表达式 `(expr)` | `lex()` 一次性 | `parse_paren_expr()` → `parse_block(is_subexpression=true)` |
-| 匹配块 `match { ... }` | `lex()` + 手动遍历 | `parse_match_block_expression()` |
+- **词法和轻量语法层**：各自用 `Option<ParseError>` 返回值独立运行，都只保留自己层次中遇到的**第一个**错误，彼此互不知道。它们的错误通过调用方的 `if let Some(err) = err { working_set.error(err) }` 注入到全局 `Vec`——这个模式在代码中出现了 **8+ 处**（顶层 parse、每个嵌套结构的 lex 后、每个 parse_block 的 lite_parse 后）。
 
-**记录的增量词法**：[parse_record()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L1795-L2018) 使用 `lex_n_tokens()` 每次只 lex 一个 token，这是因为记录的 `:` 分隔符需要作为 `special_tokens` 处理，而键和值的边界需要精确控制。
+- **AST 构建层**：直接操作共享的 `Vec<ParseError>`，可以累积任意数量的错误。但在试探解析场景下，可以通过"快照 + `truncate`"**有选择地删除**刚追加的一批错误。
 
----
+### 2. 试探回溯与跨层注入的协作
 
-## 总结：三层协作关系
+- 回溯基于"错误数量快照 + truncate"，是**绝对操作**——不管新错误来自词法层、lite_parse 层还是深层语义检查，全部一次性清除。
+- 但是否执行回溯，取决于**新增第一个错误的类型**：
+  - `Expected` / `ExpectedWithStringMsg` → 回溯（这是"形状不匹配"，试下一个形状）
+  - 其他类型（`Unclosed`、`Unbalanced`、`UnexpectedEof` 等） → 不回溯（这是"代码有问题"，直接报出）
+- `parse_oneof` 更激进：总是回溯，但最后会把"最优猜测"（走得最远的那次）的错误再补回来。
 
-### 核心数据契约
+### 3. 编译门槛的全局语义
 
-| 层次 | 输入 | 输出 | 核心职责 | 错误载体 | 错误策略 |
-|---|---|---|---|---|---|
-| **词法层** (lex) | 字节流 | `(Vec<Token>, Option<ParseError>)` | 分词、字符串/定界符嵌套、重定向识别 | `Option` | 记首个错，继续扫描 |
-| **轻量语法层** (lite_parse) | `&[Token]` | `(LiteBlock, Option<ParseError>)` | 组织命令/管道/重定向/注释/属性 | `Option` | 记首个错，产出完整结构 |
-| **AST 层** (parse_block 等) | `LiteBlock` | `Block` (含完整 AST) | 类型推断、关键字分发、优先级解析、变量作用域 | `Vec<ParseError>` in StateWorkingSet | Garbage 占位 + 全量累积 + 试错回溯 |
+- **判断对象是同一个全局 `parse_errors`**。不是"当前块"或"当前作用域"的错误，而是"整个解析过程中累计的所有错误"。
+- 因此：**任何嵌套层级产生的 1 个未被回滚的错误，都会阻止整个解析过程中的所有块编译**——包括顶层块、所有子闭包、所有嵌套块。
+- 双重保险：所有调用方要么显式检查 `is_empty()`，要么依赖 `compile_block` 内部的检查（此时会打一条 error log，被注释认为"可能是 parser bug"）。
 
-### 错误流总图
-
-```
-Source bytes
-    │
-    ▼
-┌───────────────────────────────────────────────────┐
-│  lex()                                            │
-│  错误: Option<ParseError> (只记第一个)             │
-└───────────────────────┬───────────────────────────┘
-                        │
-                        │ parse() 注入:
-                        │   if let Some(err) = err {
-                        │       working_set.error(err)
-                        │   }
-                        ▼
-              StateWorkingSet.parse_errors
-                        ▲
-                        │ parse_block() 注入:
-                        │   if let Some(err) = err {
-                        │       working_set.error(err)
-                        │   }
-                        │
-┌───────────────────────┴───────────────────────────┐
-│  lite_parse()                                      │
-│  错误: Option<ParseError> (只记第一个)             │
-│  working_set: 只读访问                             │
-└───────────────────────┬───────────────────────────┘
-                        │
-                        ▼
-┌───────────────────────────────────────────────────┐
-│  parse_block() / parse_expression() / ...         │
-│  错误: 直接 working_set.error(err) 追加            │
-│  working_set: 可变访问                             │
-│  Garbage 占位保证 AST 结构完整                     │
-│  parse_value(Any) / parse_oneof → truncate 回溯   │
-└───────────────────────┬───────────────────────────┘
-                        │
-                        │ 编译门槛:
-                        │   if working_set.parse_errors.is_empty()
-                        │
-                        ▼
-              ┌─────────────────────┐
-              │  compile_block()    │  双重检查：内部也会判断 parse_errors
-              │  产出: IrBlock      │
-              └─────────────────────┘
-```
-
-### 关键设计原则
+### 4. 全局一致的设计哲学
 
 1. **每层独立产出有效输出**：即使存在错误，每层也保证产出结构完整的输出（token 流、LiteBlock、Block）
 2. **两层 Option + 一层 Vec**：词法和轻量语法层各自只记首个错（通过返回值 `Option`），AST 层累积所有错（通过 `StateWorkingSet` 共享的 `Vec`）
 3. **错误侧传**：错误通过返回值或全局状态的 side channel 传递，不影响函数的正常返回值路径
 4. **无 Result 传播**：解析函数几乎都返回值本身，而非 `Result`，确保下游总能拿到可用的结构
-5. **双重编译保险**：调用方检查 + `compile_block` 内部检查，确保 IR 绝不在有解析错误的 AST 上运行
-6. **闭包立即编译**：闭包在解析期就编译 IR，因为后续编译阶段没有可变访问权来回填
+5. **试探基于全局错误快照**：truncate 绝对回滚，但 first error 类型决定"要不要回滚"
+6. **编译门槛统一**：同一个全局 is_empty() 检查，双重保险，错误零容忍
 
-这种设计使得 Nushell 的解析器能够**一次性报告尽可能多的错误**，而非遇到首个错误就终止——这对 IDE 智能提示和 REPL 体验尤为重要。
+这种设计使得 Nushell 的解析器能够**一次性报告尽可能多的错误**（AST 层不中断），同时在形状歧义场景下能高效试错（truncate 回滚干净）。任何未被回滚的错误都会导致所有块不编译，确保损坏 AST 永不进入执行引擎。
