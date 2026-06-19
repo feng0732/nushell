@@ -84,8 +84,10 @@ impl ConfigFileKind {
 
 ```rust
 // nu-protocol/src/engine/engine_state.rs#L382-L384
+//   stack.config: Option<Arc<Config>>  →  take() 解包为 Arc<Config>
+//   self.config: Arc<Config>           →  赋值一侧也是 Arc<Config>
 if let Some(config) = stack.config.take() {
-    self.config = config;   // Arc<Arc<Config>> 整体指针替换
+    self.config = config;   // Arc<Config> 引用替换，零拷贝
 }
 ```
 
