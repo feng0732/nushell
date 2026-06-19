@@ -2,6 +2,8 @@
 
 本文档对照代码，厘清 Nushell 插件系统中 **协议层**（消息帧定义）、**序列化层**（字节编码）、**I/O层**（通信通道）与 **进程生命周期**（子进程管理/GC/异常隔离）的清晰边界。
 
+> **路径约定**：本文所有代码引用均为仓库根目录下的相对路径，格式为 `crates/<crate>/src/...`。
+
 ---
 
 ## 0. 代码仓库分层概览
@@ -10,10 +12,10 @@
 
 | Crate | 职责 | 关键文件 |
 |---|---|---|
-| `nu-plugin-protocol` | **纯类型定义**：消息帧枚举 + Serde 实现，**零 I/O** | [lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-protocol/src/lib.rs) |
-| `nu-plugin-core` | **共享逻辑**：序列化器、通信模式、流多路复用、接口抽象 | [serializers/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-core/src/serializers/mod.rs)、[communication_mode/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-core/src/communication_mode/mod.rs)、[interface/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-core/src/interface/mod.rs) |
-| `nu-plugin-engine` | **引擎侧**：子进程 spawn、PersistentPlugin 持久化、GC 垃圾回收、异常隔离屏障 | [init.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-engine/src/init.rs)、[persistent.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-engine/src/persistent.rs)、[gc.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-engine/src/gc.rs)、[interface/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-engine/src/interface/mod.rs) |
-| `nu-plugin` | **插件侧 SDK**：供第三方插件使用的服务端循环、EngineInterface | `crates/nu-plugin/src/plugin/` |
+| `nu-plugin-protocol` | **纯类型定义**：消息帧枚举 + Serde 实现，**零 I/O** | `crates/nu-plugin-protocol/src/lib.rs` |
+| `nu-plugin-core` | **共享逻辑**：序列化器、通信模式、流多路复用、接口抽象 | `crates/nu-plugin-core/src/serializers/mod.rs`、`crates/nu-plugin-core/src/communication_mode/mod.rs`、`crates/nu-plugin-core/src/interface/mod.rs` |
+| `nu-plugin-engine` | **引擎侧**：子进程 spawn、PersistentPlugin 持久化、GC 垃圾回收、异常隔离屏障 | `crates/nu-plugin-engine/src/init.rs`、`crates/nu-plugin-engine/src/persistent.rs`、`crates/nu-plugin-engine/src/gc.rs`、`crates/nu-plugin-engine/src/interface/mod.rs` |
+| `nu-plugin` | **插件侧 SDK**：供第三方插件使用的服务端循环、EngineInterface | `crates/nu-plugin/src/plugin/mod.rs` |
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -31,7 +33,7 @@
 ┌──────────────────▼───────────────────────────────────────────┐
 │                    插件子进程 (独立地址空间)                    │
 │  ┌───────────────────────────────────────────────────────┐   │
-│  │ nu-plugin: EngineInterfaceManager / serve() 循环       │   │
+│  │ nu-plugin: EngineInterfaceManager / serve_plugin()    │   │
 │  └───────────────┬───────────────────────────────────────┘   │
 │                  │                                             │
 │  ┌───────────────▼───────────────────────────────────────┐   │
@@ -56,7 +58,7 @@
 | `PluginCallId` | `usize` | 标识一次引擎→插件调用（Metadata/Signature/Run 等） | 发出 Call → 收到 CallResponse |
 | `EngineCallId` | `usize` | 标识一次插件→引擎回调（GetEnv/EvalClosure 等） | 发出 EngineCall → 收到 EngineCallResponse |
 
-见 [lib.rs#L42-L49](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-protocol/src/lib.rs#L42-L49)。
+见 `crates/nu-plugin-protocol/src/lib.rs` 第 42-49 行。
 
 ### 1.2 消息帧枚举
 
@@ -75,7 +77,7 @@ pub enum PluginInput {
     Signal(SignalAction),          // 信号中继 (Ctrl+C)
 }
 ```
-见 [lib.rs#L288-L311](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-protocol/src/lib.rs#L288-L311)。
+见 `crates/nu-plugin-protocol/src/lib.rs` 第 288-311 行。
 
 #### 插件 → 引擎：`PluginOutput`
 
@@ -95,7 +97,7 @@ pub enum PluginOutput {
     Ack(StreamId),
 }
 ```
-见 [lib.rs#L509-L536](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-protocol/src/lib.rs#L509-L536)。
+见 `crates/nu-plugin-protocol/src/lib.rs` 第 509-536 行。
 
 #### 流帧的统一抽象：`StreamMessage`
 
@@ -109,7 +111,7 @@ pub enum StreamMessage {
     Ack(StreamId),
 }
 ```
-见 [lib.rs#L397-L410](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-protocol/src/lib.rs#L397-L410)。
+见 `crates/nu-plugin-protocol/src/lib.rs` 第 397-410 行。
 
 ### 1.3 PipelineDataHeader：管道数据的"首帧"
 
@@ -123,7 +125,7 @@ pub enum PipelineDataHeader {
     ByteStream(ByteStreamInfo { id, type_, .. }), // 流：后续 StreamMessage::Data(id, Raw(bytes))
 }
 ```
-见 [lib.rs#L121-L135](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-protocol/src/lib.rs#L121-L135)。
+见 `crates/nu-plugin-protocol/src/lib.rs` 第 121-135 行。
 
 ### 1.4 协议版本协商：Hello 帧
 
@@ -136,15 +138,16 @@ pub struct ProtocolInfo {
     pub features: Vec<Feature>, // 可选特性：LocalSocket 等
 }
 ```
+
 兼容性判定：**低版本 semver caret 兼容高版本**（如 1.1.x 与 1.2.x 兼容，但 1.x 与 2.x 不兼容）。nightly 版本的预发布后缀在比较时被忽略。
 
-见 [protocol_info.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-protocol/src/protocol_info.rs)。
+见 `crates/nu-plugin-protocol/src/protocol_info.rs`。
 
 ---
 
 ## 2. 序列化层 (Serialization)
 
-定义在 `nu-plugin-core/src/serializers/`。序列化层的抽象是 **Encoder trait**，它**只关心如何将消息帧 ↔ 字节流**，不关心通道是什么（pipe/socket）。
+定义在 `crates/nu-plugin-core/src/serializers/`。序列化层的抽象是 **Encoder trait**，它**只关心如何将消息帧 ↔ 字节流**，不关心通道是什么（pipe/socket）。
 
 ### 2.1 Encoder 抽象
 
@@ -158,7 +161,7 @@ pub trait PluginEncoder: Encoder<PluginInput> + Encoder<PluginOutput> {
     fn name(&self) -> &str;  // "json" 或 "msgpack"
 }
 ```
-见 [serializers/mod.rs#L12-L32](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-core/src/serializers/mod.rs#L12-L32)。
+见 `crates/nu-plugin-core/src/serializers/mod.rs` 第 12-32 行。
 
 ### 2.2 JSON 序列化器 (JsonSerializer)
 
@@ -170,7 +173,7 @@ pub trait PluginEncoder: Encoder<PluginInput> + Encoder<PluginOutput> {
 // encode: serde_json::to_writer(...) + write_all(b"\n")
 // decode: PluginInput::deserialize(&mut de) → Ok(Some) 或 is_eof() → Ok(None)
 ```
-见 [serializers/json.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-core/src/serializers/json.rs)。
+见 `crates/nu-plugin-core/src/serializers/json.rs`。
 
 ### 2.3 MsgPack 序列化器 (MsgPackSerializer)
 
@@ -178,7 +181,7 @@ pub trait PluginEncoder: Encoder<PluginInput> + Encoder<PluginOutput> {
 - 使用 `rmp_serde::encode::write_named`（命名字段，便于跨语言兼容）
 - **EOF 判定**：`InvalidMarkerRead(UnexpectedEof)` 或 `InvalidDataRead(UnexpectedEof)` → `Ok(None)`
 
-见 [serializers/msgpack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-core/src/serializers/msgpack.rs)。
+见 `crates/nu-plugin-core/src/serializers/msgpack.rs`。
 
 ### 2.4 编码协商握手（Encoding Negotiation）
 
@@ -188,12 +191,14 @@ pub trait PluginEncoder: Encoder<PluginInput> + Encoder<PluginOutput> {
 ```
 如：`\x04json` 或 `\x07msgpack`。
 
-引擎侧读取逻辑：`get_plugin_encoding()` 在 [init.rs#L195-L218](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-engine/src/init.rs#L195-L218)：
+引擎侧读取逻辑：`get_plugin_encoding()` 在 `crates/nu-plugin-engine/src/init.rs` 第 195-218 行：
 
 ```rust
 // 读 1 字节长度 → 读 N 字节名称 → EncodingType::try_from_bytes(&buf)
 // 支持值: b"json" → JsonSerializer, b"msgpack" → MsgPackSerializer
 ```
+
+插件侧发送逻辑：`tell_nushell_encoding()` 在 `crates/nu-plugin/src/plugin/mod.rs` 第 378-392 行。
 
 > **边界关键**：这 1+N 字节**不经过 Encoder**，是序列化层的外层引导字节。它发生在 Hello 帧之前。
 
@@ -213,7 +218,7 @@ Encoder 的错误被严格分为三类，体现了协议层与 I/O 层的边界�
 
 ## 3. I/O 层：通信模式 (Communication Mode)
 
-定义在 `nu-plugin-core/src/communication_mode/mod.rs`。这一层**只关心字节通道的建立**，不理解消息帧内容。
+定义在 `crates/nu-plugin-core/src/communication_mode/mod.rs`。这一层**只关心字节通道的建立**，不理解消息帧内容。
 
 ### 3.1 Stdio 模式（默认）
 
@@ -231,8 +236,9 @@ Encoder 的错误被严格分为三类，体现了协议层与 I/O 层的边界�
 - 插件通过 `--local-socket <name>` 参数连接两次：一次读、一次写
 - **优点**：stdio 还给插件，可直接与终端 TTY 交互
 - 协商：Hello 帧 `features: [LocalSocket]` 后，引擎自动重启插件切换到此模式
+- 连接超时：10 秒（`const TIMEOUT: Duration = Duration::from_secs(10)`）
 
-见 [communication_mode/mod.rs#L23-L135](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-core/src/communication_mode/mod.rs#L23-L135)。
+见 `crates/nu-plugin-core/src/communication_mode/mod.rs` 第 180、223 行。
 
 ### 3.3 连接建立流程（3步握手）
 
@@ -263,7 +269,7 @@ Encoder 的错误被严格分为三类，体现了协议层与 I/O 层的边界�
 
 ### 4.1 子进程启动：PersistentPlugin 的懒加载
 
-`PersistentPlugin` 是**引擎侧**对插件生命周期的唯一持有入口，位于 `nu-plugin-engine/src/persistent.rs`。
+`PersistentPlugin` 是**引擎侧**对插件生命周期的唯一持有入口，位于 `crates/nu-plugin-engine/src/persistent.rs`。
 
 ```rust
 pub struct PersistentPlugin {
@@ -287,7 +293,7 @@ struct RunningPlugin {
 
 **懒启动流程**（`PersistentPlugin::get()` → `spawn()`）：
 1. 锁 `mutable`，若 `running.is_some()` → 直接 clone interface 返回
-2. 否则调用 `create_command()`：
+2. 否则调用 `create_command()`（见 `crates/nu-plugin-engine/src/init.rs` 第 35-101 行）：
    - 根据扩展名自动选择解释器（`.py`→python，`.nu`→`nu --stdin`，`.jar`→`java -jar` 等）
    - **关键隔离1：新进程组**！Unix `process_group(0)`，Windows `CREATE_NEW_PROCESS_GROUP`
    - **关键隔离2：CWD 隔离**：工作目录设为插件可执行文件所在目录，避免污染引擎 cwd
@@ -297,8 +303,6 @@ struct RunningPlugin {
 6. `make_plugin_interface()` → `get_plugin_encoding()` → hello 握手
 7. **模式升级尝试**：若 Hello 携带 `LocalSocket` feature → 停止当前插件，重启为 LocalSocket 模式
 8. 将 `RunningPlugin` 存入 `mutable.running`
-
-见 [persistent.rs#L61-L226](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-engine/src/persistent.rs#L61-L226) 和 [init.rs#L35-L101](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-engine/src/init.rs#L35-L101)。
 
 ### 4.2 读线程与错误屏障：consume_all()
 
@@ -328,14 +332,17 @@ pub fn consume_all(&mut self, mut reader: impl PluginRead<PluginOutput>) -> Resu
     result
 }
 ```
-见 [interface/mod.rs#L417-L452](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-engine/src/interface/mod.rs#L417-L452)。
+见 `crates/nu-plugin-engine/src/interface/mod.rs` 第 417-452 行。
 
-**三层错误隔离**：
+**引擎侧三层错误隔离**：
 | 层次 | 机制 | 效果 |
 |---|---|---|
 | **进程级** | 新进程组 + 独立地址空间 | 插件 panic / abort / 内存泄漏 不影响引擎 |
 | **通道级** | 读线程捕获 I/O / 解码错误 → 广播 → break | 所有等待方收到错误，**无死锁** |
 | **调用级** | `state.error: OnceLock<ShellError>` | 后续新调用在 `plugin_call()` 入口**直接短路返回**，不会写入半关闭通道 |
+
+**插件侧的异常隔离**（对称存在）：
+插件侧 `serve_plugin_io()` 也有对应的 "engine interface reader" 读线程。此外，每个 Run 调用在独立线程中执行，并用 `std::panic::catch_unwind(AssertUnwindSafe(|| { ... }))` 捕获 panic，若发生 panic 则调用 `std::process::exit(1)` 退出进程。见 `crates/nu-plugin/src/plugin/mod.rs` 第 515-539 行。
 
 ### 4.3 插件垃圾回收 (PluginGc)
 
@@ -355,7 +362,14 @@ GC 停止条件（需 **同时满足**）：
 1. `config.enabled == true`
 2. `disabled == false`（可被插件通过 `PluginOption::GcDisabled(true)` 覆盖）
 3. `locks == 0`（无活跃调用 / 无活跃流）
-4. 距 `last_update` 超过 `config.stop_after`（默认 10 秒）
+4. 距 `last_update` 超过 `config.stop_after`
+
+> **关于默认值的说明**：
+> - `PluginGcConfig::default()` 的 `stop_after` 是 **10 秒**（10_000_000_000 纳秒）
+> - 但 `PluginGcConfigs`（配置文件中的默认配置）的 default 是 **30 秒**
+> - 实际运行时以 `$env.config.plugin_gc.default` 为准，每个插件也可单独配置
+
+见 `crates/nu-protocol/src/config/plugin_gc.rs` 第 56-58、114-116 行。
 
 **锁计数规则**（见 `PluginGc::increment_locks / decrement_locks`）：
 - **+1**：每次发起 PluginCall（`write_plugin_call` 结尾）
@@ -363,7 +377,7 @@ GC 停止条件（需 **同时满足**）：
 - **+1**：每次开始读来自插件的流（`recv_stream_started`）
 - **-1**：每次结束读来自插件的流（`recv_stream_ended` / `StreamMessage::End`）
 
-见 [gc.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-engine/src/gc.rs)。
+见 `crates/nu-plugin-engine/src/gc.rs`。
 
 ### 4.4 优雅关闭链
 
@@ -376,7 +390,7 @@ GC 停止条件（需 **同时满足**）：
 | **超时**：GC 线程 | `PersistentPlugin::stop()`（同上） | |
 
 **Goodbye 语义**：
-- `Goodbye` 只是"**不再接受新的 PluginCall**"
+- `Goodbye` 只是"**不再接受新的 PluginCall**"（引擎发给插件，属于 `PluginInput` 枚举）
 - 正在执行的调用 / 正在传输的流 **继续完成**
 - 插件完成所有工作后自行退出进程（因此引擎只需等待 EOF）
 
@@ -407,7 +421,7 @@ StreamManager (InterfaceManager 持有)
 
 每个 `StreamId` 都被注册为一条独立的 mpsc 通道。`StreamMessage`（Data/End/Drop/Ack）被 `handle_message()` 分发到对应通道。
 
-见 [interface/stream/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-core/src/interface/stream/mod.rs)。
+见 `crates/nu-plugin-core/src/interface/stream/mod.rs`。
 
 ### 5.2 流量控制（背压）
 
@@ -429,7 +443,7 @@ StreamManager (InterfaceManager 持有)
 - PluginCallResponse 到达后，若还有流未读完，**不释放** `PluginCallState`（保留上下文以处理 EngineCall）
 - 所有流 End 后，计数器归零，才清理状态
 
-见 `recv_stream_started` / `recv_stream_ended` 在 [interface/mod.rs#L206-L235](file:///d:/fz/0601-2/solo-dogfeeding/code/64-nushell/crates/nu-plugin-engine/src/interface/mod.rs#L206-L235)。
+见 `recv_stream_started` / `recv_stream_ended` 在 `crates/nu-plugin-engine/src/interface/mod.rs` 第 206-235 行。
 
 ---
 
@@ -438,8 +452,8 @@ StreamManager (InterfaceManager 持有)
 | 问题 | 归哪层 | 关键代码位置 |
 |---|---|---|
 | "PluginCall 有几个 variant？" | 协议帧层 | `nu-plugin-protocol::PluginCall` |
-| "JSON 编码时末尾加不加 \\n？" | 序列化层 | `serializers/json.rs` |
-| "本地 socket 超时时间是多少？" | I/O层（CommMode） | `communication_mode/mod.rs TIMEOUT = 10s` |
+| "JSON 编码时末尾加不加 \\n？" | 序列化层 | `crates/nu-plugin-core/src/serializers/json.rs` |
+| "本地 socket 超时时间是多少？" | I/O层（CommMode） | `crates/nu-plugin-core/src/communication_mode/mod.rs` 中 `TIMEOUT = 10s` |
 | "插件死掉了调用者会卡吗？" | 异常隔离（读线程屏障） | `PluginInterfaceManager::consume_all` |
 | "什么时候会自动关掉空闲插件？" | 生命周期（GC） | `PluginGcState::next_timeout` |
 | "一条流发太快会 OOM 吗？" | 流复用层（背压） | `StreamWriterSignal HIGH_PRESSURE` |
