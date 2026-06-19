@@ -853,59 +853,274 @@ parse() 顶层入口
 
 ---
 
-## IR 编译的前置条件（补充细节）
+## IR 编译的触发时序与全局状态交互
 
-### compile_block() 的自我保护
+### compile_block() / compile_block_with_id() 的自我保护
 
-[compile_block()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_captures_compile.rs#L11-L26) 自身有第一道防线：
+[compile_block()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_captures_compile.rs#L11-L26) 和 [compile_block_with_id()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_captures_compile.rs#L28-L45) 自身都有同一道防线：
 
 ```rust
 pub fn compile_block(working_set: &mut StateWorkingSet<'_>, block: &mut Block) {
     if !working_set.parse_errors.is_empty() {
-        // This means there might be a bug in the parser, since calling this function
-        // while parse errors are present is a logic error.
-        // However, it's not fatal and it's best to continue without doing anything.
         log::error!("compile_block called with parse errors");
-        return;
+        return;   // 不编译，Block.ir_block 保持 None
     }
-
     match nu_engine::compile(working_set, block) {
         Ok(ir_block) => { block.ir_block = Some(ir_block); }
         Err(err) => working_set.compile_errors.push(err),
     }
 }
-```
 
-注意：这里比较的是 `parse_errors`（解析错误），而 `compile_errors` 是另一回事。即使解析成功，编译也可能产生编译错误。
-
-### 顶层编译触发点
-
-[parse() 函数第 546-548 行](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_captures_compile.rs#L546-L548)：
-
-```rust
-if working_set.parse_errors.is_empty() {
-    compile_block(working_set, Arc::make_mut(&mut output));
+pub fn compile_block_with_id(working_set: &mut StateWorkingSet<'_>, block_id: BlockId) {
+    if !working_set.parse_errors.is_empty() {
+        log::error!("compile_block_with_id called with parse errors");
+        return;   // 不编译，Block.ir_block 保持 None
+    }
+    match nu_engine::compile(working_set, working_set.get_block(block_id)) {
+        Ok(ir_block) => {
+            working_set.get_block_mut(block_id).ir_block = Some(ir_block);
+        }
+        Err(err) => working_set.compile_errors.push(err),
+    }
 }
 ```
 
-顶层 Block 的编译**只在零解析错误时**触发。即使 `compile_block` 自身有保护，调用方也做了检查——双重保险。
+**关键理解**：
+- 两个函数检查的都是 `parse_errors`（解析错误），不是 `compile_errors`
+- 即使解析成功，编译也可能产生 `compile_errors`——这是独立通道
+- 编译成功时 `block.ir_block = Some(ir_block)`；编译失败或跳过时 `ir_block` 保持 `None`
+- **没有回退机制**：一旦 `ir_block` 被设为 `Some(...)`，永远不会被清回 `None`
 
-### 闭包的立即编译
+### 所有编译触发点的完整清单
 
-闭包比较特殊，它需要在解析时就立即编译。[parse_closure_expression()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L759-L769)：
+按在 `parse()` → `parse_block()` 递归中的执行先后排列：
+
+| 序号 | 触发位置 | 调用形式 | 调用方是否检查 | 编译对象 | 何时执行 |
+|---|---|---|---|---|---|
+| ① | `parse_closure_expression()` [L767-769](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L767-L769) | `compile_block(working_set, &mut output)` | **是**：`if parse_errors.is_empty()` | 闭包体的 `Block`（在 `add_block` 之前） | parse_block 递归中 |
+| ② | `parse_expression()` with-env 简写 [L1566](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L1566) | `compile_block(working_set, &mut block)` | **否**：直接调用 | 环境简写包装的临时 `Block` | parse_block 递归中 |
+| ③ | `parse_def()` 函数体 [L495](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_def.rs#L495) | `compile_block_with_id(working_set, *block_id)` | **否**：直接调用 | `def` 的闭包体 Block（已 `add_block`） | parse_block 递归中 |
+| ④ | `parse_module()` export-env 块 [L449](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_module.rs#L449) | `compile_block_with_id(working_set, block_id)` | **否**：直接调用 | export-env 的 Block（已 `add_block`） | parse_block 递归中 |
+| ⑤ | `parse_row_condition()` [L507](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_signatures.rs#L507) | `compile_block(working_set, &mut block)` | **否**：直接调用 | RowCondition 的 `Block`（在 `add_block` 之前） | parse_block 递归中 |
+| ⑥ | `parse_source()` source 命令 [L130-132](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_source.rs#L130-L132) | `compile_block(working_set, block_mut)` | **间接**：`if block.ir_block.is_none()` | source 进来的文件 Block | parse_block 递归中 |
+| ⑦ | `parse()` 顶层 [L546-548](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_captures_compile.rs#L546-L548) | `compile_block(working_set, Arc::make_mut(&mut output))` | **是**：`if parse_errors.is_empty()` | 顶层 `Block` | parse_block 返回后 |
+
+### 编译触发的时序图
+
+以解析 `def foo [] { 1 + 2 }; let x = { 3 + 4 }` 为例：
+
+```
+parse() 顶层入口
+  │
+  ├─ lex(顶层) → tokens
+  │   如有词法错误 → working_set.error(err)    parse_errors: [E0?]
+  │
+  ├─ parse_block(顶层 tokens)
+  │     │
+  │     ├─ lite_parse(tokens) → 如有错 → error(err)   parse_errors: [..., E1?]
+  │     │
+  │     ├─ parse_def_predecl()  注册 foo 的声明
+  │     │
+  │     ├─ pipeline 1: "def foo [] { 1 + 2 }"
+  │     │    parse_builtin_commands() → parse_def()
+  │     │      parse_internal_call() → 解析参数（签名 + 闭包体）
+  │     │        参数2: 闭包 { 1 + 2 }
+  │     │          parse_closure_expression()
+  │     │            lex("{ 1 + 2 }")  → 如有错 → error(err)
+  │     │            parse_block(闭包 tokens)
+  │     │              lite_parse → 如有错 → error(err)
+  │     │              parse_pipeline → parse_math_expression → 1 + 2 → 成功
+  │     │            返回 Block (无错误)
+  │     │            ┌─────────────────────────────────────────┐
+  │     │            │ ① compile_block(闭包 Block)             │ ← 此时检查 parse_errors
+  │     │            │    parse_errors.is_empty() = true       │    若为空，编译成功
+  │     │            │    → Block.ir_block = Some(IrBlock)     │    ir_block 已写入
+  │     │            │    → add_block() 存入块表               │
+  │     │            └─────────────────────────────────────────┘
+  │     │          返回 Expr::Closure(block_id)
+  │     │
+  │     │      parse_internal_call 返回 Call
+  │     │      Call.positional[2] = Expr::Closure(block_id)  ← 闭包已带 IrBlock
+  │     │      ┌──────────────────────────────────────────────┐
+  │     │      │ ③ compile_block_with_id(block_id)            │ ← def 体再次编译
+  │     │      │    parse_errors.is_empty() = true            │    闭包 Block 已有 ir_block
+  │     │      │    → nu_engine::compile 再次执行              │    覆盖写入 ir_block
+  │     │      │    → Block.ir_block = Some(new_IrBlock)      │
+  │     │      │    → 设置 signature                          │
+  │     │      └──────────────────────────────────────────────┘
+  │     │
+  │     ├─ pipeline 2: "let x = { 3 + 4 }"
+  │     │    parse_builtin_commands() → parse_let()
+  │     │      parse_value(Closure) → 闭包 { 3 + 4 }
+  │     │        parse_closure_expression()
+  │     │          lex → parse_block → 成功
+  │     │          ┌─────────────────────────────────────────┐
+  │     │          │ ① compile_block(第二个闭包)              │
+  │     │          │    parse_errors.is_empty() = true       │
+  │     │          │    → ir_block = Some(IrBlock)            │
+  │     │          └─────────────────────────────────────────┘
+  │     │        返回 Expr::Closure(block_id_2)
+  │     │
+  │     └─ type_check → 可能追加类型错误      parse_errors: [..., E2?]
+  │
+  │  返回 Block
+  │
+  ├─ ⑦ compile_block(顶层 Block)
+  │    parse_errors.is_empty() ?
+  │    若为 true → 顶层 Block.ir_block = Some(IrBlock)
+  │    若为 false → 不编译
+  │
+  ├─ discover_captures_in_closure()
+  │    如出错 → working_set.error(err)        parse_errors: [..., E3?]
+  │
+  └─ 返回 Arc<Block>
+```
+
+### 已编译闭包不会被后续错误"撤销"
+
+**核心事实**：`compile_block()` 成功后，`block.ir_block = Some(IrBlock)` 被写入。代码中**没有任何路径**会将 `ir_block` 从 `Some` 重置回 `None`。
+
+这意味着一个关键的时间窗口问题：
+
+```
+时间 →
+  │
+  ├─ T1: 闭包 A 解析完成，parse_errors = []（空）
+  │        compile_block(闭包 A) → ir_block = Some(IrBlock_A)  ✓ 已写入
+  │
+  ├─ T2: 继续解析后续代码
+  │        遇到错误 → parse_errors = [E1]
+  │
+  ├─ T3: 闭包 B 解析完成，parse_errors = [E1]（非空）
+  │        compile_block(闭包 B) → 内部检查 is_empty() = false → return
+  │        → 闭包 B.ir_block = None  ✗ 未编译
+  │
+  ├─ T4: 顶层 Block 解析完成，parse_errors = [E1]（非空）
+  │        compile_block(顶层) → 检查 is_empty() = false → 不调用
+  │        → 顶层 Block.ir_block = None  ✗ 未编译
+  │
+  └─ 最终状态：
+       闭包 A.ir_block = Some(IrBlock_A)   ← 已经编译，不受后续错误影响
+       闭包 B.ir_block = None               ← 因为 T2 的错误而被跳过
+       顶层 Block.ir_block = None           ← 同上
+```
+
+**设计含义**：
+- **早期闭包可能"逃过"错误**：如果闭包 A 在 T1 编译时 `parse_errors` 恰好为空，它的 `ir_block` 就会一直保留，即使后续 T2 出现了错误
+- 这不是 bug，而是一种**时序依赖**的结果：编译发生在解析过程中（边解析边编译），而不是全部解析完再统一编译
+- **编译是否执行取决于调用瞬间的全局状态**，而非整个解析过程的最终状态
+
+### def 体闭包的二次编译
+
+[parse_def()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_def.rs#L490-L496) 中的逻辑值得特别注意：
 
 ```rust
-// NOTE: closures need to be compiled eagerly due to these reasons:
-//  - their `Block`s (which contains their `IrBlock`) are stored in the working_set
-//  - Ir compiler does not have mutable access to the working_set and can't attach
-//    `IrBlock`s to existing `Block`s
-// so they can't be compiled as part of their parent `Block`'s compilation
-if working_set.parse_errors.is_empty() {
-    compile_block(working_set, &mut output);
+match call.positional_iter().nth(2) {
+    Some(Expression { expr: Expr::Closure(block_id), .. }) => {
+        compile_block_with_id(working_set, *block_id);
+        *working_set.get_block_mut(*block_id).signature = sig.clone();
+    }
+    // ...
 }
 ```
 
-原因：闭包的 `Block` 存储在 `StateWorkingSet` 的块表中，而 IR 编译器只有 `&StateWorkingSet` 不可变访问权，无法回填 `IrBlock`。因此闭包必须在解析阶段（此时 working_set 是可变的）就完成编译。
+这里对 `def` 的闭包体做了**第二次编译**：
+- **第一次**：在 `parse_closure_expression()` 中，闭包体闭包刚解析完时编译（序号①）
+- **第二次**：在 `parse_def()` 中，闭包体闭包被识别为 `def` 的函数体后再编译（序号③）
+
+两次编译都会覆盖 `ir_block`。第二次编译还会**设置 `signature`**——这是因为 `def` 的函数签名需要在闭包 Block 上标注，而 `parse_closure_expression()` 编译时签名尚未设置。
+
+**时序效果**：如果第一次编译时 `parse_errors` 为空（成功编译），但第一次和第二次之间出现了新错误，那么第二次 `compile_block_with_id` 会因为 `parse_errors` 非空而跳过——闭包保留第一次编译的 `ir_block`，但**没有 `signature`**。
+
+### source 命令的特殊检查
+
+[parse_source()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_source.rs#L130-L132) 中的编译触发点有一个其他调用方都没有的额外检查：
+
+```rust
+let mut block = parse(working_set, Some(&path), &contents, scoped);
+if block.ir_block.is_none() {
+    let block_mut = Arc::make_mut(&mut block);
+    compile_block(working_set, block_mut);
+}
+```
+
+**为什么检查 `ir_block.is_none()`**？因为 `parse()` 函数内部已经会调用 `compile_block`。如果 `parse()` 成功编译了（`ir_block` 不为 `None`），就不需要再编译一次。只有当 `parse()` 因为有错误而没有编译时，才需要尝试重新编译——但此时 `compile_block` 内部的 `parse_errors.is_empty()` 检查仍然会阻止编译。
+
+**实际效果**：这个 `ir_block.is_none()` 检查可以避免在 `parse()` 已经成功编译时进行冗余的 `compile_block` 调用（减少一条 error log），但不改变功能语义。
+
+### RowCondition 和 with-env 简写的"无检查"编译
+
+[parse_row_condition()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_signatures.rs#L507) 和 [parse_expression() with-env 简写](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L1566) 都**不检查** `parse_errors` 就直接调用 `compile_block`。
+
+它们依赖 `compile_block` 内部的保护。如果 `parse_errors` 非空，内部检查会阻止编译并打一条 error log。这些 `Block` 的 `ir_block` 将保持 `None`。
+
+### 全局 parse_errors 与编译时机的精确时序图
+
+```
+                parse_errors 状态          编译操作
+                ──────────────          ─────────
+
+parse() 开始    []
+  │
+  ├─ lex()      [E0?]                  （可能注入词法错误）
+  │
+  ├─ parse_block()
+  │    │
+  │    ├─lite_parse  [E0?, E1?]        （可能注入语法错误）
+  │    │
+  │    ├─ 递归解析过程中产生的错误:
+  │    │    [E0?, E1?, E2, E3, ...]
+  │    │
+  │    │    ┌──────────────────────────────────────────────┐
+  │    │    │ 在解析每个闭包/def/module/RowCondition 时:   │
+  │    │    │                                            │
+  │    │    │  当前 parse_errors 状态 = ?                │
+  │    │    │        │                                   │
+  │    │    │        ├─ 为空 → compile_block 执行        │
+  │    │    │        │        → ir_block = Some(...)     │
+  │    │    │        │                                   │
+  │    │    │        └─ 非空 → compile_block 跳过        │
+  │    │    │                 → ir_block = None         │
+  │    │    │                 → log::error!() 打印      │
+  │    │    └──────────────────────────────────────────────┘
+  │    │
+  │    └─ type_check   [..., E_type?]   （可能追加类型错误）
+  │
+  │  返回 Block
+  │
+  ├─ compile_block(顶层)
+  │    当前 parse_errors 状态 = ?
+  │    为空 → 顶层 ir_block = Some(...)
+  │    非空 → 顶层 ir_block = None
+  │
+  ├─ discover_captures_in_closure()
+  │    [..., E_capture?]              （可能追加捕获分析错误）
+  │
+  └─ 返回 Arc<Block>
+      注意：discover_captures_in_closure 的错误发生在顶层编译之后
+      这些错误不会影响已完成的编译决策
+```
+
+### 编译时序的三个关键特性
+
+#### 特性一：边解析边编译（Eager Compilation）
+
+编译不是"全部解析完再统一编译"，而是在解析过程中**逐个编译**。每个闭包/def/module/RowCondition 解析完就立即尝试编译。
+
+- **优点**：闭包的 `Block` 存储在 `StateWorkingSet` 块表中，而 IR 编译器只有 `&StateWorkingSet` 不可变访问权，无法回填 `IrBlock`。因此必须在解析阶段（`working_set` 可变时）完成编译。
+- **后果**：早期闭包可能在 `parse_errors` 尚为空时成功编译，而后期闭包可能因为中间产生的错误而无法编译。
+
+#### 特性二：已编译的 IrBlock 不可撤回
+
+`block.ir_block` 一旦被设为 `Some(IrBlock)`，代码中没有任何路径会将其重置为 `None`。即使后续产生了 `parse_errors`，已编译的 `IrBlock` 仍然保留在 `Block` 中。
+
+从运行时的角度：当 `parse_errors` 非空时，整个 `Block` 不会被提交到 `EngineState`（由上层调用方决定），因此残留的 `IrBlock` 不会被使用。但在 `StateWorkingSet` 的生命周期内，`IrBlock` 确实存在。
+
+#### 特性三：顶层编译是"最终兜底"
+
+[parse() L546-548](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_captures_compile.rs#L546-L548) 的顶层编译是最晚执行的。它的语义是：如果整个解析过程结束后 `parse_errors` 仍为空，则编译顶层 `Block`。
+
+但这个编译**只编译顶层 Block 本身**，不编译子闭包（子闭包已经在各自解析时编译过了）。顶层 `Block` 的 `IrBlock` 包含的是顶层 pipeline 的 IR，其中通过 `BlockId` 引用子闭包的 `IrBlock`。
 
 ---
 
@@ -923,7 +1138,7 @@ if working_set.parse_errors.is_empty() {
 
 ### 1. 错误收集的层级关系
 
-- **词法和轻量语法层**：各自用 `Option<ParseError>` 返回值独立运行，都只保留自己层次中遇到的**第一个**错误，彼此互不知道。它们的错误通过调用方的 `if let Some(err) = err { working_set.error(err) }` 注入到全局 `Vec`——这个模式在代码中出现了 **8+ 处**（顶层 parse、每个嵌套结构的 lex 后、每个 parse_block 的 lite_parse 后）。
+- **词法和轻量语法层**：各自用 `Option<ParseError>` 返回值独立运行，都只保留自己层次中遇到的**第一个**错误，彼此互不知道。它们的错误通过调用方的 `if let Some(err) = err { working_set.error(err) }` 注入到全局 `Vec`——这个模式在代码中出现了 **8+ 处**（顶层 parse、每个嵌套结构的 lex 后、每个 parse_block 的lite_parse 后）。
 
 - **AST 构建层**：直接操作共享的 `Vec<ParseError>`，可以累积任意数量的错误。但在试探解析场景下，可以通过"快照 + `truncate`"**有选择地删除**刚追加的一批错误。
 
@@ -935,11 +1150,15 @@ if working_set.parse_errors.is_empty() {
   - 其他类型（`Unclosed`、`Unbalanced`、`UnexpectedEof` 等） → 不回溯（这是"代码有问题"，直接报出）
 - `parse_oneof` 更激进：总是回溯，但最后会把"最优猜测"（走得最远的那次）的错误再补回来。
 
-### 3. 编译门槛的全局语义
+### 3. 编译门槛的全局语义与时序依赖
 
-- **判断对象是同一个全局 `parse_errors`**。不是"当前块"或"当前作用域"的错误，而是"整个解析过程中累计的所有错误"。
-- 因此：**任何嵌套层级产生的 1 个未被回滚的错误，都会阻止整个解析过程中的所有块编译**——包括顶层块、所有子闭包、所有嵌套块。
-- 双重保险：所有调用方要么显式检查 `is_empty()`，要么依赖 `compile_block` 内部的检查（此时会打一条 error log，被注释认为"可能是 parser bug"）。
+- **判断对象是同一个全局 `parse_errors`**。不是"当前块"或"当前作用域"的错误，而是"调用 `compile_block` 的**那一瞬间**全局 `parse_errors` 的状态"。
+- 编译发生在解析过程中（边解析边编译），不是全部解析完再统一编译。因此：
+  - 早期闭包可能恰好在 `parse_errors` 为空时编译成功
+  - 后续错误**不会撤销**已编译闭包的 `IrBlock`（`ir_block` 一旦设为 `Some` 不会被重置为 `None`）
+  - 后期闭包因 `parse_errors` 非空而跳过编译（`ir_block` 保持 `None`）
+- 顶层编译在 `parse_block()` 返回后、`discover_captures_in_closure()` 之前执行，是最后一个编译机会
+- `def` 体闭包被编译**两次**：第一次在 `parse_closure_expression()` 中，第二次在 `parse_def()` 中（覆盖 `ir_block` 并设置 `signature`）
 
 ### 4. 全局一致的设计哲学
 
@@ -948,6 +1167,6 @@ if working_set.parse_errors.is_empty() {
 3. **错误侧传**：错误通过返回值或全局状态的 side channel 传递，不影响函数的正常返回值路径
 4. **无 Result 传播**：解析函数几乎都返回值本身，而非 `Result`，确保下游总能拿到可用的结构
 5. **试探基于全局错误快照**：truncate 绝对回滚，但 first error 类型决定"要不要回滚"
-6. **编译门槛统一**：同一个全局 is_empty() 检查，双重保险，错误零容忍
+6. **边解析边编译**：编译时机与解析交织，检查的是调用瞬间的全局状态，已编译的 `IrBlock` 不可撤回
 
-这种设计使得 Nushell 的解析器能够**一次性报告尽可能多的错误**（AST 层不中断），同时在形状歧义场景下能高效试错（truncate 回滚干净）。任何未被回滚的错误都会导致所有块不编译，确保损坏 AST 永不进入执行引擎。
+这种设计使得 Nushell 的解析器能够**一次性报告尽可能多的错误**（AST 层不中断），同时在形状歧义场景下能高效试错（truncate 回滚干净）。编译门槛基于调用瞬间的全局 `parse_errors` 状态——早期无错时编译的闭包不会因后续错误而被撤销，但整个 `Block` 是否被提交到运行时仍由上层调用方根据最终 `parse_errors` 状态决定。
