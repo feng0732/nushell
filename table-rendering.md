@@ -1,6 +1,8 @@
 # Nushell 表格渲染流程分析
 
-本文档深入分析 Nushell 表格输出系统在**列宽分配**、**内容换行/截断策略**、**主题色彩**三者之间的权衡取舍，并结合代码梳理完整渲染链路与大表性能优化手段。
+本文档结合源码分析 Nushell 表格输出系统在**列宽分配**、**内容换行/截断策略**、**主题色彩**三者之间的权衡取舍，梳理完整渲染链路与大表性能优化手段。
+
+> **阅读说明**：文中标注「⚠️ 推断」的条目是基于代码结构的合理推测，尚未通过运行时验证；其余结论均可在引用的源码行中找到直接证据。
 
 ---
 
@@ -8,12 +10,12 @@
 
 表格渲染涉及 4 个核心 crate 的协作：
 
-| 模块 | 路径 | 职责 |
-|------|------|------|
-| `nu-command/viewers` | [table.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-command/src/viewers/table.rs) | `table` 命令入口，参数解析、流式分页调度 |
-| `nu-table` | [table.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/table.rs) | 核心渲染引擎（列宽估计、截断/换行、主题加载） |
-| `nu-protocol/config` | [table.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-protocol/src/config/table.rs) | 配置类型定义（`TableMode` / `TrimStrategy` / `TableConfig`） |
-| `nu-color-config` | [style_computer.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-color-config/src/style_computer.rs) | 单元格颜色计算 |
+| 模块 | 仓库路径 | 职责 |
+|------|---------|------|
+| `nu-command/viewers` | `crates/nu-command/src/viewers/table.rs` | `table` 命令入口，参数解析、流式分页调度 |
+| `nu-table` | `crates/nu-table/src/table.rs` | 核心渲染引擎（列宽估计、截断/换行、主题加载） |
+| `nu-protocol/config` | `crates/nu-protocol/src/config/table.rs` | 配置类型定义（`TableMode` / `TrimStrategy` / `TableConfig`） |
+| `nu-color-config` | `crates/nu-color-config/src/style_computer.rs` | 单元格颜色计算 |
 
 数据从 `table` 命令入口到最终字符串的处理流水线：
 
@@ -26,6 +28,8 @@ PagingTableCreator::next()              (流式分批 + 缩写)
         ↓
 create_table / create_table_with_header_and_index
                                         (构建 NuTable，写入数据/样式)
+        ↓
+colorize_space                          (第 2 遍空格着色，仅 list_table)
         ↓
 configure_table                         (加载主题、footer、边框色)
         ↓
@@ -45,7 +49,7 @@ NuTable::draw(termwidth)                ← 核心渲染
 
 ### 2.1 策略选择的分水岭 `maybe_truncate_columns`
 
-[table.rs#L849-L882](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/table.rs#L849-L882) 是整个列宽分配的总入口，通过两个布尔条件在三种策略间切换：
+`crates/nu-table/src/table.rs` 第 849–882 行是整个列宽分配的总入口，通过两个布尔条件在三种策略间切换：
 
 ```rust
 fn maybe_truncate_columns(..., termwidth: usize, truncate_by_head: bool) -> WidthEstimation {
@@ -62,17 +66,17 @@ fn maybe_truncate_columns(..., termwidth: usize, truncate_by_head: bool) -> Widt
 }
 ```
 
-三个关键的设计决策点：
+三个关键的设计决策点（均有直接代码证据）：
 
 1. **`truncate_by_head` 条件**：当启用 `header_on_separator` 且无显式优先级列时，策略 A 激活——把列压缩到「刚好能放下列名」的宽度，最大化**列数量**（可读性牺牲最大）。
-2. **终端宽度阈值 120**：宽度 >120 认为是宽屏，策略 B 会给每列至少 10 字符（`MIN_ACCEPTABLE_WIDTH = 10`），保证**每列至少可读**。
+2. **终端宽度阈值 120**：宽度 >120 认为是宽屏，策略 B 的最小列宽为 10（`MIN_ACCEPTABLE_WIDTH = 10`），保证**每列至少可读**。
 3. **窄终端（≤120）**：策略 C 的最小可接受宽度仅 5 字符，宁愿**少显示几列**也要把前几列展示完整。
 
 ### 2.2 策略 A —— 按表头宽度 `truncate_columns_by_head`
 
-[table.rs#L1475-L1581](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/table.rs#L1475-L1581)
+位置：`crates/nu-table/src/table.rs` 第 1475–1581 行
 
-**核心思想**：每个数据列的宽度先尝试完整内容，放不下就退化为 `header_width + padding`。
+**核心思想**：每个数据列先尝试完整内容宽度，放不下就退化为 `header_width + padding`。
 
 ```rust
 for (i, &column_width) in widths_original.iter().enumerate() {
@@ -91,11 +95,11 @@ for (i, &column_width) in widths_original.iter().enumerate() {
 }
 ```
 
-**与主题色的交互**：此策略下数据列被强力压缩，`colorize_space`（首尾空格着色）与 `LS_COLORS` 等长着色序列更容易被截断，导致 ANSI 转义序列被切断产生视觉脏字符。**因此宽终端默认不使用此策略**。
+**与主题色的交互**：此策略下数据列被强力压缩，但因 tabled 启用了 `ansi` 特性（见 `crates/nu-table/Cargo.toml`）且 `Truncate` 调用了 `.suffix_try_color(true)`（第 774 行），截断操作是 ANSI 感知的，不会从 ESC 序列中间切断。
 
 ### 2.3 策略 B —— 宽终端 `truncate_columns_by_columns`
 
-[table.rs#L1058-L1210](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/table.rs#L1058-L1210)
+位置：`crates/nu-table/src/table.rs` 第 1058–1210 行
 
 **两阶段分配**：
 - **第一轮**：每列先给 `min(10, original_width)`，尽可能多地塞进列。
@@ -119,11 +123,11 @@ fn distribute_available_width_round_robin(...) -> usize {
 }
 ```
 
-当有 `width_priority_columns` 时（如 `ps` 的 `name` 列），`compact_partial_visibility_for_priority` 会**主动砍掉右侧非优先列**，把空间让给优先列——这是三者权衡中最激进的「列宽 > 列数」选择。
+当有 `width_priority_columns` 时（如 `ps` 的 `name` 列，通过 pipeline metadata 传入），`compact_partial_visibility_for_priority` 会**主动砍掉右侧非优先列**，把空间让给优先列——这是三者权衡中最激进的「列宽 > 列数」选择。
 
 ### 2.4 策略 C —— 窄终端 `truncate_columns_by_content`
 
-[table.rs#L885-L1046](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/table.rs#L885-L1046)
+位置：`crates/nu-table/src/table.rs` 第 885–1046 行
 
 **设计哲学**：「少而全」。最小列宽仅 5 字符，若首列连 5+vertical+trailing 的空间都没有，直接返回 `WidthEstimation { needed: vec![] }`，最终会触发 `Couldn't fit table into N columns!` 的错误提示。
 
@@ -135,7 +139,7 @@ fn distribute_available_width_round_robin(...) -> usize {
 
 ### 3.1 两种策略的配置
 
-[config/table.rs#L159-L198](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-protocol/src/config/table.rs#L159-L198) 定义了枚举：
+`crates/nu-protocol/src/config/table.rs` 第 159–198 行定义了枚举：
 
 ```rust
 pub enum TrimStrategy {
@@ -144,9 +148,11 @@ pub enum TrimStrategy {
 }
 ```
 
+默认值：`TrimStrategy::Wrap { try_to_keep_words: true }`（第 193–197 行）。
+
 ### 3.2 应用时机：`DimensionCtrl::change`
 
-[table.rs#L694-L723](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/table.rs#L694-L723) 根据 `width.truncate` 标志走两条路径：
+`crates/nu-table/src/table.rs` 第 694–723 行根据 `width.truncate` 标志走不同路径：
 
 ```rust
 impl TableOption<...> for DimensionCtrl {
@@ -165,32 +171,24 @@ impl TableOption<...> for DimensionCtrl {
 }
 ```
 
-**关键：高度重算的性能影响** —— 只有 `Truncate` 模式会触发 `hint_change()` 返回 `Some(Entity::Row(0))`，强制 tabled 重新计算所有行高。`Wrap` 模式则在 `width_ctrl_truncate` 内部**只遍历被改宽的列**来更新高度（[table.rs#L766-L769](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/table.rs#L766-L769)）：
+**高度重算的两种路径**（代码证据在 `width_ctrl_truncate` 第 736–784 行）：
 
-```rust
-TrimStrategy::Wrap { try_to_keep_words } => {
-    let wrap = Width::wrap(width).keep_words(*try_to_keep_words);
-    CellOption::change(wrap, recs, cfg, Entity::Column(col));
-    // 优化：只对变化列重算行高，而非全表
-    for (row, row_height) in heights.iter_mut().enumerate() {
-        let height = recs.count_lines(Position::new(row, col));
-        *row_height = max(*row_height, height);
-    }
-}
-```
+- `Wrap` 模式：每列调用 `CellOption::change(wrap, ...)` 后，**手动遍历该列所有行**调用 `recs.count_lines()` 更新高度。只扫受影响列，而非全表。
+- `Truncate` 模式：调用 `CellOption::change(truncate, ...)` 后，**不手动更新高度**。但 `hint_change()` 方法（第 711–722 行）在 `matches!(self.trim_strategy, TrimStrategy::Truncate { .. })` 时返回 `Some(Entity::Row(0))`，提示 tabled 内部需要重算行高。
 
-### 3.3 与主题色 + 列宽的三角关系
+> **⚠️ 推断**：从注释 `// NOTE: Only truncation case must be relaclucated in term of height.` 来看，作者认为截断后行高可能变化（例如原文本有 `\n`，截断后行数变少）。但 Wrap 模式代码中手动重算了高度，与注释表述不完全一致。
 
-| 场景 | Wrap | Truncate |
-|------|------|----------|
-| **ANSI 完整性** | ✅ tabled 内部识别 ANSI 转义，换行不会切到色彩序列中间 | ⚠️ 若截断点在 ESC[...m 中间，会产生漏色/污染后续单元格 |
-| **行高膨胀** | ❌ 换行会拉高整行高度，大表整体输出长度陡增 | ✅ 每行始终 1 行（除非原内容已含 `\n`） |
-| **可读性（窄屏）** | ✅ 能看到全部文字 | ❌ 后半部分被切掉 |
-| **可读（宽屏优先级列）** | ✅ 优先级列在 round-robin 后往往足够宽 | 🔶 建议用 Wrap |
-| **与 header_on_separator 的冲突** | 🔶 header 名字会被换行（`user_name\n_tail` 难看） | ✅ header 通常短于列宽，不会被切 |
+### 3.3 与列宽 + 主题色的三角关系
 
-**推荐配置组合**：
-- **日常开发（默认）**：`TrimStrategy::Wrap { try_to_keep_words: true }` + `mode: rounded`
+| 维度 | Wrap 换行 | Truncate 截断 | 代码依据 |
+|------|----------|--------------|---------|
+| **ANSI 安全性** | ✅ tabled `ansi` 特性下换行识别转义序列 | ✅ `.suffix_try_color(true)` 显式支持颜色感知 | `Cargo.toml` features; `table.rs` L774 |
+| **行高膨胀** | ❌ 换行会拉高整行高度 | ✅ 通常每行仅 1 行（原文本有 `\n` 除外） | `table.rs` L766-L769 |
+| **信息完整性** | ✅ 全部可见，只是折行 | ❌ 超出部分被丢弃 | `TrimStrategy` 枚举定义 |
+| **与 `header_on_separator` 配合** | ⚠️ 数据行可换行，但 header 行用 `Truncate` 不换行（`SetLineHeaders`） | ✅ header 通常短于列宽 | `table.rs` L1821 |
+
+**推荐配置组合**（基于代码行为的合理建议）：
+- **日常 REPL（默认）**：`TrimStrategy::Wrap { try_to_keep_words: true }` + `mode: rounded`
 - **自动化脚本 / grep 管道**：`TrimStrategy::Truncate { suffix: Some("…".into()) }` + `mode: none`
 - **大屏查数（>160 列）**：`header_on_separator: true` + Wrap，充分利用宽终端塞下最多列
 
@@ -200,29 +198,47 @@ TrimStrategy::Wrap { try_to_keep_words } => {
 
 ### 4.1 样式计算链
 
-颜色来源于 `StyleComputer`（由 `$env.config.color_config` 生成），每个单元格在 `get_value_style` 时即确定：
+颜色来源于 `StyleComputer`（由 `$env.config.color_config` 生成）。单元格着色有两条独立路径：
+
+**路径 A：构建时着色（`nu_value_to_string_colored`）**
+位置：`crates/nu-table/src/common.rs` 第 42–59 行
 
 ```
-Value → style_primitive()       → 基础类型颜色（int/float/string/bool/...）
-      → LS_COLORS 覆写          → 文件路径颜色（table 命令的 path_columns metadata）
-      → compute("row_index", _) → 索引列
-      → compute("header", _)    → 表头
-      → compute("separator", _) → 边框线颜色
+1. val.to_abbreviated_string()        → 纯文本
+2. style_computer.style_primitive()   → 拿到 nu_ansi_term::Style
+3. color.paint(text).to_string()      → 包裹 ANSI 前缀/后缀
+4. clean_charset (替换 \t 为 4 空格) → 文本形态规整化
+5. colorize_space_str                 → 行首尾空格再包一层颜色
 ```
 
-[common.rs#L42-L59](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/common.rs#L42-L59) 中 `nu_value_to_string_colored` 的顺序很关键：**先上色，再 clean_charset（\t→空格、去 \r），再 colorize_space_str**。这样 \t 被替换成空格后仍然能被空格着色捕获。
+这条路径应用于 `create_table_with_*` 等常规表构建流程中。
 
-### 4.2 空格着色的陷阱
+**路径 B：构建后二次着色（`colorize_space`）**
+位置：`crates/nu-table/src/types/general.rs` 第 35 行
 
-[util.rs#L103-L175](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/util.rs#L103-L175) 使用 fancy_regex 匹配每行首尾的空格并包裹颜色。当**列宽刚好等于字符串宽度 + padding** 时，`tabled` 会在对齐时追加补位空格，这些空格**不在原始文本里，因而不会被 colorize_space 着色**。
+在 `list_table` 函数中，`create_table` 完成后又调了一遍 `colorize_space(out.table.get_records_mut(), ...)`。代码注释写明 `// TODO: It would be WAY more effitient to do right away instead of second pass over the data.` —— 这是一次独立的全表扫描。
 
-表现为：
-- 末尾可见的 1-2 个空格显示为默认背景色，像「漏了一块」。
-- 用 `header_on_separator: true` 时此问题更突出，因为 header 被独立处理（`SetLineHeaders` 使用 `Truncate` 而非着色）。
+> **⚠️ 推断**：两遍 colorize_space 可能是历史遗留：路径 A 处理字符串值的空格，路径 B 兜底所有类型的单元格空格着色。
+
+**颜色来源汇总**：
+- `style_primitive()`：基础类型颜色（int/float/string/bool/...）
+- `compute("row_index", _)`：索引列
+- `compute("header", _)`：表头
+- `compute("separator", _)`：边框线颜色
+- `LS_COLORS` 覆写：文件路径颜色（在 `table` 命令层通过 `path_columns` metadata 处理，位置：`crates/nu-command/src/viewers/table.rs` 第 802–839 行）
+
+### 4.2 空格着色与 tabled padding 的边界
+
+`crates/nu-table/src/util.rs` 第 103–175 行的 `colorize_space` 使用 fancy_regex 匹配每行首尾空格并包裹颜色。
+
+**明确的事实**：
+- 着色的是**单元格文本内部**的首尾空格。
+- tabled 的 `Padding`（`crates/nu-table/src/table.rs` 第 633–635 行 `set_indent` 函数）是在单元格外部追加的补位空格，不在文本内，因此**不会被** `colorize_space` 着色。
+- 当单元格文本宽度 + 左右 indent 刚好等于列宽时，视觉上左右 padding 区域显示默认背景色，而文本内部首尾空格（若有）会被着色 —— 两者颜色可能不一致。
 
 ### 4.3 主题与列宽的定量关系
 
-不同 `TableMode` 使用的边框字符宽度不同（都是 ASCII，宽度统一为 1，但**垂直线数量**有差异）。`get_total_width2` 中计算：
+不同 `TableMode` 使用的边框字符不同（都是单宽字符），但**垂直线数量**直接占用列宽预算。`get_total_width2`（`table.rs` 第 1583–1589 行）计算：
 
 ```rust
 fn get_total_width2(widths: &[usize], cfg: &ColoredConfig) -> usize {
@@ -233,21 +249,20 @@ fn get_total_width2(widths: &[usize], cfg: &ColoredConfig) -> usize {
 }
 ```
 
-以 5 列表为例：
+以 N 列数据为例（代码事实）：
 
-| 主题 | 外边框 | 内部垂直线 | 额外占用字符 | 相当于占用的「内容」宽度 |
-|------|--------|-----------|-------------|------------------------|
-| `none` (blank) | 无 | 无 | 0 | 0 列 |
-| `light` | 无 | 仅 header 下横线 | 0 | 0 列 |
-| `basic` (ascii) | 有 | 有 | N+1 = 6 | ≈ 1 列（每列 6 字符时）|
-| `heavy` | 有 + 粗字 | 有 + 粗字 | N+1 = 6 | ≈ 1 列（视觉上更宽）|
-| `double` (extended) | 双线 | 双线 | N+1 = 6 | ≈ 1 列 |
+| 主题 | 外边框 | 内部垂直线 | 总垂直线占用 | 相当于内容宽度 |
+|------|--------|-----------|-------------|--------------|
+| `none` (blank) | 无 | 无 | 0 | 0 |
+| `light` | 无 | 无（仅 header 横线） | 0 | 0 |
+| `basic` / `rounded` / `thin` | 有 | 有 | N + 1 | 约 1 列宽（当每列 ≈ 6 字符时）|
+| `heavy` / `double` | 有 | 有 | N + 1 | 同上（字符更粗，字符宽度仍为 1）|
 
-**结论**：对于窄终端（80 列）切换到 `none` 或 `light` 主题，可以多塞约 6 个字符 —— 常常刚好是「能显示 vs 报错 `Couldn't fit table`」的边界。
+> **⚠️ 推断**：对于 80 列窄终端，切换到 `none` 或 `light` 主题可省出 N+1 ≈ 6 个字符，这一空间往往处在「能渲染完整表 vs 报 `Couldn't fit table`」的边界上。此判断基于常见列数（5–10 列）的经验估计，未做精确边界测试。
 
 ### 4.4 `SetLineHeaders` 与截断
 
-[table.rs#L1788-L1851](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/table.rs#L1788-L1851) 是 `header_on_separator: true` 下的特殊渲染路径：表头从数据行中**剥离**（`remove_header`），作为分割线标题单独绘制。
+`crates/nu-table/src/table.rs` 第 1788–1851 行是 `header_on_separator: true` 下的特殊渲染路径：表头从数据行中**剥离**（`remove_header` 函数），作为分割线标题单独绘制。
 
 ```rust
 let columns = self.head.values.into_iter()
@@ -262,7 +277,7 @@ if let Some(color) = self.head.color {
 }
 ```
 
-此时列宽的「最终值」来自 `CompleteDimension`（已经过 Truncate/Wrap 调整），header 文字用 `Truncate` 而非 `Wrap`，所以即使配置了 `Wrap` 策略，表头也不会换行 —— 这是刻意为之，保证分割线清晰。
+**明确事实**：header 文字在这里使用 `Truncate` 而非 `Wrap`，所以即使全局配置了 `Wrap` 策略，分割线上的表头也不会换行。这是刻意设计，保证分割线视觉干净。
 
 ---
 
@@ -270,12 +285,14 @@ if let Some(color) = self.head.color {
 
 ### 5.1 `PagingTableCreator` 迭代器
 
-[table.rs#L906-L1030](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-command/src/viewers/table.rs#L906-L1030) 是处理无限流（例如 `seq 1 1e9 | table`）的核心。它实现了 `Iterator<Item = Result<Vec<u8>>>`，每迭代一次产出一批（batch）渲染好的表文本字节，直接喂给 `ByteStream::from_result_iter`，零内存膨胀。
+位置：`crates/nu-command/src/viewers/table.rs` 第 906–1030 行
 
-两个关键参数（来自 `$env.config.table`）：
+`PagingTableCreator` 实现了 `Iterator<Item = Result<Vec<u8>>>`，每迭代一次产出一批渲染好的表文本字节，直接喂给 `ByteStream::from_result_iter`，实现流式输出。
 
-- **`stream_page_size`**：默认 1000 行（`NonZeroU16::new(1000)`）。每批最多多少行。
-- **`batch_duration`**：默认 1 秒。即使没攒够 1000 行，到了 1 秒也强制输出 —— 保证首屏响应。
+两个关键参数（均来自 `$env.config.table`，代码证据）：
+
+- **`stream_page_size`**：默认 1000 行（`NonZeroU16::new(1000)`，见 `crates/nu-protocol/src/config/table.rs` 第 395 行）。每批最多行数。
+- **`batch_duration`**：默认 1 秒（`Duration::from_secs(1)`，见第 394 行）。即使没攒够 1000 行，到时间也强制输出，保证首屏响应。
 
 ```rust
 fn stream_collect(stream, size, batch_duration, signals) -> (Vec<Value>, bool) {
@@ -293,6 +310,8 @@ fn stream_collect(stream, size, batch_duration, signals) -> (Vec<Value>, bool) {
 
 ### 5.2 `abbreviated` 缩写模式
 
+位置：`crates/nu-command/src/viewers/table.rs` 第 1065–1107 行
+
 当设置了 `table --abbreviated N` 或 `$env.config.table.abbreviated_row_count`，`stream_collect_abbreviated` 只保留**前 N 条 + 后 N 条**，中间插一条「...」占位行：
 
 ```rust
@@ -304,7 +323,7 @@ fn stream_collect_abbreviated(..., size: usize, ...) -> (Vec<Value>, usize, bool
         } else if tail.len() < size {
             tail.push_back(item);
         } else {
-            let _ = tail.pop_front();   // 固定大小的滑窗
+            let _ = tail.pop_front();   // 固定大小滑窗
             tail.push_back(item);
         }
     }
@@ -312,33 +331,35 @@ fn stream_collect_abbreviated(..., size: usize, ...) -> (Vec<Value>, usize, bool
 }
 ```
 
-这对于百万行的表渲染是数量级的优化 —— 内存占用稳定在 O(2N) 而非 O(总行数)。
+内存占用稳定在 O(2N) 而非 O(总行数)，对于百万行级表是数量级的优化。
 
-### 5.3 高度维度的缓存优化
+### 5.3 维度缓存优化
 
-`NuTable` 在数据插入阶段就预先计算了 `widths` 和 `heights`（见 `insert_value` [table.rs#L102-L108](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/table.rs#L102-L108)），避免 tabled 内部的全表 `PeekableGridDimension::width/height` 扫描。
+`NuTable` 在数据插入阶段就预先计算了 `widths` 和 `heights`（`insert_value` 函数，`crates/nu-table/src/table.rs` 第 102–108 行），避免 tabled 内部的全表 `PeekableGridDimension::width/height` 扫描。
 
-只有在**列被压缩**（触发 Wrap/Truncate）时，才按需对受影响列重算行高（[table.rs#L766-L769](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/table.rs#L766-L769)），其余场景 `DimensionCtrl::change` 直接 `set_heights(self.heights)` 跳过计算。
+只有在**列被压缩**（触发 Wrap/Truncate）时，才按需对受影响列重算行高（Wrap 模式手动扫、Truncate 模式通过 `hint_change` 触发 tabled 内部重算），其余场景 `DimensionCtrl::change` 直接 `set_heights(self.heights)` 跳过计算。
 
-### 5.4 宽度优先队列的性能考虑
+### 5.4 宽度分配的时间复杂度
 
-`distribute_available_width_round_robin` 每循环一轮消耗 O(优先级列数) 的时间。对于优先级列数量 < 10 的常见情况是可接受的；但如果用户给了几百个优先级列，这里会退化为 O(预算 × 列数)。目前尚未见到这种配置，因此没有更激进的优化。
+`distribute_available_width_round_robin`（第 1706–1742 行）每轮消耗 O(优先级列数) 的时间。常见配置下优先级列 < 10，开销可忽略。
+
+> **⚠️ 推断**：如果用户配置了上百个优先级列，复杂度退化为 O(预算 × 列数)，可能成为瓶颈。目前未见此类配置的实际用例。
 
 ---
 
 ## 六、列宽 / 换行 / 主题 的三难选择与推荐实践
 
-### 6.1 不可能三角
+### 6.1 三个优化目标的权衡
 
-| 目标 | 需优化方向 | 牺牲 |
-|------|-----------|------|
-| **最多信息**（每行内容全可见） | 用 Wrap、light/none 主题、关闭 header_on_separator | 行高膨胀，总输出变长，滚屏慢 |
-| **最多列数**（尽量把所有列塞下） | 用 Truncate、basic/rounded 主题、开 header_on_separator | 每列内容被腰斩，需配合鼠标悬停或 get 命令查看完整内容 |
-| **视觉美观**（色满、边框规整、不溢色） | 用 Wrap + 主题配色 + 关闭 header_on_separator | 三者占用的空间最大，窄终端直接放不下 |
+| 优化目标 | 倾向的配置 | 代价 | 代码依据 |
+|---------|-----------|------|---------|
+| **信息密度最高**（每行内容全可见） | Wrap + light/none 主题 + 关 header_on_separator | 行高膨胀，总输出长度↑，滚屏慢 | `TrimStrategy::Wrap`; `TableMode` 边框占用 |
+| **列数最多**（尽量把所有列塞下） | Truncate + basic/rounded 主题 + 开 header_on_separator | 每列内容被截断，需 `get` 等命令补全查看 | `truncate_columns_by_head`; `SetLineHeaders` |
+| **视觉最完整**（色彩/边框/内容都完整） | Wrap + 彩色主题 + 关 header_on_separator | 三者组合占空间最多，窄终端可能直接放不下 | `colorize_space`; `load_theme` |
 
 ### 6.2 常见场景的推荐配置
 
-#### 场景 1：日常 REPL（默认）
+#### 场景 1：日常 REPL（默认配置）
 ```nu
 $env.config.table = {
     mode: rounded
@@ -351,33 +372,38 @@ $env.config.table = {
 
 #### 场景 2：脚本 CI / 重定向到文件
 ```nu
-$env.config.use_ansi_coloring = false          # 关全部颜色，避免 grep 污染
+$env.config.use_ansi_coloring = false
 $env.config.table = {
     mode: basic_compact
     trim: { methodology: truncating, truncating_suffix: "…" }
     header_on_separator: false
 }
 ```
-配合 `is_color_empty` 的判断 [table.rs#L809-L820](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/table.rs#L809-L820)，`colorize_table` 全程跳过，性能最佳。
+配合 `is_color_empty` 判断（`table.rs` 第 809–820 行），`colorize_table` 全程跳过，性能最佳。
 
-#### 场景 3：80 列终端、长列名（如数据库查询结果）
+#### 场景 3：80 列终端 + 长列名（如数据库查询）
 ```nu
 $env.config.table = {
-    mode: none                                 # 去掉所有边框，挤出空间
+    mode: none
     trim: { methodology: wrapping, wrapping_try_keep_words: true }
     header_on_separator: false
 }
 ```
-主题切换到 `none` 节省 N+1 字符的垂直线宽度，往往刚好能让 `truncate_columns_by_content` 多塞入一列而不报错。
+去掉所有边框垂直线，省出 N+1 字符宽度给内容列。
 
 ---
 
 ## 七、源码中的 TODO 与已知局限
 
-1. **[table.rs#L1-L6](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/table.rs#L1-L6)** 的 TODO 注释指出：当终端高度不够时，`tabled -e`（expand）模式不会中途停止构建 —— 目前**只按宽度控制，不按高度裁剪**。
-2. **[table.rs#L1048-L1057](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/table.rs#L1048-L1057)** 的注释提到策略 B 可以按「左列优先多给空间」的思路（`[15,10,5]` 而非均匀 `[10,10,10]`），目前尚未实现。
-3. **[table.rs#L1831-L1843](file:///d:/fz/0601-2/solo-dogfeeding/code/79-nushell/crates/nu-table/src/table.rs#L1831-L1843)** 的 FIXME：`SetLineHeaders` 因 tabled 的 bug 而没有给索引列单独设置对齐方式，header 行的 `#` 号与数据行的右对齐索引可能不对齐。
-4. 大表 `Wrap` 时高度重算是逐列遍历的（`for row, row_height in heights.iter_mut().enumerate()`），对于 1000 行 × 50 列的超大表是 O(行×列) 热点，未来可并行化或进一步限定「只对含换行的单元格扫描」。
+以下条目均在代码中有明确注释标注：
+
+1. **高度维度缺失**：`crates/nu-table/src/table.rs` 第 1–6 行 TODO 指出，表格目前仅按宽度控制，当终端高度不够时 `table -e`（expand）模式不会中途停止构建。
+
+2. **左列优先分配未实现**：`crates/nu-table/src/table.rs` 第 1048–1057 行注释提到策略 B 可以按「左列优先多给空间」的思路（如 `[15,10,5]` 而非均匀 `[10,10,10]`），目前尚未实现。
+
+3. **SetLineHeaders 索引列对齐**：`crates/nu-table/src/table.rs` 第 1831–1843 行 FIXME 指出，因 tabled 的 bug，`SetLineHeaders` 没有给索引列单独设置对齐方式，header 行的 `#` 与数据行的右对齐索引可能不对齐。
+
+4. **colorize_space 两遍扫描**：`crates/nu-table/src/types/general.rs` 第 34 行 TODO 指出 `list_table` 中对空格着色做了第二遍全表扫描，应合并到构建阶段一次完成。
 
 ---
 
@@ -385,19 +411,20 @@ $env.config.table = {
 
 | 功能 | 文件 | 函数 |
 |------|------|------|
-| 命令入口 | nu-command/src/viewers/table.rs | `Table::run` → `handle_table_command` |
-| 流式分页 | nu-command/src/viewers/table.rs | `PagingTableCreator::next` |
-| 数据填充 + 样式 | nu-table/src/types/general.rs | `create_table_with_header_and_index` |
-| 列宽策略分发 | nu-table/src/table.rs | `maybe_truncate_columns` |
-| 宽终端列均分 | nu-table/src/table.rs | `truncate_columns_by_columns` |
-| 窄终端保内容 | nu-table/src/table.rs | `truncate_columns_by_content` |
-| 表头主导模式 | nu-table/src/table.rs | `truncate_columns_by_head` |
-| 优先级列压缩 | nu-table/src/table.rs | `compact_partial_visibility_for_priority` |
-| Wrap / Truncate 应用 | nu-table/src/table.rs | `width_ctrl_truncate` |
-| 主题加载 | nu-table/src/table.rs | `load_theme` |
-| 颜色 + 对齐 | nu-table/src/table.rs | `set_styles` |
-| 表头分割线模式 | nu-table/src/table.rs | `SetLineHeaders::change` |
-| 空格着色 | nu-table/src/util.rs | `colorize_space` |
-| 主题枚举 | nu-protocol/src/config/table.rs | `TableMode` |
-| 剪裁策略枚举 | nu-protocol/src/config/table.rs | `TrimStrategy` |
-| 全部配置结构 | nu-protocol/src/config/table.rs | `TableConfig` |
+| 命令入口 | `crates/nu-command/src/viewers/table.rs` | `Table::run` → `handle_table_command` |
+| 流式分页 | `crates/nu-command/src/viewers/table.rs` | `PagingTableCreator::next` |
+| 数据填充 + 样式 | `crates/nu-table/src/types/general.rs` | `create_table_with_header_and_index` |
+| 列宽策略分发 | `crates/nu-table/src/table.rs` | `maybe_truncate_columns` |
+| 宽终端列均分 | `crates/nu-table/src/table.rs` | `truncate_columns_by_columns` |
+| 窄终端保内容 | `crates/nu-table/src/table.rs` | `truncate_columns_by_content` |
+| 表头主导模式 | `crates/nu-table/src/table.rs` | `truncate_columns_by_head` |
+| 优先级列压缩 | `crates/nu-table/src/table.rs` | `compact_partial_visibility_for_priority` |
+| Wrap / Truncate 应用 | `crates/nu-table/src/table.rs` | `width_ctrl_truncate` |
+| 主题加载 | `crates/nu-table/src/table.rs` | `load_theme` |
+| 颜色 + 对齐 | `crates/nu-table/src/table.rs` | `set_styles` |
+| 表头分割线模式 | `crates/nu-table/src/table.rs` | `SetLineHeaders::change` |
+| 空格着色 | `crates/nu-table/src/util.rs` | `colorize_space` |
+| ANSI 安全的字符串宽度 | `crates/nu-table/src/util.rs` | `string_width`（底层 tabled `get_text_width`） |
+| 主题枚举 | `crates/nu-protocol/src/config/table.rs` | `TableMode` |
+| 剪裁策略枚举 | `crates/nu-protocol/src/config/table.rs` | `TrimStrategy` |
+| 全部配置结构 | `crates/nu-protocol/src/config/table.rs` | `TableConfig` |
