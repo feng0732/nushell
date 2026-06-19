@@ -130,6 +130,208 @@ if let Some(custom_completer) = flag.and_then(|f| f.completion) {
 // ... 依次尝试 command-wide → dynamic → type-based → file fallback
 ```
 
+### 2.5 外部命令参数补全链路（ExternalCall）
+
+当用户在 Nushell 中运行外部命令（即 `Expr::ExternalCall`），例如 `sudo ls -l`、`^git status` 或 `docker run` 时，补全走一条独立的链路。代码位于 [completer.rs#L578-L650](crates/nu-cli/src/completions/completer.rs#L578-L650)。
+
+**链路总览**（优先级从高到低）：
+
+```
+sudo/doas 命令名补全（仅第一个参数）
+    → 外部补全器闭包（config.completions.external.completer）
+        → 文件回退（FileCompletion）
+```
+
+#### 2.5.1 sudo / doas 的特殊处理：穿透式命令补全
+
+对于 `sudo l<TAB>` 或 `doas l<TAB>`，用户期望补全出 `ls`、`less` 等命令名，而不是文件名。
+
+代码（[completer.rs#L582-L603](crates/nu-cli/src/completions/completer.rs#L582-L603)）：
+
+```rust
+Expr::ExternalCall(head, arguments) => {
+    for (i, arg) in arguments.iter().enumerate() {
+        if span.contains(pos) {
+            // HACK: judge by index 0 is not accurate
+            if i == 0 {
+                let external_cmd = working_set.get_span_contents(head.span);
+                if external_cmd == b"sudo" || external_cmd == b"doas" {
+                    let commands = self.command_completion_helper(
+                        working_set, span, offset,
+                        CommandCompletionOptions {
+                            internals: true,
+                            externals: true,
+                            builtins_only: false,
+                            quote_internals: false,
+                        },
+                        strip,
+                    );
+                    // flags of sudo/doas can still be completed by external completer
+                    if !commands.is_empty() {
+                        return commands;
+                    }
+                }
+            }
+            // ... 继续走外部补全器和文件回退
+```
+
+**关键点**：
+- 只对 **第一个参数**（`i == 0`）触发 sudo/doas 穿透逻辑
+- 使用 `command_completion_helper` 生成命令补全（包括内置命令和外部命令）
+- 如果命令补全无结果（例如用户输入的是 `sudo -<TAB>` 标志），**不返回**，继续走下面的外部补全器闭包
+- 注释中标注为 **HACK**，原因是仅靠参数索引判断不够精确（无法区分参数是命令名还是选项值）
+
+测试用例验证（[completer.rs#L812-L822](crates/nu-cli/src/completions/completer.rs#L812-L822)）：
+
+```
+"sudo"           → []   （无输入，无可匹配）
+"sudo l"         → ["ls", "let", "lines", "loop"]
+" sudo le"       → ["let", "length"]
+"ls | sudo m"    → ["mv", "mut", "move"]
+```
+
+#### 2.5.2 外部补全器闭包（ExternalCompleter Closure）
+
+如果 sudo/doas 分支未命中或返回空，下一步尝试从配置中读取外部补全器闭包。
+
+**配置结构**（[completions.rs#L58-L72](crates/nu-protocol/src/config/completions.rs#L58-L72)）：
+
+```rust
+pub struct ExternalCompleterConfig {
+    pub enable: bool,
+    pub max_results: i64,
+    pub completer: Option<Closure>,   // ← 用户自定义的 Nushell 闭包
+}
+```
+
+**调用代码**（[completer.rs#L606-L628](crates/nu-cli/src/completions/completer.rs#L606-L628)）：
+
+```rust
+let completion = self.engine_state.get_config()
+    .completions.external.completer.as_ref()
+    .map(|closure| {
+        CommandWideCompletion::closure(closure, element_expression, strip)
+    });
+
+if let Some(mut completion) = completion {
+    let ctx = Context::new(working_set, span, b"", offset);
+    let results = self.process_completion(&mut completion, &ctx);
+
+    // Prioritize external results over (sub)commands
+    suggestions.splice(0..0, results);
+
+    if !completion.need_fallback {
+        return suggestions;
+    }
+}
+```
+
+**CommandWideCompletion 闭包执行流程**（[custom_completions.rs#L364-L438](crates/nu-cli/src/completions/custom_completions.rs#L364-L438)）：
+
+```
+1. get_command_arguments() 从 AST 提取整条外部命令的参数列表
+   └─ flatten_expression() 把 ExternalCall 的 arguments 展平为 [sudo, ls, -l]
+2. 如果 strip=true，移除最后一个参数末尾的占位符字符 `a`
+3. 将参数列表（Spanned<Vec<Spanned<String>>>）作为 $arg 传入闭包
+4. eval_block_with_early_return() 执行闭包（Nushell 代码）
+5. convert_whole_command_completion_results() 解析闭包返回值
+   ├─ Value::List → 通过 map_value_completions() 转为建议
+   ├─ Value::Nothing → need_fallback = true，触发回退
+   └─ 其他类型 → 记录 error log，返回空
+```
+
+**参数传入细节**：
+- `get_command_arguments()`（[custom_completions.rs#L309-L323](crates/nu-cli/src/completions/custom_completions.rs#L309-L323)）遍历整个 `element_expression`，提取所有子 span 的原始文本
+- 闭包签名的第一个必需位置参数（`$arg`）接收参数列表，值类型为 `list<string>`
+- 闭包可以访问 captures（外部变量），通过 `stack.captures_to_stack_preserve_out_dest()` 传递
+
+**need_fallback 语义**：
+- 闭包返回 `Nothing`（`null`）→ `need_fallback = true`，表示"我不知道，让系统继续猜"
+- 闭包返回 `[]`（空列表）→ `need_fallback = false`，表示"没有候选，但别再回退了"
+- 闭包返回列表 → `need_fallback = false`，直接使用结果
+
+#### 2.5.3 文件回退（FileCompletion Fallback）
+
+如果以上两步都没返回有效结果，最终回退到文件系统补全。
+
+**回退触发点有两处**：
+
+**第一处**（仅 ExternalCall 内部）（[completer.rs#L630-L636](crates/nu-cli/src/completions/completer.rs#L630-L636)）：
+
+```rust
+// for external path arguments with spaces, please check issue #15790
+if suggestions.is_empty() {
+    let (new_span, prefix) = strip_placeholder_if_any(working_set, &span, strip);
+    let ctx = Context::new(working_set, new_span, prefix, offset);
+    return self.process_completion(&mut FileCompletion, &ctx);
+}
+```
+
+**第二处**（函数末尾，所有表达式类型共用）（[completer.rs#L644-L650](crates/nu-cli/src/completions/completer.rs#L644-L650)）：
+
+```rust
+if suggestions.is_empty() {
+    let (new_span, prefix) = strip_placeholder_if_any(
+        working_set, &element_expression.span, strip
+    );
+    let ctx = Context::new(working_set, new_span, prefix, offset);
+    suggestions.extend(self.process_completion(&mut FileCompletion, &ctx));
+}
+```
+
+**两处回退的区别**：
+| 位置 | span 使用 | 是否 return | 适用场景 |
+|------|----------|-------------|----------|
+| 第一处（L630） | 当前参数的 span | 直接 `return` | ExternalCall 参数，精确匹配单个参数位置 |
+| 第二处（L644） | 整个表达式的 span | `extend` 追加 | 所有表达式类型的最终兜底 |
+
+第一处针对外部命令做了专门处理，注释中提到 issue #15790（外部路径参数含空格的情况），使用更精确的参数级 span 而不是整个表达式 span。
+
+#### 2.5.4 完整示例：`sudo l<TAB>` 的处理流程
+
+```
+用户输入: "sudo l" + <TAB>
+    ↓
+parse("sudo la") → Expr::ExternalCall(head="sudo", args=["la"])
+    ↓
+find_pipeline_element_by_position → 定位到 ExternalCall 节点
+    ↓
+complete_by_expression 匹配 Expr::ExternalCall 分支
+    ↓
+遍历 arguments，i=0，span 包含光标位置
+    ↓
+检查 head.span == "sudo" → YES
+    ↓
+command_completion_helper("l") → ["ls", "let", "lines", ...]
+    ↓
+结果非空 → return 命令列表 ←（停在这里，不再走外部闭包和文件回退）
+```
+
+#### 2.5.5 完整示例：`docker run --na<TAB>` 的处理流程（假设配置了外部补全器）
+
+```
+用户输入: "docker run --na" + <TAB>
+    ↓
+parse → Expr::ExternalCall(head="docker", args=["run", "--naa"])
+    ↓
+i=1（--naa），head != "sudo"/"doas" → 跳过穿透分支
+    ↓
+检查 config.completions.external.completer → Some(closure)
+    ↓
+CommandWideCompletion::closure() 构造 completer
+    ↓
+get_command_arguments() → ["docker", "run", "--na"]（移除占位符后）
+    ↓
+eval 闭包，$arg = ["docker", "run", "--na"]
+    ↓
+闭包返回 ["--network", "--name"]（list）或 null（Nothing）
+    ↓
+如果返回 list → 转为建议返回；need_fallback = false
+如果返回 null → need_fallback = true，继续
+    ↓
+（可选）文件回退：FileCompletion 在当前目录搜索匹配 "--na*" 的文件
+```
+
 ---
 
 ## 三、作用域数据在补全中的使用
@@ -578,6 +780,29 @@ RUST_LOG=nu_cli::completions=debug nu
 |----------|------|----------|------|
 | 单精确匹配优化 | L125-L134 | `if !multiple_exact_matches && let Some(built) = exact_match { ... }` | ✅ |
 | `enable_exact_match` 参数 | L45 | `enable_exact_match: bool` 函数参数 | ✅ |
+
+#### 外部命令参数补全链路
+| 文档描述 | 文件 | 行号 | 核实内容 | 状态 |
+|----------|------|------|----------|------|
+| ExternalCall 分支入口 | `crates/nu-cli/src/completions/completer.rs` | L578-L650 | `Expr::ExternalCall(head, arguments)` | ✅ |
+| sudo/doas 穿透判断 | 同上 | L582-L603 | `external_cmd == b"sudo" \|\| external_cmd == b"doas"` | ✅ |
+| i==0 限制第一个参数 | 同上 | L584 | `if i == 0` | ✅ |
+| sudo/doas 测试用例 | 同上 | L812-L822 | `"sudo l" → ["ls", "let", "lines", "loop"]` 等 | ✅ |
+| 外部补全器闭包读取 | 同上 | L606-L628 | `config.completions.external.completer.as_ref()` | ✅ |
+| `CommandWideCompletion::closure` 构造 | 同上 | L614-L615 | `CommandWideCompletion::closure(closure, ...)` | ✅ |
+| `need_fallback` 短路 | 同上 | L625-L627 | `if !completion.need_fallback { return suggestions; }` | ✅ |
+| ExternalCall 内文件回退 | 同上 | L630-L636 | `if suggestions.is_empty() { return process_completion(FileCompletion) }` | ✅ |
+| 全局文件回退 | 同上 | L644-L650 | 函数末尾 `suggestions.extend(FileCompletion)` | ✅ |
+| ExternalCompleterConfig 结构 | `crates/nu-protocol/src/config/completions.rs` | L58-L72 | `pub completer: Option<Closure>` | ✅ |
+| `completer` 配置更新逻辑 | 同上 | L89-L93 | `"completer" => match val { Value::Closure, Value::Nothing }` | ✅ |
+| CommandWideCompletion 结构 | `crates/nu-cli/src/completions/custom_completions.rs` | L325-L331 | `block_id, captures, expression, strip, need_fallback` | ✅ |
+| `closure()` 构造函数 | 同上 | L353-L361 | `Self { block_id: closure.block_id, captures: closure.captures.clone(), ... }` | ✅ |
+| `Completer` trait 的 fetch 实现 | 同上 | L364-L438 | 参数提取 → 占位符剥离 → eval → 结果转换 | ✅ |
+| `get_command_arguments()` | 同上 | L309-L323 | `flatten_expression()` 提取所有 span | ✅ |
+| 参数传入闭包（$arg） | 同上 | L404-L416 | `callee_stack.add_var(var_id, Value::list(...))` | ✅ |
+| `eval_block_with_early_return` 执行 | 同上 | L420-L426 | `nu_engine::eval_block_with_early_return::<WithoutDebug>(...)` | ✅ |
+| 结果转换（Nothing → need_fallback） | 同上 | L442-L484 | `Value::Nothing { .. } => None` 触发 need_fallback=true | ✅ |
+| `map_value_completions` 结果映射 | 同上 | L19-L49 | List → SemanticSuggestion 转换 | ✅ |
 
 ### 复核结论
 
