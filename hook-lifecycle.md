@@ -394,22 +394,89 @@ pub fn hide_env_var(&mut self, engine_state: &EngineState, name: &str) -> bool {
 ```
 
 `hide_env_var` 比 `remove_env_var` 多出的步骤：
-1. 检查 `env_hide_history`，防止同一 scope 重复 hide 报错
-2. 无论栈上有没有值，都会调用 `record_env_var_hide_in_active_overlay` 记录隐藏历史
+1. 调用 `is_env_var_hide_recorded` 检查 `env_hide_history`，防止同一 scope 重复 hide 报错
+2. **只有在两条成功路径中**才调用 `record_env_var_hide_in_active_overlay` 记录隐藏历史（见下方详细分析）
 3. 栈上删除后，额外检查 `has_env_var_in_stack`——只有在所有栈层都没有残留值时，才标记基线隐藏
 
-一个容易忽视的细节：如果栈上有**多层 shadow**（例如外层 scope 设了 FOO="a"，内层 scope 又设 FOO="b"），`remove_env_var_from_stack` 只删除**找到的第一个**（按 active_overlays.rev() 顺序）。如果删除后仍有残留的栈级 shadow（外层的 "a"），`has_env_var_in_stack` 返回 `true`，则基线隐藏标记**不会**被设置——因为仍然有栈级值在遮蔽基线。
+#### env_hide_history 的精确记录时机
+
+`env_hide_history` 的注释（`crates/nu-protocol/src/engine/stack.rs` L45-L48）：
+> Tracks env vars hidden in this stack context to report repeated `hide-env` calls.
+> This is separate from `env_hidden`: `env_hidden` controls runtime visibility for engine state values, while `env_hide_history` preserves command semantics for repeated hides.
+
+`record_env_var_hide_in_active_overlay`（`crates/nu-protocol/src/engine/stack.rs` L650-L661）只有**两个调用点**，都在 `hide_env_var` 函数内：
+
+**调用点 A（栈级删除成功路径）**：`crates/nu-protocol/src/engine/stack.rs` L692-L693
+```rust
+if self.remove_env_var_from_stack(&env_name) {
+    self.record_env_var_hide_in_active_overlay(&env_name);  // ← 只要栈上删除成功就记录
+    // ...后续可能设置或不设置 env_hidden...
+    return true;
+}
+```
+
+**调用点 B（基线隐藏成功路径）**：`crates/nu-protocol/src/engine/stack.rs` L701-L702
+```rust
+if self.hide_engine_state_env_var(engine_state, &env_name) {
+    self.record_env_var_hide_in_active_overlay(&env_name);  // ← 基线隐藏成功才记录
+    return true;
+}
+```
+
+**不记录 `env_hide_history` 的四种情况**：
+
+| 场景 | 触发条件 | 是否记录 hide_history | `hide_env_var` 返回值 |
+|------|----------|:---------------------:|:--------------------:|
+| ① 重复隐藏 | `is_env_var_hide_recorded` 开头返回 `true` | ❌ 不记录 | `false` |
+| ② 变量完全不存在 | 栈上没有值 + 基线也没有值 | ❌ 不记录 | `false` |
+| ③ 使用 `remove_env_var` 而非 `hide_env_var` | `remove_env_var` 函数体不包含任何 `record_env_var_hide_in_active_overlay` 调用 | ❌ 不记录 | 视情况而定 |
+| ④ active_overlays 为空 | `record_env_var_hide_in_active_overlay` 内部 `active_overlays.last()` 返回 `None` | ❌ 不记录（实际几乎不会发生） | — |
+
+**关键纠正**：之前的描述「无论栈上有没有值，都会调用 `record_env_var_hide_in_active_overlay` 记录隐藏历史」不准确。实际是**只有两条成功路径**（栈级删除成功 OR 基线隐藏成功）才记录。变量不存在或重复隐藏时都**不记录**。
+
+#### is_env_var_hide_recorded 的检查范围
+
+`crates/nu-protocol/src/engine/stack.rs` L663-L669：
+```rust
+fn is_env_var_hide_recorded(&self, env_name: &EnvName) -> bool {
+    self.active_overlays
+        .iter()
+        .rev()
+        .filter_map(|overlay| self.env_hide_history.get(overlay))
+        .any(|hidden_vars| hidden_vars.contains(env_name))
+}
+```
+它遍历**所有 active_overlay**（不是只检查最后一个），只要任意一个 active overlay 的历史里有这个变量，就判定为已记录。
+
+#### 重新赋值对 hide_history 的清除
+
+`crates/nu-protocol/src/engine/stack.rs` L298-L306：
+```rust
+fn clear_env_var_marks_in_active_overlay(&mut self, overlay, env_name) {
+    if let Some(env_hidden) = Arc::make_mut(&mut self.env_hidden).get_mut(overlay) {
+        env_hidden.remove(env_name);  // 清除可见性隐藏标记
+    }
+    if let Some(hide_history) = Arc::make_mut(&mut self.env_hide_history).get_mut(overlay) {
+        hide_history.remove(env_name);  // ← 同时清除隐藏历史记录
+    }
+}
+```
+当执行 `$env.FOO = value`（即 `add_env_var`）时，`env_hidden` 和 `env_hide_history` 中的记录都会被清除。所以 `hide-env FOO` 后再 `$env.FOO = "x"`，后续再次 `hide-env FOO` 不会被判定为"重复隐藏"。
+
+一个容易忽视的细节：如果栈上有**多层 shadow**（例如外层 scope 设了 FOO="a"，内层 scope 又设 FOO="b"），`remove_env_var_from_stack` 只删除**找到的第一个**（按 active_overlays.rev() 顺序）。如果删除后仍有残留的栈级 shadow（外层的 "a"），`has_env_var_in_stack` 返回 `true`，则基线隐藏标记**不会**被设置——因为仍然有栈级值在遮蔽基线。但**无论基线是否被标记，hide_history 已经被记录了**（栈级删除成功路径的调用点 A 已经先执行了）。
 
 #### hide_env_var vs remove_env_var 对比表
 
-| 场景 | 操作 | 栈上的结果 | `env_hidden` 标记是否设置 | `get_env_var` 返回 | 对 `env_change` 钩子的影响 |
-|------|------|-----------|:--------------------------:|--------------------|---------------------------|
-| 栈上有 FOO="new"，基线有 FOO="bar" | `remove_env_var("FOO")` | 栈上的值被删除 | ❌ 不设置（`||` 短路） | `Some("bar")`（回退基线） | `after` 从 "new" 变为 "bar"，与缓存的 `before` 可能不同 → **可能触发** |
-| 栈上有 FOO="new"，基线有 FOO="bar" | `hide_env_var("FOO")` | 栈上的值被删除 | ✅ 设置（因为栈上已无其他 shadow） | `None` | `after` 从 "new" 变为 `None` → **触发**，`$after = null` |
-| 栈上有 FOO="inner" 和 FOO="outer" 两层 shadow，基线有 FOO="bar" | `hide_env_var("FOO")` | 只删除了找到的一层（"inner"），"outer" 还在 | ❌ 不设置（`has_env_var_in_stack` 仍为 true） | `Some("outer")`（残留栈值） | `after` 从 "inner" 变为 "outer" → **触发** |
-| 栈上无值，基线有 FOO="bar" | `remove_env_var("FOO")` | 无变化 | ✅ 设置 | `None` | `after` 从 "bar" 变为 `None` → **触发**，`$after = null` |
-| 栈上无值，基线有 FOO="bar" | `hide_env_var("FOO")` | 无变化 | ✅ 设置，同时记录 hide_history | `None` | `after` 从 "bar" 变为 `None` → **触发**，`$after = null` |
-| 栈上无值，基线也无值 | 两者任一 | 无变化 | ❌ | `None` | 无 |
+| 场景 | 操作 | 栈上的结果 | `env_hidden` 标记是否设置 | `env_hide_history` 是否记录 | `get_env_var` 返回 | 对 `env_change` 钩子的影响 |
+|------|------|-----------|:--------------------------:|:--------------------------:|--------------------|---------------------------|
+| 栈上有 FOO="new"，基线有 FOO="bar" | `remove_env_var("FOO")` | 栈上的值被删除 | ❌ 不设置（`||` 短路） | ❌ 不记录（`remove_env_var` 从不调用 record） | `Some("bar")`（回退基线） | `after` 从 "new" 变为 "bar" → **触发** |
+| 栈上有 FOO="new"，基线有 FOO="bar" | `hide_env_var("FOO")` | 栈上的值被删除 | ✅ 设置（栈上已无其他 shadow） | ✅ 记录（调用点 A：栈级删除成功） | `None` | `after` 从 "new" 变为 `None` → **触发**，`$after = null` |
+| 栈上有两层 shadow FOO="inner"/"outer"，基线有 FOO="bar" | `hide_env_var("FOO")` | 只删除了 "inner"，"outer" 还在 | ❌ 不设置（`has_env_var_in_stack` 仍为 true） | ✅ 记录（调用点 A 已执行，与基线是否设置无关） | `Some("outer")`（残留栈值） | `after` 从 "inner" 变为 "outer" → **触发** |
+| 栈上无值，基线有 FOO="bar" | `remove_env_var("FOO")` | 无变化 | ✅ 设置 | ❌ 不记录 | `None` | `after` 从 "bar" 变为 `None` → **触发**，`$after = null` |
+| 栈上无值，基线有 FOO="bar" | `hide_env_var("FOO")` | 无变化 | ✅ 设置 | ✅ 记录（调用点 B：基线隐藏成功） | `None` | `after` 从 "bar" 变为 `None` → **触发**，`$after = null` |
+| 栈上无值，基线也无值 | 两者任一 | 无变化 | ❌ | ❌ 不记录（两条成功路径都没走通） | `None` | 无 |
+| 已记录过 hide_history，再次 `hide-env FOO` | `hide_env_var("FOO")` | 无变化 | ❌（开头短路返回） | ❌ 不记录（开头短路返回） | 取决于上次隐藏后的状态 | 取决于上次隐藏后的状态 |
+| `hide-env FOO` 后执行 `$env.FOO = "x"` | `add_env_var` | 栈上写入 "x" | ❌（被 clear_env_var_marks 清除） | ❌（被 clear_env_var_marks 从 hide_history 中删除） | `Some("x")` | after 从 None 变为 "x" → **触发** |
 
 #### 实际场景对 env_change 缓存的影响
 
@@ -1027,13 +1094,20 @@ $env.config.hooks.display_output = ""     # 空字符串也有效
 | 闭包钩子实际执行 run_hook | `crates/nu-cmd-base/src/hook.rs` | L284-L331 |
 | run_hook 中 redirect_env 调用点 | `crates/nu-cmd-base/src/hook.rs` | L328 |
 | env_change 对比与缓存更新 | `crates/nu-cmd-base/src/hook.rs` | L13-L38 |
-| Stack::add_env_var（清除隐藏标记） | `crates/nu-protocol/src/engine/stack.rs` | L273-L296 |
+| Stack::add_env_var（清除隐藏标记和 hide_history） | `crates/nu-protocol/src/engine/stack.rs` | L273-L307 |
 | Stack::get_env_var（检查 env_hidden） | `crates/nu-protocol/src/engine/stack.rs` | L531-L557 |
 | Stack::remove_env_var | `crates/nu-protocol/src/engine/stack.rs` | L591-L596 |
-| Stack::hide_env_var（含 hide_history） | `crates/nu-protocol/src/engine/stack.rs` | L684-L707 |
+| Stack::remove_env_var_from_stack | `crates/nu-protocol/src/engine/stack.rs` | L604-L626 |
+| Stack::hide_engine_state_env_var | `crates/nu-protocol/src/engine/stack.rs` | L628-L648 |
+| Stack::record_env_var_hide_in_active_overlay | `crates/nu-protocol/src/engine/stack.rs` | L650-L661 |
+| Stack::is_env_var_hide_recorded（检查 hide_history） | `crates/nu-protocol/src/engine/stack.rs` | L663-L669 |
 | Stack::is_env_hidden_in_overlay | `crates/nu-protocol/src/engine/stack.rs` | L671-L675 |
+| Stack::hide_env_var（完整流程） | `crates/nu-protocol/src/engine/stack.rs` | L684-L707 |
+| Stack::has_env_var_in_stack（多层 shadow 检查） | `crates/nu-protocol/src/engine/stack.rs` | L709-L718 |
+| Stack::clear_env_var_marks_in_active_overlay | `crates/nu-protocol/src/engine/stack.rs` | L298-L307 |
+| env_hide_history 字段定义与注释 | `crates/nu-protocol/src/engine/stack.rs` | L45-L49 |
 | Stack::captures_to_stack_preserve_out_dest | `crates/nu-protocol/src/engine/stack.rs` | L336-L357 |
-| 环境重定向 redirect_env | `crates/nu-engine/src/eval.rs` | L369-L384 |
+| 环境重定向 redirect_env | `crates/nu-engine/src/eval.rs` | L369-L388 |
 | EngineState::merge_env（永久写入） | `crates/nu-protocol/src/engine/engine_state.rs` | L365-L392 |
 | previous_env_vars 初始化（空 HashMap） | `crates/nu-protocol/src/engine/engine_state.rs` | L199 |
 | REPL 主循环触发点 | `crates/nu-cli/src/repl.rs` | L510-L848 |
