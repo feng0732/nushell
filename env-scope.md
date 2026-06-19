@@ -134,46 +134,329 @@ pub fn with_parent(parent: Arc<Stack>) -> Stack {
 
 ### 3. with-env 命令
 
-实现于 [with_env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/env/with_env.rs)
+实现于 [with_env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/env/with_env.rs#L54-L80)
 
+```rust
+fn with_env(engine_state: &EngineState, stack: &mut Stack, call: &Call, input: PipelineData) -> Result<PipelineData, ShellError> {
+    let env: Record = call.req(engine_state, stack, 0)?;
+    let capture_block: Closure = call.req(engine_state, stack, 1)?;
+    let block = engine_state.get_block(capture_block.block_id);
+
+    // 步骤1：创建新栈（推入新环境层）
+    let mut stack = stack.captures_to_stack_preserve_out_dest(capture_block.captures);
+
+    // 步骤2：在新栈上设置临时环境变量
+    for (k, v) in env {
+        stack.add_env_var(k, v);
+    }
+
+    // 步骤3：执行闭包
+    eval_block::<WithoutDebug>(engine_state, &mut stack, block, input).map(|p| p.body)
+
+    // 步骤4：函数返回 → stack 被丢弃 → 新环境层自动消失 → 回滚完成
+}
 ```
-执行流程：
-  1. 通过 captures_to_stack_preserve_out_dest 创建新栈（推入新环境层）
-  2. 在新栈上设置临时环境变量
-  3. 执行闭包
-  4. 闭包执行完成 → 新栈丢弃 → 环境自动回滚
-```
+
+**源码核对**：
+- 新栈创建：[captures_to_stack_preserve_out_dest](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L336-L357) 第338-339行推入新层
+- 临时变量设置：[with_env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/env/with_env.rs#L75-L77)
+- 自动回滚：新栈是函数局部变量，返回即销毁
 
 示例测试见 [with_env.rs 测试](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/tests/commands/with_env.rs)
 
-## 环境重定向（redirect_env）
+### 4. 三种机制对比总览
 
-有些场景需要将内部作用域的环境变更**持久化**到外部作用域，而不是自动回滚。这通过 `redirect_env` 机制实现。
+| 机制 | 作用域创建 | 数据流向 | 回滚方式 | 典型应用 |
+|------|-----------|---------|---------|---------|
+| **临时作用域回滚** | 推入新环境层 | 单向（外部→内部） | 自动（栈丢弃） | `with-env`、`do` 块 |
+| **当前作用域导入** | 推入新环境层 | 双向（外部→内部→外部） | 主动同步（redirect_env） | `source-env`、`export-env` |
+| **外部命令转换** | 不创建 | 单向（Nushell→子进程） | 不回滚也不持久化 | `run-external`、外部命令 |
 
-### redirect_env 函数
+## 机制一：临时作用域回滚（with-env 模式）
 
-实现于 [eval.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/eval.rs#L368-L388)
+### 完整执行流程
+
+```
+调用者 Stack                          新创建的 Stack
+┌───────────────────────┐            ┌───────────────────────┐
+│ env_vars: [Layer0]    │  clone +   │ env_vars: [Layer0,    │
+│                       │  push new  │            Layer1]    │
+│                       │ ─────────► │                       │
+│                       │            │ Layer1: { FOO: BAR }  │ ← 临时变量
+│                       │            │                       │
+└───────────────────────┘            └───────────┬───────────┘
+                                                  │
+                                                  ▼
+                                           执行闭包
+                                                  │
+                                                  ▼
+                                           Stack 被丢弃
+                                                  │
+                                                  ▼
+                                     Layer1 消失 → 自动回滚
+```
+
+### 源码关键路径
+
+1. **创建新作用域**：[Stack::captures_to_stack_preserve_out_dest](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L336-L357)
+   ```rust
+   let mut env_vars = self.env_vars.clone();
+   env_vars.push(Arc::new(HashMap::new()));  // 关键：推入新层
+   ```
+
+2. **设置临时变量**：[Stack::add_env_var](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L273-L296)
+   - 总是写入 `env_vars.last_mut()`（最新层）
+
+3. **读取时优先级**：[Stack::get_env_var](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L531-L557)
+   - 从 `env_vars.iter().rev()` 逆序查找，新层优先
+
+4. **自动回滚**：新栈是函数局部变量，离开作用域时 Rust 自动销毁
+   - `env_vars` 中的 `Arc` 引用计数归零，新层内存被释放
+
+### 测试验证
+
+见测试用例 [with_env_hides_variables_in_parent_scope](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/tests/commands/with_env.rs#L50-L60)：
+```nu
+$env.FOO = "1"
+let before = $env.FOO                # "1"
+let during = (with-env { FOO: null } { $env.FOO })  # null
+let after = $env.FOO                 # "1" （自动回滚）
+```
+
+## 机制二：当前作用域导入（source-env / export-env 模式）
+
+与临时作用域回滚的核心区别：**执行完后主动将内部环境变更同步回外部**。
+
+### 核心函数：redirect_env
+
+在 Nushell 中有两个 `redirect_env` 实现，功能完全一致：
+
+1. AST 求值版本：[eval.rs::redirect_env](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/eval.rs#L368-L388)
+2. IR 求值版本：[eval_ir.rs::redirect_env](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/eval_ir.rs#L1885-L1905)
 
 ```rust
-pub fn redirect_env(engine_state: &EngineState, caller_stack: &mut Stack, callee_stack: &Stack) {
+fn redirect_env(engine_state: &EngineState, caller_stack: &mut Stack, callee_stack: &Stack) {
+    // 步骤1：获取 caller 当前所有环境变量名（含 engine_state）
     let caller_env_vars = caller_stack.get_env_var_names(engine_state);
 
-    // 1. 移除 caller 有但 callee 没有的变量（callee 隐藏了它们）
+    // 步骤2：移除 caller 有但 callee 没有的变量（callee 中被 hide-env 了）
     for var in caller_env_vars.iter() {
         if !callee_stack.has_env_var(engine_state, var) {
             caller_stack.hide_env_var(engine_state, var);
         }
     }
 
-    // 2. 将 callee 栈层的变量添加到 caller
+    // 步骤3：将 callee 栈层的变量同步到 caller
+    // 关键：只同步栈层变量（get_stack_env_vars），不同步 engine_state 的
     for (var, value) in callee_stack.get_stack_env_vars() {
         caller_stack.add_env_var(var, value);
     }
 
-    // 3. 同步 config
+    // 步骤4：同步 config
     caller_stack.config.clone_from(&callee_stack.config);
 }
 ```
+
+**源码核对**：
+- 变量移除：[hide_env_var](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L684-L707)
+- 变量同步：[get_stack_env_vars](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L423-L440) 只返回栈层
+- 添加变量：[add_env_var](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L273-L296) 写入 caller 的最新栈层
+
+### source-env 的完整流程
+
+实现于 [source_env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/env/source_env.rs#L45-L109)
+
+```
+caller_stack                          callee_stack
+┌───────────────────────┐            ┌───────────────────────┐
+│ env_vars: [Layer0]    │ gather_   │ env_vars: [Layer0,    │
+│ $env.FOO = "1"        │ captures  │            Layer1]    │
+│                       │ ─────────► │                       │
+│                       │            │ 执行脚本:             │
+│                       │            │   $env.FOO = "2"      │
+│                       │            │   $env.BAR = "new"    │
+│                       │            │ 写入 Layer1          │
+│                       │            │                       │
+└───────────────────────┘            └───────────┬───────────┘
+                                                  │
+                                          redirect_env
+                                                  │
+                        ┌─────────────────────────┘
+                        ▼                         ▼
+              同步新增/修改              同步隐藏
+              $env.BAR = "new"           如果 callee 隐藏了 FOO，
+              $env.FOO = "2"             caller 也会隐藏
+```
+
+**源码核对**：
+- 新栈创建：[gather_captures](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L359-L393) 第374-375行推入新层
+- 显式调用 redirect_env：[source_env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/env/source_env.rs#L101-L102)
+
+### export-env 的流程
+
+实现于 [export_env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/env/export_env.rs#L40-L67)
+
+与 source-env 几乎相同，区别在于：
+- source-env 是执行外部脚本文件
+- export-env 是执行内联块
+- 都使用 `redirect_env` 同步环境
+
+### 自定义命令的 redirect_env
+
+当 `def` 命令的 block 设置了 `redirect_env: true` 时，IR 求值器会自动调用：
+
+[eval_ir.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/eval_ir.rs#L1269-L1272)
+```rust
+let result = eval_block_with_early_return::<D>(engine_state, &mut callee_stack, block, input)
+    .map(|p| p.body);
+
+if block.redirect_env {
+    redirect_env(engine_state, &mut caller_stack, &callee_stack);
+}
+```
+
+### 关键细节：get_stack_env_vars vs get_env_vars
+
+这是理解 redirect_env 行为的核心！
+
+| 函数 | 返回范围 | 用途 |
+|------|---------|------|
+| [`get_stack_env_vars()`](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L423-L440) | 只返回 `stack.env_vars` 栈层的变量 **不含** `engine_state.env_vars` | redirect_env 同步时使用，只同步运行时变更 |
+| [`get_env_vars()`](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L396-L421) | 返回完整环境：`engine_state.env_vars` + `stack.env_vars` | 读取完整环境时使用 |
+
+**为什么 redirect_env 只用 get_stack_env_vars？**
+- engine_state 的变量是永久的，不应该通过 redirect_env 重复同步
+- redirect_env 的目的是同步**运行时变更**，即 callee 栈层中的变更
+- 如果 callee 只是读取了 engine_state 的变量但没修改，不会产生栈层记录，也就不会被同步
+
+## 机制三：外部命令环境转换（run-external 模式）
+
+与前两种机制不同，外部命令转换**不创建新作用域**，也**不回滚**，而是将 Nushell 的环境变量转换为字符串格式传递给子进程。
+
+### 核心函数：env_to_strings
+
+实现于 [env.rs::env_to_strings](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/env.rs#L175-L192)
+
+```rust
+pub fn env_to_strings(engine_state: &EngineState, stack: &Stack) -> Result<HashMap<String, String>, ShellError> {
+    // 关键：获取完整环境（栈层 + engine_state）
+    let env_vars = stack.get_env_vars(engine_state);
+
+    let mut env_vars_str = HashMap::new();
+    for (env_name, val) in env_vars {
+        // 逐个转换为字符串
+        match env_to_string(&env_name, &val, engine_state, stack) {
+            Ok(val_str) => {
+                env_vars_str.insert(env_name, val_str);
+            }
+            Err(ShellError::EnvVarNotAString { .. }) => {} // 忽略无法转换的值
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(env_vars_str)
+}
+```
+
+### 单个变量转换：env_to_string
+
+实现于 [env.rs::env_to_string](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/env.rs#L129-L172)
+
+```rust
+pub fn env_to_string(env_name: &str, value: &Value, engine_state: &EngineState, stack: &Stack) -> Result<String, ShellError> {
+    // 步骤1：尝试用 ENV_CONVERSIONS 的 to_string 闭包转换
+    match get_converted_value(engine_state, stack, env_name, value, "to_string") {
+        Ok(v) => Ok(v.coerce_into_string()?),
+        Err(ConversionError::ShellError(e)) => Err(e),
+        Err(ConversionError::CellPathError) => {
+            // 步骤2：尝试直接 coerce 为字符串
+            match value.coerce_string() {
+                Ok(s) => Ok(s),
+                Err(_) => {
+                    // 步骤3：特殊处理 PATH 变量（硬编码 fallback）
+                    if env_name.to_lowercase() == "path" {
+                        match value {
+                            Value::List { vals, .. } => {
+                                let paths: Vec<String> = vals.iter()
+                                    .filter_map(|v| v.coerce_str().ok())
+                                    .map(|s| expand_tilde(&*s).to_string_lossy().into_owned())
+                                    .collect();
+                                std::env::join_paths(paths.iter().map(AsRef::<str>::as_ref))
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .map_err(|_| ShellError::EnvVarNotAString { ... })
+                            }
+                            _ => Err(ShellError::EnvVarNotAString { ... }),
+                        }
+                    } else {
+                        Err(ShellError::EnvVarNotAString { ... })
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+**源码核对**：
+- 完整环境获取：[get_env_vars](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L396-L421) 包含栈层 + engine_state
+- 转换闭包调用：[get_converted_value](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/env.rs#L301-L325)
+- PATH 硬编码处理：[env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/env.rs#L141-L157)
+
+### run-external 的完整流程
+
+实现于 [run_external.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/system/run_external.rs#L52-L350)
+
+```
+Nushell Stack                          子进程环境
+┌───────────────────────┐            ┌───────────────────────┐
+│ env_vars: [Layer0,    │ env_to_    │ HashMap<String, String>│
+│            Layer1]    │ strings    │ FOO: "1"              │
+│                       │ ─────────► │ PATH: "/usr/bin:/bin" │
+│ $env.FOO = Value(1)   │            │ ...                   │
+│ $env.PATH = List(...) │            │                       │
+│                       │            │ （子进程只读副本）     │
+│                       │            └───────────┬───────────┘
+└───────────────────────┘                        │
+                                                 ▼
+                                          调用 std::process
+                                                 │
+                                                 ▼
+                子进程结束 → 环境丢失 → 不影响 Nushell 环境
+```
+
+**源码核对**：
+- 环境转换：[run_external.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/system/run_external.rs#L177-L178) 第178行调用 `env_to_strings`
+- 清除并设置环境：[run_external.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/system/run_external.rs#L179-L180)
+  ```rust
+  let envs = env_to_strings(engine_state, stack)?;
+  command.env_clear();
+  command.envs(envs);
+  ```
+- PWD 配置：[run_external.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/system/run_external.rs#L174-L175)
+
+### 关键区别：get_env_vars vs get_stack_env_vars
+
+这是理解外部命令转换与 redirect_env 区别的核心：
+
+| 函数 | 数据来源 | 使用场景 | 包含 engine_state |
+|------|---------|---------|------------------|
+| `get_env_vars()` | `engine_state.env_vars` + `stack.env_vars` | `env_to_strings` 外部命令 | ✅ 是 |
+| `get_stack_env_vars()` | 仅 `stack.env_vars` | `redirect_env` 作用域导入 | ❌ 否 |
+
+**为什么有这个区别？**
+- **外部命令**需要完整的环境快照，包括永久变量
+- **redirect_env**只需要同步运行时变更，永久变量已经在 caller 的 engine_state 中
+
+### 子进程环境的独立性
+
+子进程的环境是**一次性副本**：
+1. 通过 `std::process::Command.envs()` 传递给子进程
+2. 子进程对环境的修改完全独立，不会影响 Nushell
+3. 子进程退出后，环境变量随之消失
+4. Nushell 不需要也无法回滚子进程的环境变更
+
+## 环境重定向（redirect_env）
+
+> 注：这部分内容已在「机制二」中详细分析，此处保留原有的触发条件和使用场景概述。
 
 ### 触发条件
 
@@ -201,6 +484,31 @@ if block.redirect_env {
 
 3. **自定义命令（def）** — 当命令块标记了 `redirect_env` 时
    - 在 IR 求值中处理：[eval_ir.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/eval_ir.rs#L1269-L1272)
+
+## 三种机制详细对比
+
+| 对比维度 | 临时作用域回滚<br>（with-env） | 当前作用域导入<br>（source-env/export-env） | 外部命令转换<br>（run-external） |
+|---------|-------------------------------|--------------------------------------------|--------------------------------|
+| **作用域创建** | 推入新环境层 `env_vars.push()` | 推入新环境层 `env_vars.push()` | 不创建，使用当前栈 |
+| **新栈创建** | `captures_to_stack_preserve_out_dest` | `gather_captures` | 不创建 |
+| **数据流向** | 外部 → 内部（单向） | 外部 → 内部 → 外部（双向） | Nushell → 子进程（单向） |
+| **读取函数** | `get_env_var()` 逆序查找 | `get_env_var()` 逆序查找 | `get_env_vars()` 完整快照 |
+| **同步函数** | 无（自动回滚） | `redirect_env` + `get_stack_env_vars()` | `env_to_strings` + `get_env_vars()` |
+| **回滚方式** | 新栈丢弃，新层自动释放 | 不回滚，主动同步变更 | 不回滚，子进程环境独立 |
+| **环境完整性** | 临时变量 + 继承的永久变量 | 同步运行时变更 | 完整环境快照（含永久变量） |
+| **数据类型** | Nushell Value（任意类型） | Nushell Value（任意类型） | 转换为 String |
+| **对 caller 的影响** | 执行完无影响 | 执行完环境被修改 | 执行完无影响 |
+| **典型代码** | `with-env {X: Y} { ... }` | `source-env script.nu` | `echo $env.X` |
+
+### 关键源码索引对照表
+
+| 操作 | with-env | source-env | run-external |
+|------|----------|------------|--------------|
+| 创建新栈 | [captures_to_stack_preserve_out_dest](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L336-L357) | [gather_captures](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L359-L393) | 不创建 |
+| 推入新层 | L338-339 | L374-375 | 不推入 |
+| 变量读取 | [get_env_var](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L531-L557) | [get_env_var](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L531-L557) | [get_env_vars](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L396-L421) |
+| 同步/转换 | 无 | [redirect_env](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/eval_ir.rs#L1885-L1905) | [env_to_strings](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/env.rs#L175-L192) |
+| 数据范围 | 栈层 + engine_state | 仅栈层（get_stack_env_vars） | 栈层 + engine_state |
 
 ## 环境变量转换（ENV_CONVERSIONS）
 
@@ -360,18 +668,63 @@ Overlay 是环境变量和命令的命名空间，可以激活/停用。
 
 ## 关键代码索引
 
-| 功能 | 文件 | 位置 |
+### 核心数据结构
+
+| 功能 | 文件 | 行号 |
 |------|------|------|
-| Stack 定义 | [stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs) | L38-L67 |
-| 环境变量读取 | [stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs) | L531-L557 |
-| 添加环境变量 | [stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs) | L273-L296 |
-| 隐藏环境变量 | [stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs) | L684-L707 |
-| 创建闭包栈 | [stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs) | L337-L357 |
-| 父子栈创建 | [stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs) | L106-L124 |
-| 子栈合并回父 | [stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs) | L132-L150 |
-| 环境重定向 | [eval.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/eval.rs) | L368-L388 |
-| with-env 命令 | [with_env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/env/with_env.rs) | L54-L80 |
-| source-env 命令 | [source_env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/env/source_env.rs) | L45-L109 |
-| export-env 命令 | [export_env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/env/export_env.rs) | L40-L67 |
-| 环境转换 | [env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/env.rs) | L33-L124 |
-| REPL 环境合并 | [repl.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-cli/src/repl.rs) | L529-L534 |
+| Stack 结构体定义 | [stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L38-L67) | L38-L67 |
+| EnvVars 类型定义 | [stack.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L18) | L18 |
+| EngineState.env_vars | [engine_state.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/engine_state.rs#L104) | L104 |
+
+### 环境变量读写
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| 读取单个环境变量 | [Stack::get_env_var](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L531-L557) | L531-L557 |
+| 获取完整环境（栈层+永久层） | [Stack::get_env_vars](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L396-L421) | L396-L421 |
+| 仅获取栈层环境 | [Stack::get_stack_env_vars](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L423-L440) | L423-L440 |
+| 添加环境变量 | [Stack::add_env_var](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L273-L296) | L273-L296 |
+| 隐藏环境变量 | [Stack::hide_env_var](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L684-L707) | L684-L707 |
+
+### 作用域创建
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| 闭包栈（推入新环境层） | [Stack::captures_to_stack_preserve_out_dest](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L336-L357) | L336-L357 |
+| 捕获栈（source-env/export-env 用） | [Stack::gather_captures](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L359-L393) | L359-L393 |
+| 父子栈模式 | [Stack::with_parent](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L106-L124) | L106-L124 |
+| 子栈合并回父 | [Stack::with_changes_from_child](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/stack.rs#L132-L150) | L132-L150 |
+
+### 三种机制的核心实现
+
+| 机制 | 功能 | 文件 | 行号 |
+|------|------|------|------|
+| **临时作用域回滚** | with-env 命令主逻辑 | [with_env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/env/with_env.rs#L54-L80) | L54-L80 |
+| **当前作用域导入** | redirect_env（IR 版本） | [eval_ir.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/eval_ir.rs#L1885-L1905) | L1885-L1905 |
+| **当前作用域导入** | redirect_env（AST 版本） | [eval.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/eval.rs#L368-L388) | L368-L388 |
+| **当前作用域导入** | source-env 命令 | [source_env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/env/source_env.rs#L45-L109) | L45-L109 |
+| **当前作用域导入** | export-env 命令 | [export_env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/env/export_env.rs#L40-L67) | L40-L67 |
+| **外部命令转换** | env_to_strings | [env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/env.rs#L175-L192) | L175-L192 |
+| **外部命令转换** | env_to_string | [env.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/env.rs#L129-L172) | L129-L172 |
+| **外部命令转换** | run-external 命令 | [run_external.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/src/system/run_external.rs#L177-L180) | L177-L180 |
+
+### ENV_CONVERSIONS 转换
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| 字符串 → 值（批量） | [convert_env_values](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/env.rs#L72-L124) | L72-L124 |
+| 字符串 → 值（运行时） | [convert_env_vars](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/env.rs#L33-L64) | L33-L64 |
+| 核心转换函数 | [get_converted_value](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-engine/src/env.rs#L301-L325) | L301-L325 |
+
+### REPL 环境管理
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| REPL 合并环境到永久层 | [EngineState::merge_env](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-protocol/src/engine/engine_state.rs#L364-L392) | L364-L392 |
+| REPL 每轮合并调用点 | [repl.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-cli/src/repl.rs#L529-L534) | L529-L534 |
+
+### 测试用例
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| with-env 自动回滚测试 | [with_env.rs 测试](file:///d:/fz/0601-2/solo-dogfeeding/code/68-nushell/crates/nu-command/tests/commands/with_env.rs#L50-L60) | L50-L60 |
