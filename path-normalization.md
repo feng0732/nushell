@@ -264,13 +264,56 @@ pub fn is_windows_device_path(path: &Path) -> bool {
 
 ### 三种展开函数的区别
 
-| 函数 | 解析 symlink | 访盘 | 转绝对 | 适用场景 |
-|------|:---:|:---:|:---:|----------|
-| `expand_path_with` | ❌ | ❌ | ✅ | 需要稳定的词法归一（不要求文件存在） |
-| `absolute_with` | ❌ | 仅读取 cwd | ✅ | 需要绝对路径但不想跟随链接 |
-| `canonicalize_with` | ✅ | ✅ | ✅ | 需要真实物理路径 |
+| 函数 | 解析 symlink | 访盘 | 转绝对 | 词法消 `..` | 适用场景 |
+|------|:---:|:---:|:---:|:---:|----------|
+| `expand_path_with` | ❌ | ❌ | ✅ | ✅ | 需要稳定的词法归一（不要求文件存在） |
+| `absolute_with` | ❌ | 仅读取 cwd | ✅ | **平台相关** | 需要绝对路径但不想跟随链接 |
+| `canonicalize_with` | ✅ | ✅ | ✅ | ✅ | 需要真实物理路径 |
 
 （见 [expansions.rs:L55-L82](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/expansions.rs#L55-L82)）
+
+**`absolute_with` 的点号处理是跨平台行为差异的关键**。函数的文档注释明确标注了这一点（[expansions.rs:L65-L68](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/expansions.rs#L65-L68)）：
+
+> On Unix systems, .. components are a kind of link so these aren't resolved.
+> On Windows .. components are resoloved.
+
+原因在于 `absolute_with` 内部调用的是 `std::path::absolute` 而不是 `expand_dots`：
+
+```rust
+pub fn absolute_with<P, Q>(path: P, relative_to: Q) -> io::Result<PathBuf>
+where
+    P: AsRef<Path>,
+    Q: AsRef<Path>,
+{
+    let path = join_path_relative(path, relative_to, true);
+    let path = expand_tilde(path);
+    let path = expand_ndots(path);   // 只展开三个或更多点号
+    absolute(path)                   // 由 std::path::absolute 负责，其行为跨平台不同
+}
+```
+
+（见 [expansions.rs:L73-L82](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/expansions.rs#L73-L82)）
+
+**跨平台差异对比**：以 `/foo/link/../bar`（假设 `link` 是指向 `/other` 的 symlink）为例：
+
+| 平台 | `std::path::absolute` 行为 | 结果 | 原因 |
+|------|---------------------------|------|------|
+| **Unix** | 保留 `..` | `/foo/link/../bar` | Unix 上 `..` 被视为一种"链接"，必须解析 symlink 后才能知道父目录。词法消除可能导致错误——`link/..` 实际应指向 `/other/..` = `/`，而非 `/foo` |
+| **Windows** | 词法消除 `..` | `/foo/bar` | Windows 上不把 `..` 视为链接符号，直接按词法消除 |
+
+**注意：Unix 上 `std::path::absolute` 的行为并非 Nushell 决定，而是 Rust 标准库的设计。** 它不做任何词法 `..` 消除，以避免在 symlink 存在时给出错误结果。
+
+**与 `expand_path_with` 的对比**：
+- `expand_path_with` → 调 `expand_dots()` → 所有平台都词法消 `..`
+- `absolute_with` → 调 `std::path::absolute()` → 保留 `..`（Unix）/ 消除 `..`（Windows）
+- `canonicalize_with` → 调 `std::fs::canonicalize()` → 内核先解析 symlink 再处理 `..`，所有平台都消除
+
+因此，在 Unix 上如果想在不访盘的前提下消 `..`，应该用 `expand_path_with`；如果想保留 `..` 交给内核处理，应该用 `absolute_with`。在 Windows 上两者结果没有区别。
+
+**`absolute_with` 的点号展开层次**：
+- ✅ 展开 `~`（`expand_tilde`）
+- ✅ 展开 `...`/`....` 等 ndots（`expand_ndots`）
+- ❌ **不调用** `expand_dots`，所以 `.` 和 `..` 交由 `std::path::absolute` 处理（平台相关）
 
 ### path expand 命令的实现
 
@@ -396,9 +439,9 @@ Component::ParentDir if last_component_is_normal(&result) => {
 
 **这意味着词法折叠 vs symlink 安全的关键分界线不在 `expand_dots` 内部，而在调用者选择哪条路径**：
 
-- `expand_path()` 调用 `expand_dots()`，会词法折叠 `link/..`
-- `absolute_with()` 调用 `expand_tilde` + `expand_ndots` + `std::path::absolute`，**不调用** `expand_dots`，所以 `..` 保留原样
-- `canonicalize_with()` 最终走 `std::fs::canonicalize()`，由内核解析 symlink 后再处理 `..`
+- `expand_path()` 调用 `expand_dots()`，**所有平台**都会词法折叠 `link/..`
+- `absolute_with()` 调用 `expand_tilde` + `expand_ndots` + `std::path::absolute`，**不调用** `expand_dots`，所以 `..` 的处理**跨平台不同**：Unix 保留 `..`，Windows 消除 `..`
+- `canonicalize_with()` 最终走 `std::fs::canonicalize()`，**所有平台**都由内核解析 symlink 后再处理 `..`
 
 ### AbsolutePath 的 canonicalize 方法
 
