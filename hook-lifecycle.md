@@ -335,30 +335,93 @@ pub fn get_env_var(engine_state, name) {
 }
 ```
 
-**关键结论**：`is_env_hidden_in_overlay` 返回 `true` 时，即使 `engine_state` 基线里有这个变量，`get_env_var` 也返回 `None`。
+**关键结论**：只有当 `is_env_hidden_in_overlay` 返回 `true`（即基线被显式标记为隐藏）时，即使 `engine_state` 基线里有这个变量，`get_env_var` 才返回 `None`。如果只是栈上的值被删除，但基线隐藏标记没有设置，`get_env_var` 会回退到基线值。
 
-#### hide_env_var vs remove_env_var 的区别
+#### remove_env_var 的 `||` 短路删除
 
-| 操作 | 栈上的值 | 基线查找时的 env_hidden 标记 | `get_env_var` 返回 | 典型用途 |
-|------|----------|:--------------------------:|--------------------|----------|
-| `remove_env_var`（`crates/nu-protocol/src/engine/stack.rs` L591-L596） | 从栈上删除所有层级的值 | 若基线有值则**标记为隐藏** | `None`（若基线也被隐藏） | 临时清理（如 canary 变量） |
-| `hide_env_var`（`crates/nu-protocol/src/engine/stack.rs` L684-L707） | 从栈上删除所有层级的值 | **无论如何都标记为隐藏**，并记录 hide_history | `None` | `hide-env` 命令 / `redirect_env` |
+`crates/nu-protocol/src/engine/stack.rs` L591-L596：
 
-两者的关键区别：
-- `remove_env_var`：如果栈上找到了并删除了值，**不**标记 `env_hidden`（除非栈上已经没有任何 shadow 了，才会标记基线隐藏）
-- `hide_env_var`：一定会标记 `env_hidden`，并写入 `env_hide_history` 防止重复 hide 报错
+```rust
+pub fn remove_env_var(&mut self, engine_state: &EngineState, name: &str) -> bool {
+    let env_name = EnvName::from(name);
 
-#### 实际场景对 env_change 的影响
+    // ⚠️ Rust 的 || 是短路的：左边为 true 时右边不会执行
+    self.remove_env_var_from_stack(&env_name)
+        || self.hide_engine_state_env_var(engine_state, &env_name)
+}
+```
 
-假设用户配置了 `env_change.FOO` 钩子，初始状态 `previous_env_vars["FOO"] = Some("bar")`：
+这意味着存在两条完全不同的执行路径：
 
-| 场景 | stack.get_env_var("FOO") | before（缓存） | after（栈上） | 是否触发 |
-|------|:------------------------:|:--------------:|:-------------:|:--------:|
-| 正常不变 | `Some("bar")` | `Some("bar")` | `Some("bar")` | ❌ |
-| `$env.FOO = "baz"` | `Some("baz")` | `Some("bar")` | `Some("baz")` | ✅ |
-| `hide-env FOO` | `None` | `Some("bar")` | `None` | ✅，`$after` = null |
-| 先 `hide-env FOO` 再 `$env.FOO = "new"` | `Some("new")` | `Some("bar")`（假设上次没触发） | `Some("new")` | ✅ |
-| 钩子中 hide-env 但报错，缓存未更新 | `None`（下次循环） | `Some("bar")`（未更新） | `None` | ✅，再次触发 |
+**路径 A（栈上有值 → `||` 短路）**：
+1. `remove_env_var_from_stack` 返回 `true`（栈上找到了并删除）
+2. `||` 短路，`hide_engine_state_env_var` **不执行**
+3. `env_hidden` 标记**不会被设置**
+4. `get_env_var` 结果：栈上找不到，但 `is_env_hidden_in_overlay` 为 false → 从基线查到 → **返回 `Some(基线值)`**
+
+**路径 B（栈上无值 → 执行 `hide_engine_state_env_var`）**：
+1. `remove_env_var_from_stack` 返回 `false`（栈上根本没有）
+2. 执行 `hide_engine_state_env_var`：若基线有值，在 `env_hidden` 中标记
+3. `get_env_var` 结果：栈上找不到 + 基线被标记隐藏 → **返回 `None`**
+
+这就是注释「Use this for temporary bookkeeping removals (e.g. `FILE_PWD`, canary variables)」的语义：对于栈上临时设置的金丝雀变量，`remove_env_var` 只删除栈上的值，不会影响基线的可见性。
+
+#### hide_env_var 的精确语义
+
+`crates/nu-protocol/src/engine/stack.rs` L684-L707：
+
+```rust
+pub fn hide_env_var(&mut self, engine_state: &EngineState, name: &str) -> bool {
+    if self.is_env_var_hide_recorded(&env_name) { return false; }
+
+    if self.remove_env_var_from_stack(&env_name) {
+        self.record_env_var_hide_in_active_overlay(&env_name);
+
+        // 关键：栈上删除后，如果所有栈层都没有残留 shadow，才标记基线隐藏
+        if !self.has_env_var_in_stack(&env_name) {
+            self.hide_engine_state_env_var(engine_state, &env_name);
+        }
+        return true;
+    }
+
+    // 栈上没有任何值，直接尝试标记基线隐藏
+    if self.hide_engine_state_env_var(engine_state, &env_name) {
+        self.record_env_var_hide_in_active_overlay(&env_name);
+        return true;
+    }
+    false
+}
+```
+
+`hide_env_var` 比 `remove_env_var` 多出的步骤：
+1. 检查 `env_hide_history`，防止同一 scope 重复 hide 报错
+2. 无论栈上有没有值，都会调用 `record_env_var_hide_in_active_overlay` 记录隐藏历史
+3. 栈上删除后，额外检查 `has_env_var_in_stack`——只有在所有栈层都没有残留值时，才标记基线隐藏
+
+一个容易忽视的细节：如果栈上有**多层 shadow**（例如外层 scope 设了 FOO="a"，内层 scope 又设 FOO="b"），`remove_env_var_from_stack` 只删除**找到的第一个**（按 active_overlays.rev() 顺序）。如果删除后仍有残留的栈级 shadow（外层的 "a"），`has_env_var_in_stack` 返回 `true`，则基线隐藏标记**不会**被设置——因为仍然有栈级值在遮蔽基线。
+
+#### hide_env_var vs remove_env_var 对比表
+
+| 场景 | 操作 | 栈上的结果 | `env_hidden` 标记是否设置 | `get_env_var` 返回 | 对 `env_change` 钩子的影响 |
+|------|------|-----------|:--------------------------:|--------------------|---------------------------|
+| 栈上有 FOO="new"，基线有 FOO="bar" | `remove_env_var("FOO")` | 栈上的值被删除 | ❌ 不设置（`||` 短路） | `Some("bar")`（回退基线） | `after` 从 "new" 变为 "bar"，与缓存的 `before` 可能不同 → **可能触发** |
+| 栈上有 FOO="new"，基线有 FOO="bar" | `hide_env_var("FOO")` | 栈上的值被删除 | ✅ 设置（因为栈上已无其他 shadow） | `None` | `after` 从 "new" 变为 `None` → **触发**，`$after = null` |
+| 栈上有 FOO="inner" 和 FOO="outer" 两层 shadow，基线有 FOO="bar" | `hide_env_var("FOO")` | 只删除了找到的一层（"inner"），"outer" 还在 | ❌ 不设置（`has_env_var_in_stack` 仍为 true） | `Some("outer")`（残留栈值） | `after` 从 "inner" 变为 "outer" → **触发** |
+| 栈上无值，基线有 FOO="bar" | `remove_env_var("FOO")` | 无变化 | ✅ 设置 | `None` | `after` 从 "bar" 变为 `None` → **触发**，`$after = null` |
+| 栈上无值，基线有 FOO="bar" | `hide_env_var("FOO")` | 无变化 | ✅ 设置，同时记录 hide_history | `None` | `after` 从 "bar" 变为 `None` → **触发**，`$after = null` |
+| 栈上无值，基线也无值 | 两者任一 | 无变化 | ❌ | `None` | 无 |
+
+#### 实际场景对 env_change 缓存的影响
+
+假设用户配置了 `env_change.FOO` 钩子，基线 `FOO="bar"`，用户通过 `$env.FOO = "new"` 在栈上覆盖了值，且缓存 `previous_env_vars["FOO"] = Some("new")`：
+
+| 场景 | `get_env_var("FOO")` 返回 | `after`（比较时） | `before`（缓存） | 是否触发 | 触发后缓存更新为 |
+|------|:------------------------:|:-----------------:|:----------------:|:--------:|:----------------:|
+| 正常不变 | `Some("new")` | `Some("new")` | `Some("new")` | ❌ | — |
+| `hide-env FOO` | `None` | `None` | `Some("new")` | ✅ | `None` |
+| `remove_env_var("FOO")`（栈上有值时） | `Some("bar")` | `Some("bar")` | `Some("new")` | ✅ | `Some("bar")` |
+| `hide-env FOO` 执行了，钩子报错（Closure）缓存未更新，下一轮 | `None` | `None` | `Some("new")`（仍为旧值） | ✅，再次触发 | —（仍然报错，不更新） |
+| `remove_env_var("FOO")` 执行了，钩子报错（Closure）缓存未更新，下一轮 | `Some("bar")` | `Some("bar")` | `Some("new")`（仍为旧值） | ✅，再次触发 | — |
 
 ---
 
@@ -438,33 +501,35 @@ pub fn get_env_var(engine_state, name) {
 
 | 函数 | 代码位置 | 作用域 | 语义 |
 |------|----------|--------|------|
-| `redirect_env` | `crates/nu-engine/src/eval.rs` L369-L384 | Stack → Stack | 将 callee 子栈的环境变量复制回 caller 栈，支持 hide-env |
+| `redirect_env` | `crates/nu-engine/src/eval.rs` L369-L388 | Stack → Stack | 将 callee 子栈的环境变量复制回 caller 栈，支持 hide-env |
 | `merge_env` | `crates/nu-protocol/src/engine/engine_state.rs` L365-L392 | Stack → EngineState | 将 Stack 中的所有环境变量、config 变更永久写入 EngineState + 切换系统 cwd |
 
 ```rust
 // redirect_env：Stack 间同步
 pub fn redirect_env(engine_state, caller_stack, callee_stack) {
-    for var in caller_env_vars {
-        if !callee_stack.has_env_var(var) {
-            caller_stack.hide_env_var(var);  // callee 隐藏了某些变量
+    let caller_env_vars = caller_stack.get_env_var_names(engine_state);
+
+    // 步骤1：遍历 caller 中存在的所有变量名，用 callee 的 has_env_var 检查
+    // callee 中"看不到"的变量（栈上没有 + 基线被隐藏）→ 在 caller 中执行 hide_env_var
+    for var in caller_env_vars.iter() {
+        if !callee_stack.has_env_var(engine_state, var) {
+            caller_stack.hide_env_var(engine_state, var);
         }
     }
-    for (var, value) in callee_stack.get_stack_env_vars() {
-        caller_stack.add_env_var(var, value);  // callee 新增/修改了变量
-    }
-}
 
-// merge_env：Stack → EngineState 永久写入
-pub fn merge_env(&mut self, stack: &mut Stack) {
-    for scope in stack.env_vars.drain(..) {
-        // 遍历所有 overlay 层级的环境变量，写回 EngineState
+    // 步骤2：将 callee 栈级的所有环境变量（get_stack_env_vars 只返回栈上的值）复制回 caller
+    for (var, value) in callee_stack.get_stack_env_vars() {
+        caller_stack.add_env_var(var, value);  // 会自动清除隐藏标记
     }
-    std::env::set_current_dir(cwd)?;  // 同步系统工作目录
-    if let Some(config) = stack.config.take() {
-        self.config = config;  // 应用配置变更
-    }
+
+    // 步骤3：同步 config 更新
+    caller_stack.config.clone_from(&callee_stack.config);
 }
 ```
+
+**关键纠正**：`redirect_env` 的步骤1 **不使用 `get_hidden_env_vars`**，而是用 `has_env_var` 检查 callee 是否能看到每个 caller 的变量。只要 `callee_stack.has_env_var` 返回 `false`，就说明 callee 执行了 `hide-env` 或栈上删除且基线隐藏，于是在 caller 中也执行 `hide_env_var`。
+
+另一个重要区别：`get_stack_env_vars()` 只返回**栈上存在的**环境变量，不包括 engine_state 基线值。这意味着 callee 中如果只是看到了基线值但没有在栈上重新赋值，不会触发 caller 侧的复制——caller 本来就有这个基线值。
 
 ### 5.4 Record 条件钩子的特殊环境
 
@@ -683,37 +748,46 @@ eval_block_with_early_return(engine_state, &mut callee_stack, ...)
 
 ### 7.4 redirect_env 中的双向同步语义
 
-`redirect_env`（`crates/nu-engine/src/eval.rs` L369-L384）在 Closure 成功执行后被调用，它做了两件事：
+`redirect_env`（`crates/nu-engine/src/eval.rs` L369-L388）在 Closure 成功执行后被调用，它做了三件事：
 
 ```rust
 pub fn redirect_env(engine_state, caller_stack, callee_stack) {
-    // 步骤1：隐藏 caller 有但 callee 没有的环境变量
-    // （即 callee 中执行了 hide-env 的那些变量）
-    for active_overlay in caller_stack.active_overlays.iter() {
-        if let Some(hidden_env_vars) = caller_stack
-            .get_hidden_env_vars(active_overlay, callee_stack, engine_state)
-        {
-            for env in hidden_env_vars {
-                caller_stack.hide_env_var(engine_state, &env);  // ← 调用 hide_env_var
-            }
+    let caller_env_vars = caller_stack.get_env_var_names(engine_state);
+
+    // 步骤1：找出 caller 能看到但 callee 看不到的变量，在 caller 中 hide
+    for var in caller_env_vars.iter() {
+        // has_env_var 的语义：栈上有值 OR（基线有值 AND 未被标记为 env_hidden）
+        if !callee_stack.has_env_var(engine_state, var) {
+            caller_stack.hide_env_var(engine_state, var);
         }
     }
+
     // 步骤2：将 callee 栈级的所有环境变量复制回 caller
+    // 注意：get_stack_env_vars 只返回栈上的值，不包括 engine_state 基线
     for (env, value) in callee_stack.get_stack_env_vars() {
-        caller_stack.add_env_var(env, value);  // ← 调用 add_env_var
+        caller_stack.add_env_var(env, value);
     }
+
+    // 步骤3：同步 config 更新
+    caller_stack.config.clone_from(&callee_stack.config);
 }
 ```
 
-注意：`get_hidden_env_vars` 的语义是「找出在 caller 中可见但在 callee 中被隐藏/缺失的变量」。这通过对比 caller 和 callee 的 `has_env_var` 来实现。
+**关键纠正**：步骤1 **不使用 `get_hidden_env_vars`**（Stack 上的另一个方法，语义完全不同：获取排除某个 overlay 后 caller 自身标记为隐藏的变量）。实际逻辑是：遍历 caller 中所有可见的变量名，用 `callee_stack.has_env_var()` 逐个检查 callee 是否还能看到。如果 callee 看不到（说明 callee 中执行了 `hide-env`，或者 callee 的栈上没有值同时 callee 的基线被标记隐藏），则在 caller 中也执行 `hide_env_var`。
+
+`has_env_var` 的查找链与 `get_env_var` 完全一致（`crates/nu-protocol/src/engine/stack.rs` L559-L582），只是不返回 Value。这意味着：
+- callee 栈上有值 → `true`
+- callee 栈上无值 + 基线有值 + 基线未隐藏 → `true`
+- callee 栈上无值 + 基线隐藏或不存在 → `false`
 
 #### add_env_var 的一个副作用
 
-`crates/nu-protocol/src/engine/stack.rs` L273-L296：
+`crates/nu-protocol/src/engine/stack.rs` L273-L307：
 
 ```rust
 pub fn add_env_var(&mut self, var: String, value: Value) {
     let env_name = EnvName::from(var);
+    // 关键：在赋值之前先清除隐藏标记
     self.clear_env_var_marks_in_active_overlay(&last_overlay, &env_name);
     // ...写入 env_vars...
 }
@@ -729,7 +803,21 @@ fn clear_env_var_marks_in_active_overlay(&mut self, overlay, env_name) {
 }
 ```
 
-**结论：对一个变量重新执行 `$env.VAR = value`，会自动清除之前对它执行的 `hide-env` 标记。** 这是合理的行为——如果隐藏后又显式赋值，说明需要让它重新可见。
+**结论：对一个变量重新执行 `$env.VAR = value`，会自动清除之前对它执行的 `hide-env` 标记（包括 `env_hidden` 和 `env_hide_history`）。** 这是合理的行为——如果隐藏后又显式赋值，说明需要让它重新可见。
+
+#### redirect_env 的实际效果：先隐藏再赋值
+
+由于步骤1（`hide_env_var`）在步骤2（`add_env_var`）之前执行，一个有趣的交互是：
+
+如果 callee 中先 `hide-env FOO` 再 `$env.FOO = "new"`：
+1. 步骤1：callee 的 `has_env_var("FOO")` 返回 `true`（因为栈上有 "new"）→ **不会**在 caller 上执行 hide
+2. 步骤2：将 "new" 复制到 caller，同时清除 caller 上 FOO 的任何隐藏标记
+3. 结果：caller 上 `FOO = "new"`，完全可见
+
+如果 callee 中只 `hide-env FOO`，不再赋值：
+1. 步骤1：callee 的 `has_env_var("FOO")` 返回 `false`（栈上无值 + 基线被隐藏）→ 在 caller 上执行 `hide_env_var`
+2. 步骤2：callee 栈上没有 FOO，不复制
+3. 结果：caller 上 FOO 也被隐藏
 
 ### 7.5 Record 钩子的两阶段控制流
 
