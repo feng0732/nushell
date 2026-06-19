@@ -115,7 +115,7 @@ bob
 3. **编译函数体 Block**：
 
 ```rust
-// 第 494-496 行
+// [parse_def.rs#L491-L496](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_def.rs#L491-L496)
 Some(Expression { expr: Expr::Closure(block_id), .. }) => {
     compile_block_with_id(working_set, *block_id);    // AST → IR
     *working_set.get_block_mut(*block_id).signature = sig.clone();
@@ -125,7 +125,7 @@ Some(Expression { expr: Expr::Closure(block_id), .. }) => {
 4. **将 Block 包装为 Custom Command**：
 
 ```rust
-// 第 613-615 行
+// [parse_def.rs#L613-L615](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_def.rs#L613-L615)
 *declaration = signature
     .clone()
     .into_block_command(block_id, attribute_vals, examples);
@@ -136,7 +136,7 @@ Some(Expression { expr: Expr::Closure(block_id), .. }) => {
 5. **设置 redirect_env**：
 
 ```rust
-// 第 619 行
+// [parse_def.rs#L619](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_def.rs#L619)
 block.redirect_env = has_env;  // def --env 才为 true
 ```
 
@@ -150,13 +150,13 @@ block.redirect_env = has_env;  // def --env 才为 true
 
 #### 2.4.1 算法流程
 
-`discover_captures_in_closure` 函数（第 47-81 行）：
+`discover_captures_in_closure` 函数（[parse_captures_compile.rs#L47-L81](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L47-L81)）：
 
 1. 先把 Block 自身签名中定义的所有参数变量加入 `seen` 列表（"已在本作用域定义"）
 2. 遍历 Block 的所有 Pipeline
 3. 递归进入每个 Expression
 
-`discover_captures_in_expr` 函数（第 154-448 行）处理各种表达式类型：
+`discover_captures_in_expr` 函数（[parse_captures_compile.rs#L154-L449](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L154-L449)）处理各种表达式类型：
 
 | 表达式类型 | 处理方式 |
 |-----------|---------|
@@ -174,7 +174,7 @@ block.redirect_env = has_env;  // def --env 才为 true
 这是容易被忽略的关键点。当函数体内调用另一个自定义命令时：
 
 ```rust
-// 第 229-280 行
+// [parse_captures_compile.rs#L229-L280](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L229-L280)
 Expr::Call(call) => {
     let decl = working_set.get_decl(call.decl_id);
     if let Some(block_id) = decl.block_id() {
@@ -191,7 +191,7 @@ Expr::Call(call) => {
 分析完成后，将捕获列表写入每个 Block：
 
 ```rust
-// 第 596-618 行
+// [parse_captures_compile.rs#L596-L618](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L596-L618)
 for (block_id, captures) in seen_blocks.into_iter() {
     if !captures.is_empty()
         && block_captures_empty
@@ -203,12 +203,12 @@ for (block_id, captures) in seen_blocks.into_iter() {
 }
 ```
 
-注意条件 `block_id.get() >= working_set.permanent_state.num_blocks()`：这是为了**防止递归定义场景下修改已经固化的 Block**（第 605-611 行注释中有详细说明）。
+注意条件 `block_id.get() >= working_set.permanent_state.num_blocks()`：这是为了**防止递归定义场景下修改已经固化的 Block**（[parse_captures_compile.rs#L603-L611](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L603-L611) 注释中有详细说明）。
 
 #### 2.4.4 可变变量捕获限制
 
 ```rust
-// 第 186-192 行
+// [parse_captures_compile.rs#L186-L192](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L186-L192)
 for (var_id, span) in results.iter() {
     if !seen.contains(var_id)
         && let Some(variable) = working_set.get_variable_if_possible(*var_id)
@@ -275,7 +275,7 @@ pub fn captures_to_stack_preserve_out_dest(&self, captures: Vec<(VarId, Value)>)
 
 `ClosureEval`（可多次调用）和 `ClosureEvalOnce`（单次调用）是外部命令（如 `each`, `filter`, `map`）调用闭包的标准接口。
 
-以 `ClosureEvalOnce::new` 为例（第 209-224 行）：
+以 `ClosureEvalOnce::new` 为例（[closure_eval.rs#L209-L224](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/closure_eval.rs#L209-L224)）：
 
 ```rust
 pub fn new(engine_state: &'a EngineState, stack: &Stack, closure: Closure) -> Self {
@@ -286,7 +286,7 @@ pub fn new(engine_state: &'a EngineState, stack: &Stack, closure: Closure) -> Se
 }
 ```
 
-添加参数（第 280-284 行）：
+添加参数（[closure_eval.rs#L280-L284](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/closure_eval.rs#L280-L284)）：
 ```rust
 pub fn add_arg(mut self, value: Value) -> Result<Self, ShellError> {
     self.call_eval.add_positional(&self.block.signature, Cow::Owned(value))?;
@@ -294,7 +294,7 @@ pub fn add_arg(mut self, value: Value) -> Result<Self, ShellError> {
 }
 ```
 
-最终执行（第 298-304 行）：
+最终执行（[closure_eval.rs#L298-L304](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/closure_eval.rs#L298-L304)）：
 ```rust
 pub fn run_with_input(mut self, input: PipelineData) -> Result<PipelineData, ShellError> {
     self.call_eval.run(self.engine_state, self.block, input)
@@ -307,7 +307,7 @@ pub fn run_with_input(mut self, input: PipelineData) -> Result<PipelineData, She
 
 实现位置：[eval.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/eval.rs#L29-L289)
 
-`finalize_arguments` 方法（第 221-288 行）处理：
+`finalize_arguments` 方法（[eval.rs#L221-L288](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/eval.rs#L221-L288)）处理：
 - 必填位置参数缺失报错
 - 可选参数默认值填充
 - rest 参数列表组装
@@ -445,6 +445,7 @@ IR 路径与 AST 路径的主要区别：参数不是通过重新求值表达式
 | [eval_ir.rs:53-63](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/eval_ir.rs#L53-L63) | IR 路径 eval_ir_block 入口处 |
 
 ```rust
+// [eval.rs#L314-L322](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-engine/src/eval.rs#L314-L322)
 let maximum_call_stack_depth: u64 = engine_state.config.recursion_limit as u64;
 callee_stack.recursion_count += 1;
 if callee_stack.recursion_count > maximum_call_stack_depth {
@@ -522,7 +523,7 @@ is_even 4
 在捕获写回阶段有一个关键判断：
 
 ```rust
-// 第 612-618 行
+// [parse_captures_compile.rs#L612-L618](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/crates/nu-parser/src/parse_captures_compile.rs#L612-L618)
 if !captures.is_empty()
     && block_captures_empty
     && block_id.get() >= working_set.permanent_state.num_blocks()  // 只修改本次 delta 中的 Block
@@ -558,7 +559,7 @@ def bar [] { let $x = 10; foo }
 bar  # 错误：Variable not found
 ```
 
-原因：`foo` 在解析时 captures 为空（它的体中没有引用外部变量），调用时 `gather_captures` 不会从 caller_stack 复制任何变量。`$x` 对 `foo` 不可见。
+原因：`foo` 定义在顶层作用域，函数体中引用的 `$x` 在定义时没有对应的外部变量存在，因此 `$x` 被解析为一个与 `bar` 内部 `let $x = 10` 的 VarId 不同的标识符。虽然 `$x` 被加入了 foo 的 captures 列表，但调用时 `gather_captures` 在 caller_stack 中按 VarId 查找，找不到匹配的值（两者的 VarId 不同）。`$x` 对 `foo` 不可见——这就是**词法作用域**的核心：捕获取决于变量定义的位置，而非调用时的栈状态。
 
 测试：[no_scope_leak2](file:///d:/fz/0601-2/solo-dogfeeding/code/67-nushell/tests/repl/test_custom_commands.rs#L14-L20)
 
