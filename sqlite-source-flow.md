@@ -547,6 +547,10 @@ if let Ok(row_value) = row_result {
 
 ## 懒查询构建器与 SQL 下推优化
 
+本节通过代码实证分析 `SQLiteQueryBuilder` 上各类管道操作的**下推判定矩阵**：哪些操作真正被下推为 SQL，哪些先物化（全量加载）再在内存中处理，哪些能力在结构中预留但尚未实际接通。
+
+---
+
 ### `SQLiteQueryBuilder` 结构
 
 **定义位置**：`database/values/sqlite.rs` `SQLiteQueryBuilder` 结构体
@@ -565,9 +569,354 @@ pub struct SQLiteQueryBuilder {
 }
 ```
 
-### 核心特性
+注意：`sql_where` 字段和 `sql_params` 字段在结构体上是存在的，且 `with_where()` 方法完整可用（单元测试有调用），但**没有任何 Nu 命令实际调用它们**。
 
-#### 1. 链式构建 API
+---
+
+### 管道操作下推判定总表
+
+下表汇总了所有与 `SQLiteQueryBuilder` 相关的 Nu 命令的下推行为：
+
+| 操作命令 | 是否特殊处理 | 下推到 SQL 的部分 | 物化策略 | 处理文件 |
+|----------|------------|-------------------|---------|---------|
+| `first N` / `first` | ✅ 特殊分支 | `LIMIT N` | 不下推部分无 | `filters/first.rs` |
+| `last N` / `last` | ✅ 特殊分支 | `ORDER BY rowid DESC LIMIT N` + 客户端反序 | 结果在内存中反序 | `filters/last.rs` |
+| `length` | ✅ 特殊分支 | `SELECT COUNT(*) ...` | 不下推，直接返回数 | `filters/length.rs` |
+| `select col1 col2` | ✅ 条件下推 | `SELECT <投影重写>` | 仅单段 string path | `filters/select.rs` |
+| `select 0 1 2`（行索引） | ❌ 无 | — | `NthIterator` 物化后按行号取 | `filters/select.rs` |
+| `where <条件>` | ❌ 无 | — | 完整物化后内存 filter | `filters/where_.rs` |
+| `each { ... }` | ❌ 仅 iterable | — | `into_iter()` 完整物化后遍历 | `filters/each.rs` |
+| `columns` | ❌ 仅 CustomValue 通用路径 | — | `to_base_value()` 完整物化后取列名 | `filters/columns.rs` |
+| `skip` / `take` | ❌ 无 | — | 完全物化后内存操作 | — |
+| `sort-by` | ❌ 无 | — | 完全物化后内存排序 | — |
+| `$it[0]`（follow_path_int） | ❌ 默认实现 | — | 完整物化后取第 N 行 | `sqlite.rs` CustomValue |
+| `$it.name`（follow_path_string） | ❌ 默认实现 | — | 完整物化后取列 | `sqlite.rs` CustomValue |
+
+---
+
+### 各操作详细分析
+
+#### ✅ 操作 1：`first` — LIMIT 下推
+
+**代码位置**：`filters/first.rs` `first_helper` 函数 `PipelineData::Value` 分支
+
+```rust
+Value::Custom { val: custom_val, .. } => {
+    if let Some(table) = custom_val.as_any().downcast_ref::<SQLiteQueryBuilder>() {
+        if return_single_element {
+            let new_table = table.clone().with_limit(1);
+            let result = new_table.execute(head)?;  // 立即执行
+            // 再从结果中取第一个值
+        } else {
+            let new_table = table.clone().with_limit(rows as i64);
+            new_table.execute(head)  // 立即执行
+        }
+    }
+}
+```
+
+**下推行为**：
+- 无论 `first` 还是 `first N`，都先通过 `with_limit()` 在构建器上设置 `LIMIT`，然后**立即**调用 `execute()` 执行。
+- 对于无参数 `first`（取单行），执行后还要在内存中取 `List` 的第一个元素。
+
+**下推 SQL 示例**（`history | first 5`）：
+```sql
+SELECT start_timestamp, command_line as command, cwd, duration_ms as duration, exit_status
+FROM [history]
+ORDER BY rowid ASC
+LIMIT 5
+```
+
+---
+
+#### ✅ 操作 2：`last` — ORDER BY rowid DESC + LIMIT 下推
+
+**代码位置**：`filters/last.rs` `run` 函数 `PipelineData::Value` 分支
+
+```rust
+Value::Custom { val: custom_val, .. } => {
+    if let Some(table) = custom_val.as_any().downcast_ref::<SQLiteQueryBuilder>() {
+        if return_single_element {
+            let new_table = table
+                .clone()
+                .with_order_by("rowid DESC".to_string())
+                .with_limit(1);
+            // 立即执行，再取首个
+        } else {
+            let new_table = table
+                .clone()
+                .with_order_by("rowid DESC".to_string())
+                .with_limit(rows as i64);
+            let result = new_table.execute(head)?;
+            // 结果 vals.reverse() 还原顺序
+        }
+    }
+}
+```
+
+**下推行为**：
+- 核心技巧：原查询有 `ORDER BY rowid ASC`（history 默认），要取最后 N 行，将 ORDER BY 反转为 `rowid DESC` 加 `LIMIT N`。
+- **副作用**：原 `sql_order_by`（如 history 里的 `rowid ASC`）被覆盖。如果用户通过 `sort-by` 等方式指定过排序，`last` 的结果可能不符合预期。
+- 多行模式下，SQLite 返回的是反序结果，代码中调用 `vals.reverse()` 在内存中还原原顺序。
+
+**下推 SQL 示例**（`history | last 3`）：
+```sql
+SELECT ... FROM [history] ORDER BY rowid DESC LIMIT 3
+-- 返回的 3 行在客户端 reverse()
+```
+
+**注意**：`last N` 的多行模式下，若已有 `sql_limit`，两者取"最严"（覆盖原 ORDER BY + 新 LIMIT）。`first` 与 `last` 串联会导致 ORDER BY 被后者覆盖。
+
+---
+
+#### ✅ 操作 3：`length` — COUNT(*) 下推
+
+**代码位置**：`filters/length.rs` `length_row` 函数
+
+```rust
+if let PipelineData::Value(Value::Custom { val, .. }, ..) = &input
+    && let Some(table) = val.as_any().downcast_ref::<SQLiteQueryBuilder>()
+{
+    let count = table.count(call.head)?;  // SELECT COUNT(*)
+    return Ok(Value::int(count, call.head).into_pipeline_data());
+}
+```
+
+`count()` 方法实现：
+
+```rust
+pub fn count(&self, call_span: Span) -> Result<i64, ShellError> {
+    let mut sql = format!("SELECT COUNT(*) FROM [{}]", self.table_name);
+    if let Some(where_clause) = &self.sql_where {
+        write!(sql, " WHERE {}", where_clause).ok();
+    }
+    let params: Vec<Box<dyn ToSql>> = self
+        .sql_params
+        .iter()
+        .map(|s| Box::new(s.clone()) as Box<dyn ToSql>)
+        .collect();
+    stmt.query_row(rusqlite::params_from_iter(params), |row| row.get(0))
+}
+```
+
+**下推行为**：
+- **不关心** `sql_select`（投影）和 `sql_limit`（不会取 TOP N 计数），直接对全表计数。
+- **保留** `sql_where` — 如果有 WHERE 子句，会正确附加到 COUNT 语句中。
+- **已知限制**：`sql_params` 被强制转为 `String`，原始类型信息丢失（见「参数绑定限制」章节）。
+
+---
+
+#### ✅⚠️ 操作 4：`select`（列选择）— 条件下推 + 别名保持
+
+**代码位置**：`filters/select.rs` `select` 函数
+
+有 **两个路径**，根据参数类型决定：
+
+**路径 A（行索引 select 0 1 2）— 完全物化**
+
+```rust
+// 如果 columns 中含 PathMember::Int（行索引）
+let pipeline_iter: PipelineIterator = input.into_iter();  // 触发物化
+NthIterator { input: pipeline_iter, rows: unique_rows.into_iter().peekable(), current: 0 }
+```
+
+- 此分支运行在 SQLite 特判之前，会把输入转为通用 `PipelineIterator`。
+- 对于 `SQLiteQueryBuilder`，`into_iter()` 会**先触发完整查询执行**（调用 `to_base_value`），再按行号取。
+- 没有 LIMIT 下推，即使是 `select 0 1 2`（等价于 `first 3`）也会全表扫描后再取前 3 行。
+
+**路径 B（列名 select col1 col2）— 条件下推**
+
+```rust
+if let PipelineData::Value(Value::Custom { val, .. }, ..) = &input
+    && let Some(table) = val.as_any().downcast_ref::<SQLiteQueryBuilder>()
+{
+    let select_columns: Option<Vec<String>> = columns.iter().map(|column| {
+        match column.members.as_slice() {
+            [PathMember::String { val, .. }] => Some(val.clone()),
+            _ => None,  // 多段 path、嵌套访问 → 不下推
+        }
+    }).collect();
+
+    if let Some(select_columns) = select_columns.filter(|s| !s.is_empty())
+        && let Some(new_table) = table.project_output_columns(&select_columns)
+    {
+        return Ok(Value::custom(Box::new(new_table), call_span).into_pipeline_data());
+        // 不立即执行，返回新的构建器（可继续链式下推）
+    }
+}
+```
+
+**下推规则**：
+
+| `select` 参数 | 能否下推 | 原因 |
+|---------------|---------|------|
+| `select command` | ✅ | 单段 String PathMember |
+| `select command duration` | ✅ | 多个单段 |
+| `select $it.command` | ❌ | 路径中含 `$it`，不是纯单段 String |
+| `select 0` | ❌ | Int → 走 NthIterator 物化 |
+| `select command.sub` | ❌ | 多段嵌套 path |
+| `select --ignore-case COMMAND` | ❌ | case insensitive 标志，需在列名比对时生效，但下推路径中不处理标志 |
+| `select -o nonexistent` | ❌ | optional 标志，同样不处理 |
+| `select a -o a`（重复列）| ✅（会被 dedup） | `new_columns.push()` 前有 `!new_columns.contains()` |
+
+**投影重写逻辑**（`project_output_columns`）：
+
+- 输入构建器已有 `SELECT command_line AS command, duration_ms AS duration`
+- 用户请求 `select command`
+- 解析器先把当前投影拆成 `[(command, command_line AS command), (duration, duration_ms AS duration)]`
+- 匹配 `command` 后输出新的 `SELECT command_line AS command`
+- 匹配失败时返回 `None`，**回退到物化路径**（见 match 后 `input_vals` 分支）
+
+---
+
+#### ❌ 操作 5：`where` — **完全不做下推，全量物化**
+
+这是最关键的判定结论。
+
+**代码位置**：`filters/where_.rs` `run` 函数
+
+```rust
+fn run(...) -> Result<PipelineData, ShellError> {
+    let closure: Closure = call.req(engine_state, stack, 0)?;
+    let mut closure = ClosureEval::new(engine_state, stack, closure);
+    let metadata = input.take_metadata();
+    Ok(input
+        .into_iter_strict(head)?       // ⚠ 这里强制把输入转成严格迭代器
+        .filter_map(move |value| {
+            // 用 Nu closure 过滤每一行
+            match closure.run_with_value(value.clone()) { ... }
+        })
+        .into_pipeline_data_with_metadata(...)
+    )
+}
+```
+
+关键证据：
+1. `where` 的 `signature` 的 `input_output_types` 只有 List/Table/Range，**没有**声明接受 `Type::Custom("SQLiteQueryBuilder")`。
+2. `run` 中完全**没有** `#[cfg(feature = "sqlite")]` 条件分支，也**没有**任何 `.downcast_ref::<SQLiteQueryBuilder>()`。
+3. `into_iter_strict(head)` 对 `PipelineData::Value(Value::Custom {...})` 会调用 CustomValue 的 `into_closured_iterator()` / `is_iterable()` 路径，最终调用 `to_base_value()` **执行完整查询**，返回 `List` 后再迭代 filter。
+
+**结论**：`history | where command =~ "cargo"` 会：
+1. 不加任何 WHERE 条件地执行 `SELECT * FROM history ORDER BY rowid ASC`
+2. 把所有历史记录全量加载到内存
+3. 在 Nu 引擎中对每一行执行 regex 匹配
+
+对比 `query db`：用 `query db "SELECT * FROM history WHERE command LIKE '%cargo%'"` 可以利用 SQLite 的 LIKE 优化，这才是真正的服务端过滤。
+
+**预留下推接口未使用**：`SQLiteQueryBuilder` 上的 `with_where(where_clause, params)` 方法在整个 `crates/nu-command/src/filters/` 目录中 **0 次调用**，只在 `database/values/sqlite.rs` 的单元测试中出现。
+
+---
+
+#### ❌ 操作 6：`each` — iterable 通用路径
+
+**代码位置**：`filters/each.rs` `run` 函数
+
+```rust
+// Handle iterable custom values (like SQLiteQueryBuilder)
+PipelineData::Value(Value::Custom { ref val, .. }, ..) if val.is_iterable() => {
+    let out = input.into_iter()   // 触发 to_base_value → 全量物化
+        .map(move |value| { each_map(value, &mut closure, head) })
+}
+```
+
+- 判断条件仅为 `val.is_iterable()`，这对所有实现了 CustomValue 的可迭代类型都成立。
+- `SQLiteQueryBuilder::is_iterable()` 返回 `true`，会走这条路径。
+- 没有任何 SQLite 特定的下推优化，`input.into_iter()` 会执行完整查询后再逐行映射。
+
+---
+
+#### ❌ 操作 7：`columns` — 通用 CustomValue 路径
+
+**代码位置**：`filters/columns.rs` `getcol` 函数
+
+```rust
+Value::Custom { val, .. } => {
+    // TODO: should we get CustomValue to expose columns in a more efficient way?
+    let input_as_base_value = val.to_base_value(span)?;  // ⚠ 物化
+    get_columns(&[input_as_base_value])
+}
+```
+
+代码注释中已经明确承认了效率问题：必须先执行查询才能拿到列名。理论上可以通过 `PRAGMA table_info(tablename)` 直接从 SQLite 元数据中读取列名而不执行数据查询，但该优化尚未实现。
+
+---
+
+### CustomValue 默认方法的下推行为
+
+`SQLiteQueryBuilder` 作为 `CustomValue`，以下方法由 Nu 引擎在遇到对应操作时隐式调用：
+
+| CustomValue 方法 | 触发场景 | 实现方式 | 是否下推 |
+|-----------------|---------|---------|---------|
+| `to_base_value()` | 需展开为普通 Value 时（包括上述所有 ❌ 路径） | `execute()` → 完整 SQL | ❌ |
+| `follow_path_int(0)` | `$it[0]`、`$history.0` | `to_base_value()` 后按索引取 | ❌ |
+| `follow_path_string("name")` | `$it.name`、`$history.name` | `to_base_value()` 后按列名取 | ❌ |
+| `is_iterable()` | `for` 循环、`each` 等 | 返回 `true` | — |
+
+对比 `first`/`last` 等显式命令专门实现了 `downcast_ref::<SQLiteQueryBuilder>()` 的路径，CustomValue 的默认方法都缺少下推优化。
+
+---
+
+### 链式操作下推传播示例
+
+#### ✅ 可组合：`history | select command | first 5`
+
+```
+初始构建器:
+  SELECT ... FROM [history] ORDER BY rowid ASC
+                │
+                │ select command  (条件下推，不执行)
+                ▼
+  SELECT command_line AS command FROM [history] ORDER BY rowid ASC
+                │
+                │ first 5  (with_limit(5) + execute)
+                ▼
+  SELECT command_line AS command FROM [history] ORDER BY rowid ASC LIMIT 5
+                    ↓ 真正执行
+```
+
+#### ⚠ 部分可组合：`history | first 5 | select command`
+
+```
+初始构建器:
+  SELECT ... FROM [history] ORDER BY rowid ASC
+                │
+                │ first 5  (with_limit(5) + execute → 物化 Vec[Record])
+                ▼
+  前 5 行记录 (内存 List)
+                │
+                │ select command  (在 List 上处理，不是 SQLite)
+                ▼
+  5 行，仅含 command 列
+```
+
+`first` 在第 1 步就 `execute()` 并返回结果，后续 `select` 无法再下推。
+
+**结论**：**下推命令应尽量前置**，特别是 `select`（条件下推、不立即执行）应在会触发执行的 `first`/`last`/`length`/物化类命令之前。
+
+#### ❌ 完全不下推：`history | where command =~ "cargo" | first 5`
+
+```
+初始构建器:
+  SELECT ... FROM [history] ORDER BY rowid ASC
+                │
+                │ where ... (into_iter_strict → to_base_value → 全表物化)
+                ▼
+  完整历史表加载为内存 List
+                │
+                │ first 5  (在 List 上截断)
+                ▼
+  前 5 个匹配记录
+```
+
+WHERE 不被下推，这是性能陷阱：哪怕最终只取 5 行，也要加载整表。
+
+#### ✅ 手动绕过：`history | query db "SELECT command_line FROM history WHERE command_line LIKE '%cargo%' LIMIT 5"`
+
+这是唯一真正下推筛选条件的路径（通过手动写 SQL）。
+
+---
+
+### 链式构建 API（Rust API 内部使用）
 
 ```rust
 table
@@ -578,7 +927,13 @@ table
     .with_unix_millis_datetime_column("created_at".to_string())
 ```
 
-#### 2. SQL 生成
+此 API 对 Rust 内部代码完整可用，但 `with_where` 的条件部分尚未被任何 Nu 命令实际生成。
+
+---
+
+### SQL 生成与执行
+
+#### `build_sql()`
 
 **定义位置**：`database/values/sqlite.rs` `SQLiteQueryBuilder::build_sql` 方法
 
@@ -586,31 +941,52 @@ table
 pub fn build_sql(&self) -> String {
     let select = self.sql_select.as_deref().unwrap_or("*");
     let mut sql = format!("SELECT {} FROM [{}]", select, self.table_name);
-    // 追加 WHERE / ORDER BY / LIMIT
+    if let Some(where_clause) = &self.sql_where {
+        write!(sql, " WHERE {}", where_clause).ok();
+    }
+    if let Some(order_by) = &self.sql_order_by {
+        write!(sql, " ORDER BY {}", order_by).ok();
+    }
+    if let Some(limit) = &self.sql_limit {
+        write!(sql, " LIMIT {}", limit).ok();
+    }
+    sql
 }
 ```
 
-#### 3. 列投影下推
+#### `execute()` — 与参数 bug
 
-**定义位置**：`database/values/sqlite.rs` `SQLiteQueryBuilder::project_output_columns` 方法
+```rust
+pub fn execute(&self, call_span: Span) -> Result<PipelineData, ShellError> {
+    let conn = open_sqlite_db(&self.db_path, call_span)?;
+    let sql = self.build_sql();
+    let params = NuSqlParams::List(Vec::new());  // FIXME: handle params properly
+    run_sql_query(conn, &Spanned { item: sql, span: call_span }, params, ...)
+}
+```
 
-`project_output_columns` 方法支持在已有 SELECT 投影上进一步选择列，保持别名不变。
+**参数绑定 bug**：即使用户通过 `with_where("id > ?", vec!["10"])` 设置了参数，执行时也会传入**空参数列表**。`count()` 方法相反会传入 `sql_params` 但全部转成 `String`（类型丢失）。
 
-**示例**：
-- 当前投影：`command_line as command, duration_ms as duration`
-- 请求输出：`command`
-- 重写后：`command_line as command`
+#### `count()` — `SELECT COUNT(*)` 优化
 
-解析器实现了轻量级 SQL 投影解析：
-- `parse_sql_select_projection` — 解析投影列表
-- `split_select_expressions` — 按顶层逗号分割（处理引号和括号）
-- `parse_projection_expression` — 解析单个表达式（别名、限定名等）
-- `split_alias` — 识别 `AS` 关键字
+见「操作 3」分析。
 
-#### 4. 执行与计数
+---
 
-- `execute(span)` — 构建 SQL 并执行，返回 `PipelineData`
-- `count(span)` — 执行 `SELECT COUNT(*)` 优化查询
+### 列投影解析器（条件下推的基础设施）
+
+`project_output_columns` 方法依赖以下轻量级解析器链（都在 `database/values/sqlite.rs`）：
+
+| 函数 | 作用 |
+|------|------|
+| `parse_sql_select_projection(select)` | 解析 `col1, col2 AS alias, expr` 形式的投影为 `(output_name, expression)` 列表 |
+| `split_select_expressions(select)` | 顶层逗号分割器，正确处理引号和括号内的逗号 |
+| `parse_projection_expression(expr)` | 拆分单个表达式的别名，如 `col as x` → `(x, col as x)` |
+| `split_alias(expr)` | 识别 `AS` 关键字（前后空白、大小写不敏感） |
+
+仅当所有请求的列名都能在当前投影中（含别名、大小写不敏感）找到时才会下推；否则返回 `None`，调用方回退到物化路径。
+
+---
 
 ### 作为 CustomValue 的行为
 
