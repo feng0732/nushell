@@ -481,7 +481,7 @@ loop {
 
 #### HostCommand 与缓冲区处理
 
-`Signal::HostCommand` 是一种特殊的输入信号，由用户按下绑定了 `ExecuteHostCommand` 事件的键触发。它会影响下一次循环迭代的缓冲区处理：
+`Signal::HostCommand` 是一种特殊的输入信号，由用户按下绑定了 `ExecuteHostCommand` 事件的键触发。它通过 `is_hostcommand` 标志影响下一次循环迭代的 flush #2：
 
 ```rust
 // 读取输入后
@@ -494,30 +494,38 @@ match input {
 }
 ```
 
-在下一次循环迭代中：
+在 run_command 内部，Success 和 HostCommand 共享相同的执行流程，包括末尾的 **flush #1**（将 commandline 修改同步回 line_editor 并清空 ReplState）。
+
+在下一次循环迭代的 flush #2：
 
 ```rust
-// 预填缓冲区前检查 is_hostcommand 标志
+// read_line 前检查 is_hostcommand 标志
 if !*is_hostcommand {
     line_editor = flush_engine_state_repl_buffer(engine_state, line_editor);
 }
 *is_hostcommand = false;  // 重置标志
 ```
 
-**为什么 HostCommand 后要跳过缓冲区预填？**
+**为什么 HostCommand 后要跳过 flush #2？**
 
 根据代码注释（`crates/nu-cli/src/repl.rs`）：
 
 > If we don't flush the engine state, then the pre_prompt and env_change hooks cannot modify the commandline. But if we always flush the engine state, then the modification to the commandline done in ExecuteHostCommand will be overridden.
 
-原因分析：
-1. **reedline 缓冲区是有状态的**：reedline 实例跨循环迭代复用，其内部缓冲区在 `read_line` 返回后仍然保留着用户输入的内容
-2. **正常情况需要清空**：普通命令（Success 信号）执行后，下一次迭代应该从空行开始，因此需要 `flush_engine_state_repl_buffer` 来清空缓冲区（此时 `repl.buffer` 为空）
-3. **HostCommand 语义特殊**：HostCommand 通常用于在不提交当前行的情况下执行辅助操作（如打开外部选择器、修改当前行内容等）。执行后用户应该继续在当前行上编辑，而不是开始新的一行
-4. **flush 会覆盖内容**：如果 HostCommand 执行后调用 flush，会用 `engine_state.repl_state.buffer`（可能是空的）覆盖 reedline 内部缓冲区，导致用户之前输入的内容丢失
-5. **pre_prompt 钩子的冲突**：pre_prompt / env_change 钩子可能修改 `repl_state.buffer`，这些修改通过 flush 生效。但在 HostCommand 场景下，这些钩子的修改可能与 HostCommand 对缓冲区的修改产生冲突
+结合实际代码时序，原因分析：
 
-因此，`is_hostcommand` 标志作为一种保护机制，确保 HostCommand 执行后 reedline 的缓冲区状态被完整保留到下一次编辑会话中。
+1. **flush #1 已清空 ReplState**：run_command 末尾的 flush #1 执行后，`ReplState.buffer=""`, `cursor_pos=0`, `accept=false`。如果 HostCommand 后继续执行 flush #2，会：
+   - `EditCommand::Clear` → 清空 reedline 内部缓冲区
+   - `EditCommand::InsertString("")` → 插入空字符串
+   - `EditCommand::MoveToPosition { position: 0 }` → 光标移到开头
+
+2. **flush #1 已同步 commandline 修改**：HostCommand 中通过 commandline 写入 ReplState 的内容，已经在 flush #1 中正确同步到了 reedline 编辑器。flush #2 会用空 ReplState 覆盖这些内容。
+
+3. **reedline 缓冲区是有状态的**：reedline 实例跨循环迭代复用，其内部缓冲区在 read_line 返回后保留着用户正在编辑的内容。HostCommand 的语义是「在当前行上执行辅助操作」，执行后用户应继续在同一条输入行上编辑。
+
+4. **pre_prompt 钩子的冲突风险**：pre_prompt / env_change 钩子可能修改 ReplState.buffer，这些修改在非 HostCommand 场景下通过 flush #2 生效。但在 HostCommand 场景下，这些修改可能与 reedline 中已有的用户编辑内容产生冲突。
+
+因此，`is_hostcommand` 标志作为一种保护机制，确保 HostCommand 执行后 reedline 的缓冲区状态不被 ReplState 中的空值覆盖。
 
 #### 命令执行
 
@@ -529,10 +537,13 @@ fn run_command(ctx: RunContext) -> Reedline
 
 执行流程：
 1. 准备历史记录元数据
-2. 触发 pre_execution 钩子
-3. 解析并执行命令（parse_operation -> do_run_cmd）
-4. 更新历史记录结果元数据
-5. 运行 shell integration ANSI 序列
+2. 将 command 写入 ReplState.buffer（供 pre_execution 钩子读取）
+3. 触发 pre_execution 钩子（可调用 commandline 修改 ReplState）
+4. 保存 line_editor 当前 buffer 和光标到 ReplState（供 commandline 读取真实编辑内容）
+5. 解析并执行命令（parse_operation -> do_run_cmd）
+6. 更新历史记录结果元数据
+7. 运行 shell integration ANSI 序列
+8. **flush #1**：将 ReplState 同步回 line_editor（commandline 修改 → 编辑器）
 
 ### 4.2 input 命令输入循环
 
@@ -615,7 +626,7 @@ let file_history = match history_file_val {
 
 ### 6.1 REPL 缓冲区恢复
 
-REPL 使用 `ReplState` 机制在循环迭代间传递缓冲区内容，通过 `flush_engine_state_repl_buffer` 函数（`crates/nu-cli/src/repl.rs`）预填：
+REPL 使用 `ReplState` 机制在循环迭代间传递缓冲区内容。`flush_engine_state_repl_buffer` 函数（`crates/nu-cli/src/repl.rs`）负责将 ReplState 的内容同步到 reedline 编辑器：
 
 ```rust
 fn flush_engine_state_repl_buffer(
@@ -651,12 +662,26 @@ pub struct ReplState {
 }
 ```
 
-**用途**：
-- pre_prompt / env_change 钩子可以修改 `repl.buffer` 来改变命令行内容
-- `ExecuteHostCommand` 等特殊操作后保留缓冲区状态
-- 实现跨迭代的缓冲区状态传递
+#### 两次 flush 的不同职责
 
-**注意**：HostCommand 执行后的下一次迭代会跳过 flush，保留 reedline 内部的缓冲区状态。
+`flush_engine_state_repl_buffer` 在一次 REPL 循环中可能被调用**两次**，各有不同的作用：
+
+**flush #1 — run_command 末尾（L505）**：
+- 时机：命令执行完毕，返回 line_editor 之前
+- 目的：将 commandline 命令（在 pre_execution 钩子或 HostCommand 中调用）对 ReplState 的修改同步回编辑器
+- 执行条件：Success 和 HostCommand 信号都会触发 run_command，因此都会执行此 flush
+- 效果：commandline edit 写入的 buffer/cursor_pos/accept 立即应用到 line_editor
+
+**flush #2 — loop_iteration 开头 read_line 之前（L734-736）**：
+- 时机：下一次循环迭代，更新完提示符之后，调用 read_line 之前
+- 目的：将 pre_prompt / env_change 钩子对 ReplState 的修改同步到编辑器
+- 执行条件：**仅当上一次信号不是 HostCommand 时执行**（`if !*is_hostcommand`）
+- HostCommand 后跳过的原因：HostCommand 场景下 reedline 内部已在 flush #1 时同步了状态，且 reedline 还保留着上次 read_line 后的编辑缓冲区（用户可能正在编辑的行），再次 flush 会用 ReplState 中被清空的 buffer 覆盖掉
+
+**用途**：
+- pre_prompt / env_change 钩子可以修改 `repl.buffer` 来改变命令行内容（通过 flush #2 生效）
+- pre_execution 钩子 / HostCommand 中通过 commandline 命令修改 ReplState（通过 flush #1 生效）
+- 实现跨迭代的缓冲区状态传递
 
 ### 6.2 input 命令默认值预填
 
@@ -705,7 +730,7 @@ match default_val {
 | 光标位置 | 可指定位置 | 自动在末尾 |
 | 额外功能 | 支持立即提交（accept） | 无 |
 | 数据来源 | engine_state.repl_state | 命令参数 `--default` |
-| 调用频率 | 每次循环迭代（HostCommand 后跳过） | 仅在 input 命令执行时 |
+| 调用频率 | 每轮循环最多两次：run_command 末尾一次（Success/HostCommand）、下一轮 read_line 前一次（HostCommand 后跳过） | 仅在 input 命令执行时 |
 
 ---
 
@@ -716,28 +741,53 @@ match default_val {
 ### 7.1 ReplState：命令族与编辑器之间的桥梁
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                    ReplState (Arc<Mutex<...>>)                    │
-│                                                                  │
-│   buffer: String        ← commandline / commandline edit 读写    │
-│   cursor_pos: usize     ← commandline get-cursor / set-cursor   │
-│   accept: bool          ← commandline edit --accept 写入         │
-│                                                                  │
-│   ┌─────────────────┐          ┌───────────────────────┐         │
-│   │ commandline 命令 │ ──写入──▶│ ReplState             │         │
-│   │ (钩子/HostCmd)  │          │                       │         │
-│   └─────────────────┘          └───────────┬───────────┘         │
-│                                            │                     │
-│                                            │ flush               │
-│                                            ▼                     │
-│                                ┌───────────────────────┐         │
-│                                │ reedline 编辑器        │         │
-│                                │ (run_edit_commands)   │         │
-│                                └───────────────────────┘         │
-└──────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                          ReplState (Arc<Mutex<...>>)                               │
+│                                                                                    │
+│   buffer: String        ← commandline / commandline edit 读写                     │
+│   cursor_pos: usize     ← commandline get-cursor / set-cursor                      │
+│   accept: bool          ← commandline edit --accept 写入                           │
+│                                                                                    │
+│   ┌──────────────┐   读取    ┌──────────────┐   写入    ┌───────────────┐          │
+│   │  line_editor  │ ───────▶ │  ReplState   │ ◀─────── │ commandline   │          │
+│   │  (reedline)   │          │              │          │ 命令族         │          │
+│   └──────┬───────┘          └──────┬───────┘          └───────────────┘          │
+│          │                         │                                              │
+│          │ L388-391: read_line 前  │ flush #1 (run_command 末尾 L505)             │
+│          │   保存 buffer 和光标    │  将 ReplState 写回 line_editor                 │
+│          │                         │  (commandline 修改 → 编辑器)                   │
+│          ▼                         ▼                                              │
+│   ┌──────────────┐          ┌──────────────┐                                      │
+│   │  read_line    │          │   钩子中       │                                      │
+│   │  用户编辑     │          │  commandline   │                                      │
+│   └──────────────┘          └──────────────┘                                      │
+│                                                                                    │
+│   flush #2 (loop_iteration 开头 L734-736)                                          │
+│   将 ReplState 写回 line_editor (HostCommand 后跳过)                                │
+│   (pre_prompt/env_change 钩子修改 → 编辑器)                                        │
+└────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**关键约束**：commandline 命令族**不直接**操作 reedline 实例。它们只修改 `ReplState`，由 `flush_engine_state_repl_buffer` 在下一次循环迭代的 `read_line` 之前将状态同步到编辑器。
+**关键约束**：commandline 命令族**不直接**操作 reedline 实例。它们只修改 `ReplState`，由 `flush_engine_state_repl_buffer` 将状态同步到编辑器。同步发生在两个时间点：
+
+1. **run_command 末尾（flush #1）**：commandline 命令在 pre_execution 钩子或 HostCommand 中执行后，修改的 ReplState 会在本次循环的 run_command 返回前立即同步回 line_editor。这是**主要**的同步时机。
+2. **下一次循环开头 read_line 前（flush #2）**：pre_prompt / env_change 钩子中 commandline 的修改，会在下一次循环迭代的 read_line 之前同步。
+
+#### ReplState 与 line_editor 的双向同步
+
+ReplState 和 line_editor 之间存在**双向**数据流动：
+
+**line_editor → ReplState（命令执行前保存，L388-391）**：
+```rust
+let mut repl = engine_state.repl_state.lock().expect("repl state mutex");
+repl.cursor_pos = line_editor.current_insertion_point();
+repl.buffer = line_editor.current_buffer_contents().to_string();
+drop(repl);
+```
+这发生在 run_command 中 pre_execution 钩子之后、实际执行命令之前。目的是确保 commandline 命令读取到的是当前 line_editor 中用户正在编辑的内容和光标位置。
+
+**ReplState → line_editor（命令执行后同步，即 flush）**：
+由 flush_engine_state_repl_buffer 实现，将 commandline 修改后的内容写回编辑器。
 
 ### 7.2 commandline — 读取缓冲区内容
 
@@ -855,64 +905,109 @@ let completions = completer.fetch_completions_at(&buffer, cursor_pos);
 
 **特殊处理**：`complete` 读取 `ReplState` 后立即释放锁，避免在补全过程中（可能执行其他代码）持锁导致死锁。
 
-### 7.7 状态回到编辑器的完整流程
+### 7.7 状态同步的完整时序
 
-commandline 命令对 `ReplState` 的修改不会立即反映到 reedline 编辑器。状态同步发生在下一次循环迭代中：
+commandline 命令对 `ReplState` 的修改通过**两次 flush** 和**双向同步**机制回到编辑器。以下是一次完整循环的时序（以 Success 信号为例）：
 
 ```
-commandline 命令执行 (钩子或 HostCommand 中)
+用户按下 Enter (read_line 返回 Signal::Success(command))
         │
         ▼
-  修改 ReplState
-  (buffer / cursor_pos / accept)
-        │
-        ▼
-  当前 read_line 返回 Signal
-        │
-        ▼
-  run_command 执行命令
+  ┌─ run_command 开始 ─────────────────────────────────────────────┐
+  │                                                                 │
+  │  1. pre_execution 钩子前：将 command 写入 ReplState.buffer        │
+  │     repl.buffer = command.clone()                               │
+  │                                                                 │
+  │  2. 执行 pre_execution 钩子（可调用 commandline 修改 ReplState）  │
+  │                                                                 │
+  │  3. 命令执行前：保存 line_editor 当前状态到 ReplState              │
+  │     repl.cursor_pos = line_editor.current_insertion_point()    │
+  │     repl.buffer = line_editor.current_buffer_contents()         │
+  │     ── 目的：确保 commandline 读取到的是用户真实编辑内容            │
+  │                                                                 │
+  │  4. 实际执行命令（HostCommand 中 commandline 修改 ReplState）     │
+  │                                                                 │
+  │  5. ★ flush #1（run_command 末尾 L505）★                        │
+  │     line_editor = flush_engine_state_repl_buffer(...)          │
+  │     ── 执行：Clear + InsertString(buffer) + MoveToPosition(cursor_pos) │
+  │     ── 如果 repl.accept=true，则 line_editor.with_immediately_accept(true) │
+  │     ── 清空 ReplState：buffer="" cursor_pos=0 accept=false       │
+  │     ── 效果：commandline 修改立即应用到 line_editor                │
+  │                                                                 │
+  │  返回 line_editor                                               │
+  └─────────────────────────────────────────────────────────────────┘
         │
         ▼
   回到主循环，进入下一次 loop_iteration
         │
         ▼
-  ┌─ is_hostcommand? ──────────────────────┐
-  │ 是                                      │ 否
-  │  跳过 flush，保留 reedline 内部缓冲区   │  执行 flush_engine_state_repl_buffer
-  │                                         │
-  │                                         ▼
-  │                                   line_editor.run_edit_commands([
-  │                                     EditCommand::Clear,
-  │                                     EditCommand::InsertString(repl.buffer),
-  │                                     EditCommand::MoveToPosition { repl.cursor_pos },
-  │                                   ])
-  │                                         │
-  │                                         ▼
-  │                                   if repl.accept {
-  │                                     line_editor.with_immediately_accept(true)
-  │                                   }
-  │                                   repl.accept = false
-  │                                   repl.buffer = ""
-  │                                   repl.cursor_pos = 0
-  └─────────────────────────────────────────┘
+  ┌─ loop_iteration (下一次) 开始 ─────────────────────────────────┐
+  │  ... 环境合并、钩子处理、Reedline 配置构建 ...                   │
+  │                                                                 │
+  │  pre_prompt / env_change 钩子（可调用 commandline 修改 ReplState）│
+  │                                                                 │
+  │  6. 更新提示符                                                   │
+  │                                                                 │
+  │  7. ★ flush #2（L734-736）★                                     │
+  │     if !*is_hostcommand {                                       │
+  │         line_editor = flush_engine_state_repl_buffer(...)      │
+  │     }                                                           │
+  │     *is_hostcommand = false                                     │
+  │     ── Success 场景：执行 flush，将 pre_prompt 钩子的修改同步       │
+  │     ── HostCommand 场景：跳过 flush，避免覆盖 reedline 内部状态     │
+  │                                                                 │
+  │  8. line_editor.read_line(nu_prompt)  ← 以新缓冲区等待输入       │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+### 7.8 HostCommand 场景的同步细节
+
+HostCommand 的执行路径与 Success 几乎相同，关键差异在 flush #2：
+
+```
+用户按下 HostCommand 绑定键 (read_line 返回 Signal::HostCommand(command))
+        │
+        ▼
+  *is_hostcommand = true            ← 设置标志
+        │
+        ▼
+  run_command 执行（步骤 1-5 与 Success 完全相同）
+        │
+        ├─ flush #1 在 run_command 末尾正常执行
+        │   commandline 对 ReplState 的修改已同步到 line_editor
+        │
+        ▼
+  下一次 loop_iteration 开头
+        │
+        ▼
+  pre_prompt / env_change 钩子执行（可能修改 ReplState）
+        │
+        ▼
+  flush #2：检查 is_hostcommand=true → 跳过 flush
+        │
+        ▼
+  *is_hostcommand = false            ← 重置标志
         │
         ▼
   line_editor.read_line(nu_prompt)
-        │
-        ▼
-  reedline 以新的缓冲区内容和光标位置等待用户输入
-  （如果 accept=true，则立即提交，等价于自动按 Enter）
+  ── reedline 内部保留着上次 read_line 后的缓冲区状态
+  ── 同时 flush #1 已将 commandline 修改应用到编辑器
+  ── 用户继续在当前行编辑，内容不丢失
 ```
 
-**HostCommand 场景的特殊性**：
+**为什么 HostCommand 后要跳过 flush #2？**
 
-当 commandline 命令在 HostCommand 中执行时，下一次迭代跳过 flush。这意味着 commandline 对 `ReplState` 的修改**不会**通过 flush 传递到编辑器。但这并不影响，因为：
+flush #1 执行完毕后，`flush_engine_state_repl_buffer` 会清空 ReplState（`buffer=""`, `cursor_pos=0`, `accept=false`）。如果 HostCommand 场景下继续执行 flush #2，会发生：
 
-1. HostCommand 中常用的模式是通过 `commandline edit` 设置内容后，再由 reedline 的缓冲区保持机制生效
-2. 如果 HostCommand 需要修改当前行并立即提交，可以组合使用 `--accept` 标志，但此时 `is_hostcommand` 为 true 会跳过 flush，所以需要靠 reedline 自身的 `with_immediately_accept` 来生效
-3. 在 pre_prompt / env_change 钩子中使用 commandline 时，由于这些钩子在 flush 之前执行，修改后的 ReplState 会在随后的 flush 中正确同步到编辑器
+1. `EditCommand::Clear` → 清空 reedline 内部已通过 flush #1 设置好的内容
+2. `EditCommand::InsertString("")` → 插入空字符串
+3. `EditCommand::MoveToPosition { position: 0 }` → 光标移到第 0 位
 
-### 7.8 典型使用场景
+结果是：HostCommand 中 commandline 修改后已在 flush #1 正确同步到 reedline 的内容，又被 flush #2 用空内容覆盖了。用户会看到输入行被意外清空。
+
+**同时保留 reedline 内部状态**：HostCommand 的语义是「在当前行上执行辅助操作」，操作完成后用户应该继续在**同一条输入行**上编辑。reedline 实例跨迭代复用，其内部缓冲区保留着用户正在编辑的内容，跳过 flush #2 确保这些状态不被 ReplState 中的空值覆盖。
+
+### 7.9 典型使用场景
 
 **场景一：pre_prompt 钩子预填命令行**
 
@@ -927,9 +1022,14 @@ $env.config = {
 }
 ```
 
-流程：pre_prompt 钩子 → `commandline edit` 写入 ReplState → flush 同步到 reedline → 用户看到预填内容
+流程：
+1. 上一轮循环正常结束
+2. 本轮 loop_iteration → pre_prompt 钩子执行
+3. `commandline edit` 写入 ReplState
+4. **flush #2**（L734-736，非 HostCommand）→ 将 ReplState 同步到 reedline
+5. read_line → 用户看到预填内容
 
-**场景二：HostCommand 中修改当前行**
+**场景二：HostCommand 中修改当前行（如 fzf 历史选择）**
 
 ```nu
 # keybindings 配置中
@@ -945,7 +1045,17 @@ $env.config = {
 }
 ```
 
-流程：Ctrl+R → HostCommand 执行 fzf → `commandline edit --replace` 写入 ReplState → 下一次迭代跳过 flush（is_hostcommand=true）→ 但 reedline 缓冲区保持不变，且如果 HostCommand 内部通过 `commandline edit -r` 设置了新内容，这些内容需要等待下一次**非** HostCommand 的迭代才能通过 flush 写入
+流程：
+1. 用户在某行输入时按 Ctrl+R → read_line 返回 HostCommand 信号
+2. `*is_hostcommand = true`
+3. run_command 执行：
+   - 命令执行前保存 line_editor 状态到 ReplState（`commandline` 函数读取该行内容传给 fzf）
+   - fzf 选择结果后，`commandline edit -r` 将选中项写入 ReplState
+   - **flush #1**（run_command 末尾 L505）→ 将 fzf 选中项同步到 reedline 编辑器，清空 ReplState
+4. 下一轮 loop_iteration：
+   - pre_prompt / env_change 钩子执行
+   - **flush #2 被跳过**（is_hostcommand=true）→ 不覆盖 reedline 中已有的 fzf 结果
+   - read_line → 用户看到 fzf 选中的历史命令，可继续编辑
 
 **场景三：accept 立即执行**
 
@@ -953,7 +1063,16 @@ $env.config = {
 commandline edit --append " --help" --accept
 ```
 
-流程：设置 buffer 和 accept=true → flush 时 InsertString + MoveToPosition + `with_immediately_accept(true)` → reedline 自动提交，效果等价于用户按了 Enter
+流程：
+1. `commandline edit` 写入 ReplState.buffer += " --help"，同时 `repl.accept = true`
+2. **flush #1**（run_command 末尾）：
+   - `EditCommand::Clear` → 清空
+   - `EditCommand::InsertString(buffer)` → 插入新内容
+   - `EditCommand::MoveToPosition` → 光标到末尾
+   - `repl.accept == true` → `line_editor.with_immediately_accept(true)`
+3. ReplState 被清空
+4. 回到 read_line 后，reedline 检测到 immediately_accept 标志，自动提交缓冲区
+5. 效果等价于用户自动按了 Enter
 
 ---
 
@@ -1047,31 +1166,37 @@ fn render_prompt_indicator(&self, edit_mode: PromptEditMode) -> Cow<'_, str> {
 ## 九、三者关系图
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          evaluate_repl (主循环)                           │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                       loop_iteration (单次迭代)                     │  │
-│  │                                                                   │  │
-│  │  ┌─────────────┐    ┌──────────────────┐    ┌──────────┐         │  │
-│  │  │  环境/钩子  │───▶│ Reedline 配置构建 │───▶│ read_line│         │  │
-│  │  │  预处理     │    │ (键位/菜单/高亮…) │    │  (阻塞)  │         │  │
-│  │  └─────────────┘    └──────────────────┘    └────┬─────┘         │  │
-│  │                                                  │                │  │
-│  │  ┌─────────────┐    ┌─────────────┐             │                │  │
-│  │  │  命令执行   │◀───│  信号分发   │◀────────────┘                │  │
-│  │  └─────────────┘    └─────────────┘                              │  │
-│  │                                                                   │  │
-│  │  ┌─────────────────────────────────────────────┐                  │  │
-│  │  │  缓冲区预填: flush_engine_state_repl_buffer  │                  │  │
-│  │  │  来源: engine_state.repl_state              │                  │  │
-│  │  │  条件: 上一次不是 HostCommand (!is_hostcommand)│                  │  │
-│  │  └─────────────────────────────────────────────┘                  │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                         │
-│  历史记录: setup_history (REPL 启动时一次性初始化, 跨迭代复用)           │
-│  菜单&键位: 每次迭代重新构建 (add_menus + setup_keybindings)              │
-│  提示符:   每次迭代从环境变量更新 (update_prompt)                          │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                            evaluate_repl (主循环)                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│  │                         loop_iteration (单次迭代)                              │ │
+│  │                                                                              │ │
+│  │  ┌─────────────┐    ┌──────────────────┐    ┌──────────────┐    ┌──────────┐ │ │
+│  │  │  环境/钩子  │───▶│ Reedline 配置构建 │───▶│  flush #2    │───▶│ read_line│ │ │
+│  │  │  预处理     │    │ (键位/菜单/高亮…) │    │ (HostCommand │    │  (阻塞)  │ │ │
+│  │  └─────────────┘    └──────────────────┘    │  后跳过)      │    └────┬─────┘ │ │
+│  │                                             └──────────────┘         │       │ │
+│  │                                                  ▲                    │       │ │
+│  │                                                  │                    ▼       │ │
+│  │  ┌──────────────────────────────────────────┐  │              ┌─────────────┐ │ │
+│  │  │         ReplState (Arc<Mutex<...>>)       │  │              │  信号分发   │ │ │
+│  │  │  buffer / cursor_pos / accept             │──┘              └──────┬──────┘ │ │
+│  │  │                                            │                        │        │ │
+│  │  │  ▲           commandline 读写              │                        ▼        │ │
+│  │  │  │                                         │              ┌─────────────┐   │ │
+│  │  │  │  执行前保存(L388-391)                   │              │  run_command │   │ │
+│  │  │  │                                         │              │             │   │ │
+│  │  │  └─────────────────────────────────────────│──◀── flush #1│  (末尾 L505)│   │ │
+│  │  │                                            │              └─────────────┘   │ │
+│  │  └──────────────────────────────────────────┘                 │  命令执行     │ │
+│  │                                                               └───────────────┘ │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                    │
+│  历史记录: setup_history (REPL 启动时一次性初始化, 跨迭代复用)                      │
+│  菜单&键位: 每次迭代重新构建 (add_menus + setup_keybindings)                         │
+│  提示符:   每次迭代从环境变量更新 (update_prompt)                                    │
+│  ReplState:  ← 编辑器(L388-391)  commandline 读写  → flush #1/#2 → 编辑器           │
+└──────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         input 命令 (单次)                            │
@@ -1148,17 +1273,20 @@ let cursor_config = CursorConfig {
 ### 10.5 HostCommand 的缓冲区保护机制
 
 通过 `is_hostcommand` 标志实现 HostCommand 后的缓冲区状态保留：
-- HostCommand 执行后设置标志
-- 下一次迭代跳过 `flush_engine_state_repl_buffer`
-- 保留 reedline 内部的缓冲区内容和光标位置
-- 确保用户可以继续在当前行上编辑
+- HostCommand 与 Success 共享 run_command 流程，flush #1 在末尾正常执行（commandline 修改已同步到编辑器）
+- flush #1 执行后 ReplState 被清空（`buffer=""`）
+- HostCommand 执行后设置 `is_hostcommand` 标志
+- 下一次迭代的 flush #2 被跳过，避免用空 ReplState 覆盖 reedline 中已有的内容
+- 保留 reedline 内部的缓冲区内容和光标位置，确保用户继续在当前行上编辑
 
-### 10.6 commandline 命令族的间接修改模式
+### 10.6 commandline 命令族的双向同步机制
 
-commandline 命令族通过 ReplState 间接修改 reedline 状态，这种设计带来了几个关键特性：
-- **延迟生效**：修改不会立即反映到编辑器，需要等待下一次 flush
+commandline 命令族通过 ReplState 间接与 reedline 交互，存在**双向同步**：
+- **编辑器 → ReplState**（run_command 中命令执行前）：保存 line_editor 当前 buffer 和光标，供 commandline 读取真实编辑内容
+- **ReplState → 编辑器**（flush #1 / flush #2）：将 commandline 修改写回 reedline
+- **延迟生效但不跨轮次**：在 pre_execution 钩子或 HostCommand 中执行的 commandline，修改在本轮 run_command 末尾的 flush #1 就同步回编辑器
 - **线程安全**：通过 `Arc<Mutex<ReplState>>` 确保多线程安全访问
-- **字节/字符转换**：内部存储字节偏移，对外暴露 grapheme 索引
+- **字节/字符转换**：内部存储字节偏移（与 reedline `MoveToPosition` 一致），对外暴露 grapheme 索引（用户视角）
 - **accept 语义**：通过 `with_immediately_accept` 实现自动提交
 
 ### 10.7 input 命令：两种输入模式
