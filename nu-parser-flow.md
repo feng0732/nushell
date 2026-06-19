@@ -1009,28 +1009,96 @@ parse() 顶层入口
 - **早期闭包可能"逃过"错误**：如果闭包 A 在 T1 编译时 `parse_errors` 恰好为空，它的 `ir_block` 就会一直保留，即使后续 T2 出现了错误
 - 这不是 bug，而是一种**时序依赖**的结果：编译发生在解析过程中（边解析边编译），而不是全部解析完再统一编译
 - **编译是否执行取决于调用瞬间的全局状态**，而非整个解析过程的最终状态
+- 运行时安全：当 `parse_errors` 非空时，整个 `Block` 不会被提交到 `EngineState`（由上层调用方决定），因此残留的 `IrBlock` 不会被使用
 
-### def 体闭包的二次编译
+### def 体闭包的二次编译与 signature 赋值
 
-[parse_def()](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_def.rs#L490-L496) 中的逻辑值得特别注意：
+[parse_def() L495-496](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_def.rs#L495-L496) 是两行**独立的顺序语句**：
 
 ```rust
 match call.positional_iter().nth(2) {
     Some(Expression { expr: Expr::Closure(block_id), .. }) => {
-        compile_block_with_id(working_set, *block_id);
-        *working_set.get_block_mut(*block_id).signature = sig.clone();
+        compile_block_with_id(working_set, *block_id);        // L495: 第二次编译
+        *working_set.get_block_mut(*block_id).signature = sig.clone();  // L496: 设置签名
     }
     // ...
 }
 ```
 
-这里对 `def` 的闭包体做了**第二次编译**：
-- **第一次**：在 `parse_closure_expression()` 中，闭包体闭包刚解析完时编译（序号①）
-- **第二次**：在 `parse_def()` 中，闭包体闭包被识别为 `def` 的函数体后再编译（序号③）
+**关键点：L495 和 L496 是两行独立语句，不存在控制依赖关系。**
 
-两次编译都会覆盖 `ir_block`。第二次编译还会**设置 `signature`**——这是因为 `def` 的函数签名需要在闭包 Block 上标注，而 `parse_closure_expression()` 编译时签名尚未设置。
+`compile_block_with_id` 的内部逻辑是：
+```rust
+pub fn compile_block_with_id(working_set: &mut StateWorkingSet<'_>, block_id: BlockId) {
+    if !working_set.parse_errors.is_empty() {
+        log::error!("compile_block_with_id called with parse errors");
+        return;   // ← 仅从 compile_block_with_id 返回，不影响后续代码
+    }
+    match nu_engine::compile(working_set, working_set.get_block(block_id)) {
+        Ok(ir_block) => {
+            working_set.get_block_mut(block_id).ir_block = Some(ir_block);
+        }
+        Err(err) => working_set.compile_errors.push(err),
+    };
+}
+```
 
-**时序效果**：如果第一次编译时 `parse_errors` 为空（成功编译），但第一次和第二次之间出现了新错误，那么第二次 `compile_block_with_id` 会因为 `parse_errors` 非空而跳过——闭包保留第一次编译的 `ir_block`，但**没有 `signature`**。
+`compile_block_with_id` 提前 return 时，仅跳过了**自己内部的** ir_block 写入逻辑，**不会**阻止 L496 的执行。因此：
+
+| 场景 | compile_block_with_id 行为 | ir_block 结果 | signature 结果 |
+|---|---|---|---|
+| parse_errors 为空 | 执行编译，覆盖 ir_block | `Some(新 IrBlock)` | `= sig.clone()` ✓ 设置 |
+| parse_errors 非空 | 提前 return，不修改 ir_block | 保持原值（可能为 Some 或 None） | `= sig.clone()` ✓ 设置 |
+
+**signature 始终被设置，无论编译是否跳过。**
+
+#### 两次编译的完整时序
+
+`def` 体的闭包在两个不同时刻被编译：
+
+**第一次**：[parse_closure_expression() L767-772](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_expressions.rs#L767-L772)
+
+```rust
+if working_set.parse_errors.is_empty() {     // ← 调用方显式检查
+    compile_block(working_set, &mut output);
+}
+
+if let Some(signature) = signature {
+    output.signature = signature.0;          // ← 闭包自身参数签名（如 |x| 的 x）
+}
+```
+
+- 这里的 signature 是从闭包自身的 `|params|` 语法解析出来的（如 `{ |x, y| ... }` 中的 `x, y`）
+- 编译有调用方 `if is_empty()` 保护
+- signature 赋值也在 `if let Some(signature)` 保护下——若无参数则为 `None`
+
+**第二次**：[parse_def() L495-496](file:///d:/fz/0601-2/solo-dogfeeding/code/61-nushell/crates/nu-parser/src/parse_def.rs#L495-L496)
+
+```rust
+compile_block_with_id(working_set, *block_id);           // ← 无调用方检查，依赖内部保护
+*working_set.get_block_mut(*block_id).signature = sig.clone();  // ← def 完整签名
+```
+
+- 这里的 signature 是 `def` 命令的完整签名（包括类型标注、默认值、flag 等），**覆盖**闭包自身的简单签名
+- 编译无调用方检查，依赖 `compile_block_with_id` 内部的 `is_empty()` 保护
+- signature 赋值**无条件执行**
+
+#### 两次编译之间的三种时序状态
+
+```
+                    第一次编译（parse_closure_expression）  →  中间可能产生错误  →  第二次编译（parse_def）
+                    ──────────────────────────────────────     ──────────────     ─────────────────────────
+场景A: parse_errors  [] → 编译成功，ir_block=Some(1)        无新错误           → [] → 编译成功，ir_block=Some(2) 覆盖；signature 设置
+场景B: parse_errors  [] → 编译成功，ir_block=Some(1)        出现新错误 E       → [E] → 跳过编译，ir_block=Some(1) 保留；signature 仍设置
+场景C: parse_errors  [E] → 调用方 is_empty()=false，不编译   可能更多错误      → [E,...] → 跳过编译，ir_block=None；signature 仍设置
+```
+
+**场景 B 最值得注意**：第一次编译成功（`ir_block = Some(1)`），但中间出现错误导致第二次编译跳过。此时：
+- `ir_block` 保留第一次编译的结果（不会过期——第一次编译时 parse_errors 为空，AST 结构是正确的）
+- `signature` 被第二次的完整签名覆盖——即使第二次编译跳过，签名仍然正确
+- 但 `ir_block = Some(1)` 中的 IR 是基于第一次的签名（闭包参数签名）编译的，而 Block 上的 signature 已被覆盖为 def 完整签名——**两者可能不一致**
+
+**场景 C 的后果**：`ir_block = None` 且 signature 被设置。但此 Block 因 parse_errors 非空不会被提交到 EngineState，所以不一致不影响运行时。
 
 ### source 命令的特殊检查
 
@@ -1150,15 +1218,17 @@ parse() 开始    []
   - 其他类型（`Unclosed`、`Unbalanced`、`UnexpectedEof` 等） → 不回溯（这是"代码有问题"，直接报出）
 - `parse_oneof` 更激进：总是回溯，但最后会把"最优猜测"（走得最远的那次）的错误再补回来。
 
-### 3. 编译门槛的全局语义与时序依赖
+### 3. 编译门槛的时序依赖语义
 
-- **判断对象是同一个全局 `parse_errors`**。不是"当前块"或"当前作用域"的错误，而是"调用 `compile_block` 的**那一瞬间**全局 `parse_errors` 的状态"。
+- **判断对象是同一个全局 `parse_errors`**，但检查时刻不同导致结果可能不同。不是"当前块"或"当前作用域"的错误，而是"调用 `compile_block` 的**那一瞬间**全局 `parse_errors` 的状态"。
 - 编译发生在解析过程中（边解析边编译），不是全部解析完再统一编译。因此：
   - 早期闭包可能恰好在 `parse_errors` 为空时编译成功
   - 后续错误**不会撤销**已编译闭包的 `IrBlock`（`ir_block` 一旦设为 `Some` 不会被重置为 `None`）
   - 后期闭包因 `parse_errors` 非空而跳过编译（`ir_block` 保持 `None`）
+- **"全局错误阻止所有块编译"这个说法不够精确**——精确的说法是：**每个 `compile_block` 调用独立检查调用瞬间的 `parse_errors` 状态**。由于边解析边编译的时序，早期调用可能看到空列表而成功编译，后期调用可能因中间产生的错误而跳过。
 - 顶层编译在 `parse_block()` 返回后、`discover_captures_in_closure()` 之前执行，是最后一个编译机会
-- `def` 体闭包被编译**两次**：第一次在 `parse_closure_expression()` 中，第二次在 `parse_def()` 中（覆盖 `ir_block` 并设置 `signature`）
+- `def` 体闭包被编译**两次**：第一次在 `parse_closure_expression()` 中（有调用方 `if is_empty()` 保护），第二次在 `parse_def()` 中（无调用方保护，依赖内部检查，覆盖 `ir_block` 并设置 `signature`）。**signature 赋值与编译无关，始终执行**。
+- 7 个编译触发点中只有 2 个有调用方保护（①闭包、⑦顶层），其余 5 个依赖内部保护（②with-env、③def 体、④export-env、⑤RowCondition、⑥source）。内部保护不会阻止 signature 等后续赋值语句的执行。
 
 ### 4. 全局一致的设计哲学
 
@@ -1167,6 +1237,6 @@ parse() 开始    []
 3. **错误侧传**：错误通过返回值或全局状态的 side channel 传递，不影响函数的正常返回值路径
 4. **无 Result 传播**：解析函数几乎都返回值本身，而非 `Result`，确保下游总能拿到可用的结构
 5. **试探基于全局错误快照**：truncate 绝对回滚，但 first error 类型决定"要不要回滚"
-6. **边解析边编译**：编译时机与解析交织，检查的是调用瞬间的全局状态，已编译的 `IrBlock` 不可撤回
+6. **边解析边编译**：编译时机与解析交织，每个 `compile_block` 独立检查调用瞬间的全局 `parse_errors` 状态。已编译的 `IrBlock` 不可撤回，但 signature 等元数据赋值独立于编译、始终执行。
 
-这种设计使得 Nushell 的解析器能够**一次性报告尽可能多的错误**（AST 层不中断），同时在形状歧义场景下能高效试错（truncate 回滚干净）。编译门槛基于调用瞬间的全局 `parse_errors` 状态——早期无错时编译的闭包不会因后续错误而被撤销，但整个 `Block` 是否被提交到运行时仍由上层调用方根据最终 `parse_errors` 状态决定。
+这种设计使得 Nushell 的解析器能够**一次性报告尽可能多的错误**（AST 层不中断），同时在形状歧义场景下能高效试错（truncate 回滚干净）。编译门槛基于每个调用点的瞬间 `parse_errors` 状态——早期无错时编译的闭包不会因后续错误而被撤销，signature 等元数据也不受编译跳过的影响。整个 `Block` 是否被提交到运行时仍由上层调用方根据最终 `parse_errors` 状态决定，确保残留 IrBlock 不会被实际使用。
