@@ -342,25 +342,63 @@ pub fn components(path: &Path) -> impl Iterator<Item = Component<'_>> {
 
 （见 [trailing_slash.rs:L22-L44](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/trailing_slash.rs#L22-L44)）
 
-### expand_dots 中对 symlink 的保守处理
+### expand_dots 的词法折叠规则
 
-纯词法的 `expand_dots` 只在 **最后一个组件是 Normal（普通目录/文件名）** 时才回退 `..`：
+`expand_dots` 是纯词法操作，**有意忽略 symlink 的可能性**（见函数文档注释 [dots.rs:L52-L56](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/dots.rs#L52-L56)）。只要 `..` 前面的组件是 `Component::Normal`，就一定折叠：
 
 ```rust
 Component::ParentDir if last_component_is_normal(&result) => {
-    result.pop();
+    result.pop();   // 无条件消掉前面的 Normal 组件
 }
 ```
+
 （见 [dots.rs:L74-L75](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/dots.rs#L74-L75)）
 
-这意味着如果前面的组件可能是 symlink，比如 `link/..`，就不会被词法地消掉——因为 `link` 的父目录未必是当前目录，必须访盘才能确定。同样，根目录之后的 `..` 也被跳过：
+因此 **`link/..` 会被词法地消掉**，即使 `link` 是 symlink。具体追踪：
 
-```rust
-if prev_component == Some(Component::RootDir) && component == Component::ParentDir {
-    continue;
-}
-```
-（见 [dots.rs:L97-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/dots.rs#L97-L99)）
+| 输入 | 当前组件 | result 变化 | 说明 |
+|------|----------|-------------|------|
+| `link/..` | `Normal("link")` | `""` → `"link"` | `_` 分支，直接 push |
+| | `ParentDir` | `"link"` → `""` | `last_component_is_normal` 为 true → pop |
+
+| 输入 | 当前组件 | result 变化 | 说明 |
+|------|----------|-------------|------|
+| `/link/../baz/` | `RootDir` | `""` → `"/"` | `_` 分支，push |
+| | `Normal("link")` | `"/"` → `"/link"` | `_` 分支，push |
+| | `ParentDir` | `"/link"` → `"/"` | Normal 存在 → pop |
+| | `Normal("baz")` | `"/"` → `"/baz"` | `_` 分支，push |
+| | `Normal("")` | `"/baz"` → `"/baz/"` | 尾随斜杠空组件，push |
+
+**不会被折叠的 `..`** 只有两种情况：
+
+1. **`..` 前面不是 Normal 组件**（即前面是 `ParentDir`、`CurDir`、`Prefix` 或空路径）：
+
+   ```rust
+   fn last_component_is_normal(path: &Path) -> bool {
+       matches!(path.components().next_back(), Some(Component::Normal(_)))
+   }
+   ```
+   （见 [dots.rs:L64-L66](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/dots.rs#L64-L66)）
+
+   例如 `../../foo` 中的第二个 `..`——前一个组件是 `ParentDir`，不是 Normal，所以不会被折叠，结果是 `../../foo`。
+
+2. **`..` 紧跟在 `RootDir` 之后**（由 `_` 分支中的额外检查处理）：
+
+   ```rust
+   let prev_component = result.components().next_back();
+   if prev_component == Some(Component::RootDir) && component == Component::ParentDir {
+       continue;   // 跳过 /.. 中的 ..，不 push
+   }
+   ```
+   （见 [dots.rs:L96-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/75-nushell/crates/nu-path/src/dots.rs#L96-L99)）
+
+   例如 `/..` → `/`（`..` 被丢弃，而不是变成空路径或 `../`）。
+
+**这意味着词法折叠 vs symlink 安全的关键分界线不在 `expand_dots` 内部，而在调用者选择哪条路径**：
+
+- `expand_path()` 调用 `expand_dots()`，会词法折叠 `link/..`
+- `absolute_with()` 调用 `expand_tilde` + `expand_ndots` + `std::path::absolute`，**不调用** `expand_dots`，所以 `..` 保留原样
+- `canonicalize_with()` 最终走 `std::fs::canonicalize()`，由内核解析 symlink 后再处理 `..`
 
 ### AbsolutePath 的 canonicalize 方法
 
