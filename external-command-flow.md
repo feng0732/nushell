@@ -417,6 +417,8 @@ pub fn drain(self) -> Result<(), ShellError> {
 
 ## 第四部分：退出码检查机制
 
+> **阅读指引**：本节所有结论都基于同一份源码证据（见 4.2 节），表格中的 LAST_EXIT_CODE 取值都符合同一条规则——`drain()` 先设置末尾命令结果，`eval_source()` 在发生错误时再覆盖。
+
 ### 4.1 退出状态检查：check_ok()
 
 定义于 [child.rs:L48-L89](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs#L48-L89)
@@ -450,9 +452,17 @@ pub fn check_ok(status: ExitStatus, ignore_error: bool, span: Span) -> Result<()
 }
 ```
 
-### 4.2 LAST_EXIT_CODE 的设置
+**调用链**：`check_ok()` 是所有"末尾命令退出码检查"的终点，由以下路径调用：
 
-`LAST_EXIT_CODE` 是一个环境变量，通过 `Stack::set_last_exit_code` 设置（[stack.rs:L309-L319](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/engine/stack.rs#L309-L319)）：
+| 触发场景 | 调用链 | 对应代码 |
+|---------|--------|---------|
+| 排空 ByteStream | `drain()` → `ByteStream::drain()` → `ChildProcess::wait()` → `check_ok()` | [eval_ir.rs:L1725](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1725) / [child.rs:L453](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs#L453) |
+| 收集为 Value | `collect_reg()` / `collect()` → `into_value()` → `into_bytes()` → `check_ok()` | [eval_ir.rs:L220](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L220) / [child.rs:L403](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs#L403) |
+| 管道输出打印 | `drain_to_out_dests()` → `PipelineData::drain()` → `ByteStream::drain()` → `check_ok()` | [pipeline_data.rs:L323](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/pipeline/pipeline_data.rs#L323) / [byte_stream.rs:L692](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/pipeline/byte_stream.rs#L692) |
+
+### 4.2 LAST_EXIT_CODE 的设置路径（核心证据）
+
+`LAST_EXIT_CODE` 是环境变量，通过 `Stack::set_last_exit_code` 或 `Stack::set_last_error` 设置（[stack.rs:L309-L319](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/engine/stack.rs#L309-L319)）：
 
 ```rust
 pub fn set_last_exit_code(&mut self, code: i32, span: Span) {
@@ -468,94 +478,32 @@ pub fn set_last_error(&mut self, error: &ShellError) {
 }
 ```
 
-**设置时机**：
-| 场景 | 代码位置 | 行为 |
-|------|---------|------|
-| 源执行成功 | [util.rs:L253](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-cli/src/util.rs#L253) | 设置为 0 或实际退出码 |
-| ByteStream drain 成功 | [eval_ir.rs:L1739](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1739) | 设置为 0 |
-| 发生错误 | [stack.rs:L313-L319](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/engine/stack.rs#L313-L319) | 从 ShellError 提取退出码 |
-| ignore 命令 | [ignore.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-cmd-lang/src/core_commands/ignore.rs) | 根据配置设置 0 或 1 |
+**整个代码库中，LAST_EXIT_CODE 只在以下 4 个调用点被显式设置**：
 
-### 4.3 默认模式下的退出码检查
+| 编号 | 位置 | 触发条件 | 代码 | 设置值 |
+|-----|------|---------|------|--------|
+| A | `drain()` [eval_ir.rs:L1726](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1726) | `stream.drain()` **失败**（即末尾命令失败） | `ctx.stack.set_last_error(&err)` | 错误中的退出码（末尾命令的非零码，或信号码） |
+| B | `drain()` [eval_ir.rs:L1739](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1739) | `stream.drain()` **成功**（即末尾命令成功） | `ctx.stack.set_last_exit_code(0, span)` | `0` |
+| C | `eval_source()` [util.rs:L253](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-cli/src/util.rs#L253) | `evaluate_source()` 返回 `Ok(failed)` | `stack.set_last_exit_code(code, Span::unknown())` | `code = false.into() = 0` |
+| D | `eval_source()` [util.rs:L259](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-cli/src/util.rs#L259) | `evaluate_source()` 返回 `Err(err)` | `stack.set_last_error(&err)` | 错误中的退出码（pipefail 失败命令的退出码，或末尾命令的非零码） |
 
-**默认模式（pipefail 关闭）**：
-- 只关心**最后一个命令**的退出码
-- 管道中上游命令的非零退出码被忽略
-- `LAST_EXIT_CODE` 总是反映最后一个命令的退出码
+**关键观察（贯穿本节的统一规则）**：
+- `drain_if_end()`、`collect()`、`collect_reg()` 都**不**设置 LAST_EXIT_CODE，它们只可能返回 `Err`，最终由 `eval_source()` 的 D 路径设置。
+- LAST_EXIT_CODE 的最终取值，**取决于哪个设置点最后执行**：Drain 指令先经过 A/B，若 pipefail 检查失败会再被 D 覆盖；其他路径只有 C/D。
 
-**检查点**：
-1. `ByteStream::drain()` 时调用 `ChildProcess::wait()` → `check_ok()`
-2. 如果最后一个命令非零退出，drain 返回错误
-3. 错误被设置到 `LAST_EXIT_CODE`
+### 4.3 默认模式与 Pipefail 模式
 
-### 4.4 Pipefail 模式下的退出码检查
+#### 4.3.1 默认模式（pipefail 关闭）
 
-Pipefail 由 `nu_experimental::PIPE_FAIL` 控制，是实验性功能。
+只检查**最后一个命令**的退出码（通过 4.1 节中的 `check_ok()` 调用链）。`LAST_EXIT_CODE` 反映末尾命令的退出码。
 
-#### 4.4.1 退出状态追踪：PipelineExecutionData
+#### 4.3.2 Pipefail 模式（pipefail 开启）
 
-`PipelineExecutionData` 的 `exit` 字段是一个 `Vec<Option<ExitStatusGuard>>`，按**执行顺序**保存管道中所有命令的退出状态。
-
-**退出状态的累积**发生在 `Instruction::Call` 处理中（[eval_ir.rs:L675-L713](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L675-L713)）：
+除检查末尾命令外，还检查**所有命令**的退出码，通过 `check_exit_status_future()` 反向遍历 exit 向量（[child.rs:L22-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs#L22-L29)）：
 
 ```rust
-Instruction::Call { decl_id, src_dst } => {
-    let input = ctx.take_reg(*src_dst);
-    let input_data = input.body;
-    let result = eval_call::<D>(ctx, *decl_id, *span, input_data)?;
-
-    #[cfg(feature = "os")]
-    {
-        let mut original_exit = input.exit;  // 上游命令的退出状态列表
-
-        // complete 命令：清空继承的退出状态
-        if ctx.engine_state.get_decl(*decl_id).name() == "complete" {
-            original_exit.clear();
-        }
-
-        // 追加当前命令的退出状态
-        let result_exit_status_future = result
-            .clone_exit_status_future()
-            .map(|f| f.with_span(*span));
-        original_exit.push(result_exit_status_future);
-
-        ctx.put_reg(*src_dst, PipelineExecutionData {
-            body: result,
-            exit: original_exit,  // 累积所有命令的退出状态
-        });
-    }
-}
-```
-
-**clone_exit_status_future** 从 PipelineData 提取退出状态（[pipeline_data.rs:L871-L883](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/pipeline/pipeline_data.rs#L871-L883)）：
-
-```rust
-pub fn clone_exit_status_future(&self) -> Option<ExitStatusGuard> {
-    match self {
-        PipelineData::Empty | PipelineData::Value(..) | PipelineData::ListStream(..) => None,
-        PipelineData::ByteStream(stream, ..) => match stream.source() {
-            ByteStreamSource::Read(..) | ByteStreamSource::File(..) => None,
-            ByteStreamSource::Child(c) => {
-                let exit_future = c.clone_exit_status_future();
-                let ignore_error = c.clone_ignore_error();
-                Some(ExitStatusGuard::new(exit_future, ignore_error))
-            }
-        },
-    }
-}
-```
-
-**只有 `ByteStreamSource::Child` 类型才有退出状态**，其他类型返回 None。
-
-#### 4.4.2 Pipefail 检查：check_exit_status_future()
-
-定义于 [child.rs:L22-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs#L22-L29)
-
-```rust
-pub fn check_exit_status_future(
-    exit_status: Vec<Option<ExitStatusGuard>>,
-) -> Result<(), ShellError> {
-    // 反向遍历（从最后一个命令向前）
+pub fn check_exit_status_future(exit_status: Vec<Option<ExitStatusGuard>>) -> Result<(), ShellError> {
+    // 反向遍历（从最后一个命令向前），遇到第一个非零就报错
     for one_status in exit_status.into_iter().rev().flatten() {
         check_exit_status_future_ok(one_status)?
     }
@@ -563,152 +511,112 @@ pub fn check_exit_status_future(
 }
 ```
 
-**检查顺序**：从最后一个命令向前遍历，遇到第一个非零退出就报错。
-
-#### 4.4.3 Pipefail 检查时机
-
-Pipefail 在以下时机被检查：
+**Pipefail 检查点**：
 
 | 检查点 | 代码位置 | 说明 |
 |-------|---------|------|
-| `collect()` | [eval_ir.rs:L1707-L1709](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1707-L1709) | 收集为 Value 时 |
-| `drain()` | [eval_ir.rs:L1761-L1768](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1761-L1768) | 排空管道时 |
+| `collect(ignore_error=false)` | [eval_ir.rs:L1707-L1709](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1707-L1709) | TryCollect 指令 |
+| `drain()` | [eval_ir.rs:L1761-L1768](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1761-L1768) | Drain 指令（先检查末尾，再检查全部） |
 | `drain_if_end()` | [eval_ir.rs:L1783-L1790](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1783-L1790) | 块结束时 |
-| 源执行完毕 | [util.rs:L337-L342](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-cli/src/util.rs#L337-L342) | REPL 执行完命令后 |
+| `evaluate_source()` | [util.rs:L337-L342](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-cli/src/util.rs#L337-L342) | REPL 执行完后 |
 
-#### 4.4.4 collect_reg 与退出状态
+**退出状态累积**发生在 `Instruction::Call`（[eval_ir.rs:L675-L713](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L675-L713)）。只有 `ByteStreamSource::Child` 类型才会产生 `ExitStatusGuard`（[pipeline_data.rs:L871-L883](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/pipeline/pipeline_data.rs#L871-L883)），Value / ListStream / Read / File 均为 None。
 
-`collect_reg` 用于将寄存器内容收集为 Value（赋值场景），它会**清空退出状态**（[eval_ir.rs:L208-L221](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L208-L221)）：
+### 4.4 统一对比表（默认模式 / Pipefail / LAST_EXIT_CODE）
 
-```rust
-fn collect_reg(&mut self, reg_id: RegId, fallback_span: Span) -> Result<Value, ShellError> {
-    #[cfg(feature = "os")]
-    let body = {
-        let mut data = self.take_reg(reg_id);
-        data.exit.clear();  // 清空退出状态，赋值不触发 pipefail
-        data.body
-    };
-    let span = body.span().unwrap_or(fallback_span);
-    body.into_value(span)
-}
-```
+> 本表结论完全基于 4.2 节的 4 个设置点和 4.1 节的 check_ok 调用链。
 
-**这意味着**：`let x = (external1 | external2)` 中，即使 pipefail 开启，赋值语句也不会触发 pipefail 错误。
+| 场景 | 是否报错 | LAST_EXIT_CODE 最终值 | 依据（代码路径） |
+|------|---------|----------------------|-----------------|
+| **最后一个命令非零退出**（pipefail 关） | ❌ 报错 | 末尾命令的非零退出码 | 路径 A（Drain 指令） / 路径 D（其他路径） |
+| **最后一个命令非零退出**（pipefail 开） | ❌ 报错 | 末尾命令的非零退出码 | 同左 |
+| **中间命令非零、末尾命令成功**（pipefail 关） | ✅ 不报错 | `0`（末尾命令成功） | 路径 B（Drain 指令） / 路径 C（其他路径） |
+| **中间命令非零、末尾命令成功**（pipefail 开） | ❌ 报错 | 中间失败命令的非零退出码 | Drain 指令：先 B 设为 0，再被 D 覆盖；其他路径：直接 D |
+| **`ignore` 包裹的命令**（pipefail 关） | ✅ 不报错 | `0`（末尾命令视角） | ignore_error=true → check_ok 返回 Ok → B/C |
+| **`ignore` 包裹的命令**（pipefail 开） | ✅ 不报错 | `0`（末尾命令视角） | ignore_error=true → check_ok 和 check_exit_status_future 均 Ok → B/C |
+| **赋值语句中末尾命令失败**（pipefail 关） | ❌ 报错 | 末尾命令的非零退出码 | into_value → check_ok 报错 → Err 被 D 设置 |
+| **赋值语句中末尾命令失败**（pipefail 开） | ❌ 报错 | 末尾命令的非零退出码 | 同左（collect_reg 清空 exit 不影响 into_value 的 check_ok） |
+| **赋值语句中中间命令失败、末尾成功**（pipefail 关） | ✅ 不报错 | `0` | collect_reg 清空 exit → into_value check_ok Ok → C |
+| **赋值语句中中间命令失败、末尾成功**（pipefail 开） | ✅ 不报错 | `0` | collect_reg 清空 exit → pipefail 无向量可检查 → C |
+| **`complete` 命令后**（pipefail 关） | ✅ 不报错 | `0` | ignore_error=true + original_exit.clear() + wait_with_output 不调 check_ok → C |
+| **`complete` 命令后**（pipefail 开） | ✅ 不报错 | `0` | 同左（exit 向量为空） |
+| **SIGPIPE 信号退出** | ✅ 不报错 | `0`（被视为成功） | check_ok 中 SIGPIPE 特殊处理为 Ok → B/C |
+| **其他信号退出**（SIGINT 等） | ❌ 报错 | `-signal` | check_ok 返回 Err(TerminatedBySignal) → A/D，external_exit_code 返回 `-signal` |
 
-#### 4.4.5 complete 命令的特殊处理
+### 4.5 LAST_EXIT_CODE 的三条完整更新流程
 
-`complete` 命令将外部命令的退出状态转换为数据（`exit_code` 字段），它会**清空继承的退出状态**（[eval_ir.rs:L696-L698](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L696-L698)）：
+以下三个场景覆盖了所有可能的 LAST_EXIT_CODE 更新路径，均引用 4.2 节的 A/B/C/D 四个设置点。
 
-```rust
-if ctx.engine_state.get_decl(*decl_id).name() == "complete" {
-    original_exit.clear();  // 下游不再检查这些退出状态
-}
-```
+#### 4.5.1 场景一：Drain 指令触发的 pipefail
 
-### 4.5 ignore_error 标志
-
-`ignore_error` 标志用于控制单个命令的退出码是否触发 pipefail：
-
-- **`ignore` 命令**：将下游命令的 `ignore_error` 设为 true
-- **赋值语句**：通过 `collect_reg` 清空退出状态（效果类似但机制不同）
-- **`complete` 命令**：清空继承的退出状态
-
-### 4.6 退出码检查对比表
-
-| 场景 | 默认模式 | Pipefail 模式 |
-|------|---------|--------------|
-| 最后一个命令非零退出 | ❌ 报错 | ❌ 报错 |
-| 中间命令非零退出 | ✅ 忽略 | ❌ 报错 |
-| `ignore` 包裹的命令 | ✅ 忽略 | ✅ 忽略（ignore_error=true） |
-| 赋值语句中末尾命令失败 | ❌ 报错（into_value 检查） | ❌ 报错（into_value 检查） |
-| 赋值语句中中间命令失败 | ✅ 忽略 | ✅ 忽略（collect_reg 清空 exit） |
-| `complete` 命令后 | ✅ 不报错（exit_code 字段返回） | ✅ 不报错（exit 被清空 + ignore_error） |
-| SIGPIPE 信号退出 | ✅ 忽略 | ✅ 忽略 |
-| 其他信号退出 | ❌ 报错 | ❌ 报错 |
-
-### 4.7 pipefail 模式下 LAST_EXIT_CODE 覆盖问题
-
-**核心问题**：开启 pipefail 后，若中间命令失败，`LAST_EXIT_CODE` 是否会被错误覆盖？
-
-**答案**：**不会被错误覆盖。LAST_EXIT_CODE 最终会被设置为导致 pipefail 失败的命令的退出码。但中间过程可能短暂被设为 0，最终在 `eval_source` 中被修正。**
-
-#### 4.7.1 LAST_EXIT_CODE 的两条设置路径
-
-**LAST_EXIT_CODE 只在两个地方被显式设置**：
-
-| 路径 | 代码位置 | 触发条件 | 设置值 |
-|------|---------|---------|--------|
-| `drain()` 函数 | [eval_ir.rs:L1726](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1726) | `stream.drain()` 失败 | `set_last_error(&err)` → 错误退出码 |
-| `drain()` 函数 | [eval_ir.rs:L1739](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L1739) | `stream.drain()` 成功 | `set_last_exit_code(0)` |
-| `eval_source()` | [util.rs:L253](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-cli/src/util.rs#L253) | 评估成功 | `set_last_exit_code(code)` → `false.into()=0` |
-| `eval_source()` | [util.rs:L259](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-cli/src/util.rs#L259) | 评估出错 | `set_last_error(&err)` → 错误退出码 |
-
-**注意**：`drain_if_end()` 和 `collect()` 都**不**设置 LAST_EXIT_CODE，完全依赖错误传播到 `eval_source()` 后设置。
-
-#### 4.7.2 pipefail 通过 Drain 指令触发的完整流程
+命令：`cmd1(失败, exit=1) | cmd2(成功, exit=0)`，pipefail 开，由 `Drain` 指令排空。
 
 ```
-cmd1(失败, exit=1) | cmd2(成功, exit=0)  [pipefail 开启, Drain 指令]
-
 1. drain() 函数执行:
-   a. stream.drain()  ← 等待 cmd2 退出
-      └─ ChildProcess::wait() → check_ok(Exited(0), false, span) → Ok
-   b. LAST_EXIT_CODE = 0  ← 此时被设为 0
+   a. stream.drain()  →  ChildProcess::wait() → check_ok(Exited(0), false, span) → Ok
+   b. [路径 B] LAST_EXIT_CODE = 0
 
-2. pipefail 检查:
+2. pipefail 检查 (L1767):
    a. check_exit_status_future([None, cmd1_guard, cmd2_guard])
-   b. 反向遍历: cmd2 → Ok, cmd1 → Err(NonZeroExitCode { exit_code: 1 })
+   b. 反向遍历: cmd2→Ok, cmd1→Err(NonZeroExitCode{exit_code:1})
    c. 返回 Err
 
-3. 错误传播到 eval_source():
-   a. set_last_error(&err) → set_last_exit_code(1)  ← 修正为 1
+3. 错误向上传播，最终到 eval_source():
+   a. [路径 D] set_last_error(&err) → set_last_exit_code(1)
 
-最终: LAST_EXIT_CODE = 1 ✅
+最终: LAST_EXIT_CODE = 1  ✅（被路径 D 覆盖了路径 B 的 0）
 ```
 
-#### 4.7.3 pipefail 通过 drain_if_end 触发的完整流程
+#### 4.5.2 场景二：赋值语句（collect_reg）
+
+命令：`let x = (^false | ^echo ok)`，pipefail 开。
 
 ```
-cmd1(失败, exit=1) | cmd2(成功, exit=0)  [pipefail 开启, DrainIfEnd 指令]
+1. collect_reg() 执行 [eval_ir.rs:L208-L221]:
+   a. data.exit.clear()   ← 清空 pipefail 向量，跳过中间命令检查
+   b. body.into_value(span)
+        → ByteStream::into_value()
+        → ByteStream::into_bytes()     [byte_stream.rs:L662]
+        → ChildProcess::into_bytes()   [child.rs:L376]
+        → collect_bytes(stdout) 成功
+        → check_ok(Exited(0), false, span) → Ok
 
-1. drain_if_end() 函数执行:
-   a. drain_to_out_dests()  ← 不设置 LAST_EXIT_CODE
-      └─ ByteStream::drain() → ChildProcess::wait() → Ok
-   b. LAST_EXIT_CODE 未被设置  ← 保持之前的值
+2. 赋值成功，返回 Ok(Value)
 
-2. pipefail 检查:
-   a. check_exit_status_future([None, cmd1_guard, cmd2_guard])
-   b. 反向遍历: cmd2 → Ok, cmd1 → Err(NonZeroExitCode { exit_code: 1 })
-   c. 返回 Err
+3. 最终 eval_source() [路径 C]: set_last_exit_code(0)
 
-3. 错误传播到 eval_source():
-   a. set_last_error(&err) → set_last_exit_code(1)
-
-最终: LAST_EXIT_CODE = 1 ✅
+最终: LAST_EXIT_CODE = 0  ✅（末尾命令成功）
 ```
 
-#### 4.7.4 pipefail 通过 evaluate_source 触发的完整流程
+若为 `let x = ^false`，则 step 1b 的 check_ok 返回 Err，被 eval_source() 的路径 D 设为 1。
+
+#### 4.5.3 场景三：`complete` 命令
+
+命令：`^false | complete`，pipefail 开。
 
 ```
-cmd1(失败, exit=1) | cmd2(成功, exit=0)  [pipefail 开启, 无 Drain/DrainIfEnd]
+1. ^false 执行:
+   → 生成 exit 向量: [None, false_guard]
 
-1. eval_block() 返回 PipelineExecutionData:
-   └─ body: ByteStream(cmd2), exit: [None, cmd1_guard, cmd2_guard]
+2. Instruction::Call 执行 complete [eval_ir.rs:L696-L698]:
+   → original_exit.clear()              ← 清空继承的 exit 向量
+   → complete 内部:
+       child.ignore_error(true)         ← 标记忽略
+       child.wait_with_output()         ← 不调 check_ok，只收集
+       返回 Value(Record{exit_code:1})
+   → clone_exit_status_future() → None  ← Value 无退出状态
+   → 新 exit 向量: [None]                ← 只有 complete 自己的 None
 
-2. evaluate_source() 执行:
-   a. print_pipeline() → drain_to_out_dests()
-      └─ ByteStream::drain() → check_ok(Exited(0)) → Ok  ← 不设置 LAST_EXIT_CODE
-   b. pipefail 检查: check_exit_status_future([...])
-      └─ cmd1 → Err(NonZeroExitCode { exit_code: 1 })
-   c. 返回 Err
+3. 管道输出打印 → drain_to_out_dests → Ok
 
-3. eval_source() 捕获错误:
-   a. set_last_error(&err) → set_last_exit_code(1)
+4. pipefail 检查: check_exit_status_future([None]) → 全部 Ok
 
-最终: LAST_EXIT_CODE = 1 ✅
+5. eval_source() [路径 C]: set_last_exit_code(0)
+
+最终: LAST_EXIT_CODE = 0  ✅（不反映子进程退出码，子进程码只在 exit_code 字段中）
 ```
 
-#### 4.7.5 错误提取逻辑：external_exit_code()
+### 4.6 错误提取逻辑：external_exit_code()
 
 定义于 [shell_error/mod.rs:L1481-L1497](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/errors/shell_error/mod.rs#L1481-L1497)
 
@@ -732,205 +640,42 @@ pub fn exit_code(&self) -> Option<i32> {
 }
 ```
 
-**关键点**：`external_exit_code()` 能从 `NonZeroExitCode` 和信号错误中提取退出码。对于其他错误类型，`exit_code()` 回退到返回 `Some(1)`。
+**用于 4.2 节路径 A 和 D 的 `set_last_error(&err)`**：
+- `NonZeroExitCode` → 提取 `exit_code` 字段
+- 信号终止 → 提取 `-signal`（如 SIGINT=2 → -2）
+- 其他 ShellError → `external_exit_code()` 返回 None，`exit_code()` 回退到 `Some(1)`
 
-### 4.8 赋值收集时的子进程失败检查
+### 4.7 ignore_error 标志与三种收集指令
 
-**核心问题**：在赋值收集（如 `let x = external1 | external2`）时，是否还检查子进程的失败？
+#### 4.7.1 ignore_error 的作用
 
-**答案**：**所有收集方式都会检查最后一个命令的退出码（通过 `into_value → into_bytes → check_ok`），但对中间命令（pipefail）的检查行为不同。**
+`ignore_error` 是每个命令独立的 `Arc<Mutex<bool>>`，在两处生效：
+1. `check_ok()` 中：为 true 时非零退出不报错（[child.rs:L51-L52](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs#L51-L52)）
+2. `check_exit_status_future_ok()` 中：同理（[child.rs:L44-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs#L44-L45)）
 
-#### 4.8.1 三种收集指令对比
+由以下方式设置：
+- `ignore` 命令：标记后续命令
+- `complete` 命令：`child.ignore_error(true)` 标记子进程（[complete.rs:L70](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-command/src/system/complete.rs#L70)）
 
-| 指令 | pipefail 检查 | 末尾命令检查 | LAST_EXIT_CODE | 场景 |
-|------|-------------|-------------|---------------|------|
-| `collect_reg` | ❌（清空 exit） | ✅（`into_value`） | 由 `eval_source` 设置 | `StoreVariable`、`StoreEnv` |
-| `Collect` | ❌（`ignore_error=true`） | ✅（`into_value`） | 由 `eval_source` 设置 | 内部收集为 Value |
-| `TryCollect` | ✅（`ignore_error=false`） | ✅（`into_value`） | 由 `eval_source` 设置 | `try` 块中的收集 |
+#### 4.7.2 三种收集指令对比
 
-**关键发现**：`collect_reg` 的注释说 "It doesn't check exit status when collecting"（[eval_ir.rs:L207](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L207)），但这只针对 pipefail（exit 向量），**不**影响末尾命令的检查。`into_value()` 的调用链最终仍会执行 `check_ok()`。
+| 指令 | pipefail 检查 | 末尾命令检查 | 是否设置 LAST_EXIT_CODE |
+|------|-------------|-------------|----------------------|
+| `collect_reg` [eval_ir.rs:L208-L221](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L208-L221) | ❌（`exit.clear()`） | ✅（`into_value` → `check_ok`） | ❌（由 eval_source 的 C/D 设置） |
+| `Collect` [eval_ir.rs:L421-L429](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L421-L429) | ❌（`collect(..., ignore_error=true)`） | ✅（`into_value` → `check_ok`） | ❌（由 eval_source 的 C/D 设置） |
+| `TryCollect` [eval_ir.rs:L430-L438](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L430-L438) | ✅（`collect(..., ignore_error=false)`） | ✅（`into_value` → `check_ok`） | ❌（由 eval_source 的 C/D 设置） |
 
-#### 4.8.2 collect_reg 的完整调用链
+**`collect_reg` 注释辨析**：注释 "It doesn't check exit status when collecting"（[eval_ir.rs:L207](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L207)）**仅指 pipefail 的 exit 向量**，不影响末尾命令的 `into_value → check_ok`。因此 `let x = ^false` 仍会失败。
 
-定义于 [eval_ir.rs:L208-L221](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L208-L221)
+### 4.8 complete 命令的三重保护
 
-```
-collect_reg()
-  ├─ data.exit.clear()                    ← 清空 pipefail 向量
-  └─ body.into_value(span)
-       └─ ByteStream::into_value()
-            └─ ByteStream::into_bytes()   [byte_stream.rs:L662]
-                 └─ ChildProcess::into_bytes()  [child.rs:L376]
-                      ├─ collect_bytes(self.stdout)
-                      └─ check_ok(exit_status.wait(), ignore_error, span)
-                           └─ 非零退出 → Err(NonZeroExitCode)
-```
+`complete` 通过三层机制确保不报错、不污染 LAST_EXIT_CODE：
 
-**因此**：`let x = ^false` 会失败（`into_value` 检查到退出码 1），而 `let x = (^false | ^echo ok)` 会成功（`into_value` 只检查 `^echo ok` 的退出码 0）。
+1. **`child.ignore_error(true)`**（[complete.rs:L70](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-command/src/system/complete.rs#L70)）：即使有人调 `check_ok` 也不会报错
+2. **`wait_with_output()` 不调用 `check_ok`**（[child.rs:L478-L480](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs#L478-L480)）：只收集输出、等待退出
+3. **`original_exit.clear()`**（[eval_ir.rs:L696-L698](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L696-L698)）：清空 exit 向量，pipefail 检查跳过
 
-#### 4.8.3 赋值语句行为总结
-
-以 `let x = (false | ^false | ^echo done)` 为例（false 是内部命令，退出码 1）：
-
-```
-执行: false | ^false | ^echo done
-
-数据流向:
-PipelineData::Value(Error) → ^false → ByteStream(ChildProcess) → ^echo done
-
-赋值收集:
-collect_reg() → exit.clear() → into_value()
-                      │                │
-                      │                └─ 检查 ^echo done 的退出码 → 成功
-                      │
-                      └─ pipefail 不会检查 ^false 的退出码
-
-结果:
-✅ 赋值成功，x = "done"
-✅ LAST_EXIT_CODE = 0（echo done 的退出码）
-⚠️ ^false 的失败被忽略
-```
-
-**关键结论**：
-- ✅ 赋值语句会检查**最后一个命令**的退出码
-- ❌ 赋值语句**不会**检查中间命令的退出码（即使 pipefail 开启）
-- ⚠️ 这是设计行为：赋值语句的语义是"收集管道输出的值"，而非"执行管道并检查所有命令"
-
-### 4.9 complete 命令的子进程失败检查
-
-**核心问题**：`complete` 捕获 stdout/stderr 时，是否还检查子进程的失败？
-
-**答案**：**complete 命令会捕获退出状态但不会报错，子进程失败通过 `exit_code` 字段返回。**
-
-#### 4.9.1 complete 命令实现
-
-定义于 [complete.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-command/src/system/complete.rs)
-
-```rust
-fn run(
-    &self,
-    _engine_state: &EngineState,
-    _stack: &mut Stack,
-    call: &Call,
-    input: PipelineData,
-) -> Result<PipelineData, ShellError> {
-    match input {
-        PipelineData::ByteStream(stream, ..) => {
-            let Ok(mut child) = stream.into_child() else {
-                return Err(ShellError::Generic(...));
-            };
-
-            // ⚠️ 标记忽略错误，防止 pipefail 重复检查
-            #[cfg(feature = "os")]
-            child.ignore_error(true);
-
-            // ⚠️ wait_with_output 不调用 check_ok
-            let output = child.wait_with_output()?;
-            let exit_code = output.exit_status.code();
-
-            // 构造包含 stdout、stderr、exit_code 的 record
-            let mut record = Record::new();
-            if let Some(stdout) = output.stdout {
-                record.push("stdout", ...);
-            }
-            if let Some(stderr) = output.stderr {
-                record.push("stderr", ...);
-            }
-            record.push("exit_code", Value::int(exit_code.into(), head));
-
-            Ok(Value::record(record, call.head).into_pipeline_data())
-        }
-        // ...
-    }
-}
-```
-
-#### 4.9.2 complete 的管道重定向
-
-`complete` 命令通过 `pipe_redirection()` 方法请求分离的 stderr 流（[complete.rs:L97-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-command/src/system/complete.rs#L97-L99)）：
-
-```rust
-fn pipe_redirection(&self) -> (Option<OutDest>, Option<OutDest>) {
-    (Some(OutDest::PipeSeparate), Some(OutDest::PipeSeparate))
-}
-```
-
-这确保了上游外部命令的 stdout 和 stderr 作为分离的管道传递给 complete。
-
-#### 4.9.3 wait_with_output 的实现
-
-定义于 [child.rs:L464-L505](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-protocol/src/process/child.rs#L464-L505)
-
-```rust
-pub fn wait_with_output(self) -> Result<ProcessOutput, ShellError> {
-    let (stdout, stderr) = match (self.stdout, self.stderr) {
-        (Some(stdout), Some(stderr)) => {
-            // 分别在不同线程收集 stdout 和 stderr
-            let stderr_handle = thread::spawn(move || collect_bytes(stderr));
-            let stdout = collect_bytes(stdout)?;
-            let stderr = stderr_handle.join()...?;
-            (Some(stdout), Some(stderr))
-        }
-        // ... 其他情况
-    };
-
-    let mut exit_status = self.exit_status.lock()...;
-    let exit_status = exit_status.wait(self.span)?;  // ⚠️ 只等待，不检查
-
-    Ok(ProcessOutput { stdout, stderr, exit_status })
-}
-```
-
-**关键点**：`wait_with_output()` **不调用 `check_ok()`**，只收集输出和退出状态。
-
-#### 4.9.4 Call 指令中的特殊处理
-
-在 `Instruction::Call` 处理中，`complete` 命令会清空继承的退出状态（[eval_ir.rs:L696-L698](file:///d:/fz/0601-2/solo-dogfeeding/code/77-nushell/crates/nu-engine/src/eval_ir.rs#L696-L698)）：
-
-```rust
-// complete 命令：清空继承的退出状态
-if ctx.engine_state.get_decl(*decl_id).name() == "complete" {
-    original_exit.clear();  // ⚠️ 下游不再检查上游退出状态
-}
-```
-
-#### 4.9.5 complete 行为总结
-
-以 `^false | complete` 为例：
-
-```
-执行: ^false | complete
-
-阶段 1: ^false 执行
-  ├─ spawn 进程，退出码 1
-  └─ 返回 PipelineData::ByteStream(ChildProcess)
-      └─ exit_status_future = Some(ExitStatusGuard { ignore_error: false })
-
-阶段 2: complete 执行
-  ├─ stream.into_child() → 获取 ChildProcess
-  ├─ child.ignore_error(true) → 标记忽略
-  ├─ child.wait_with_output() → 收集 stdout/stderr，等待退出
-  │  └─ 不检查退出码，直接返回 exit_status=Exited(1)
-  ├─ original_exit.clear() → 清空上游退出状态
-  ├─ 返回 record { stdout: "", stderr: "", exit_code: 1 }
-  └─ clone_exit_status_future() → 返回 None（因为 output 是 Value，不是 ByteStream）
-
-阶段 3: 输出结果
-  └─ 打印 record，exit_code 字段为 1
-
-结果:
-✅ 不报错
-✅ exit_code 字段包含子进程的实际退出码
-✅ stdout/stderr 字段包含输出内容
-✅ LAST_EXIT_CODE 不会被设置为 1（因为没有错误）
-```
-
-**关键结论**：
-- ✅ `complete` 捕获所有输出和退出状态
-- ✅ 非零退出通过 `exit_code` 字段返回，不抛出错误
-- ✅ `ignore_error(true)` 防止后续 pipefail 检查重复报错
-- ✅ `original_exit.clear()` 确保下游不受上游失败影响
-- ⚠️ `complete` 命令名是硬编码检查的，不够优雅
+最终 `complete` 返回 Value(Record)，`clone_exit_status_future()` 返回 None，下游 exit 向量只有一个 None。LAST_EXIT_CODE 由路径 C 设为 `0`，子进程退出码仅通过 `exit_code` 字段暴露。
 
 ---
 
@@ -1004,7 +749,13 @@ exit 向量: [ None,     // Empty 输入产生
 
 pipefail 检查顺序: cmd3 → cmd2 → cmd1 (反向)
 
-LAST_EXIT_CODE: 始终等于最后一个命令（cmd3）的退出码
+LAST_EXIT_CODE:
+  - 默认模式（pipefail 关）: 末尾命令（cmd3）的退出码
+    → 路径 B（成功=0）/ 路径 A（失败=cmd3 退出码），或路径 C/D
+  - pipefail 模式（pipefail 开）: 第一个失败命令的退出码（从后往前找）
+    → 若全部成功: 路径 B/C 设为 0
+    → 若中间命令失败: 先 B 设为 0，再被路径 D 覆盖为失败命令退出码
+（完整机制见 4.2 节 A/B/C/D 四个设置点、4.4 节统一对比表）
 ```
 
 ---
@@ -1013,14 +764,14 @@ LAST_EXIT_CODE: 始终等于最后一个命令（cmd3）的退出码
 
 ### 7.1 stderr 管道模式对比
 
-Nushell 支持三种 stderr 管道模式，由 `OutDest` 枚举控制：
+Nushell 支持四种 stderr 管道模式，由 `OutDest` 枚举和 swap 参数控制。退出码行为与第四部分（4.2 节 A/B/C/D 设置点、4.4 节统一对比表）完全一致：
 
 | 模式 | 语法 | stack.stdout | stack.stderr | swap | 行为 |
 |------|------|-------------|-------------|------|------|
-| 默认继承 | `external` | `OutDest::Inherit` | `OutDest::Inherit` | false | stderr 直接输出到终端 |
-| 合并管道 | `external o+e>| other` | `OutDest::Pipe` | `OutDest::Pipe` | false | stderr 与 stdout 合并后传递给下游 |
-| stderr 管道 | `external e>| other` | `OutDest::Inherit` | `OutDest::Pipe` | true | stderr swap 到 stdout 位置传递给下游 |
-| 完整捕获 | `external \| complete` | `OutDest::PipeSeparate` | `OutDest::PipeSeparate` | false | stdout 和 stderr 分离捕获 |
+| 默认继承 | `external` | `OutDest::Inherit` | `OutDest::Inherit` | false | stderr 直接输出到终端，退出码按 4.4 节统一规则 |
+| 合并管道 | `external o+e>| other` | `OutDest::Pipe` | `OutDest::Pipe` | false | stderr 与 stdout 合并后传递给下游，退出码按 4.4 节统一规则 |
+| stderr 管道 | `external e>| other` | `OutDest::Inherit` | `OutDest::Pipe` | true | stderr swap 到 stdout 位置传递给下游，退出码按 4.4 节统一规则 |
+| 完整捕获 | `external \| complete` | `OutDest::PipeSeparate` | `OutDest::PipeSeparate` | false | stdout 和 stderr 分离捕获，LAST_EXIT_CODE 恒为 0（见 4.8 节三重保护） |
 
 ### 7.2 OutDest::Pipe 模式（合并流）
 
@@ -1288,7 +1039,9 @@ pub fn wait_with_output(self) -> Result<ProcessOutput, ShellError> {
 - 同时子进程等待 stdout 被读取，造成死锁
 - 使用独立线程并发收集 stdout 和 stderr 避免死锁
 
-### 7.5 三种 stderr 模式的对比表
+### 7.5 四种 stderr 模式的对比表
+
+> 表中的退出码与 LAST_EXIT_CODE 结论均与第四部分（4.2 节的 A/B/C/D 四个设置点，4.4 节统一对比表）完全一致。
 
 | 特性 | 默认(Inherit) | 合并(o+e>\|) | stderr 管道(e>\|) | complete 捕获 |
 |------|--------------|-------------|------------------|--------------|
@@ -1300,7 +1053,10 @@ pub fn wait_with_output(self) -> Result<ProcessOutput, ShellError> {
 | 能否区分来源 | 能（终端） | ❌ 不能 | 不需要（只有 stderr） | ✅ 能 |
 | 零拷贝传递 | N/A | ✅ 能 | ✅ 能（swap 后） | ❌ 不需要 |
 | 死锁风险 | 无 | 无 | 无 | 已通过线程解决 |
-| 退出码检查 | 最后一个命令 | 最后一个命令 | 最后一个命令 | 通过 exit_code 字段 |
+| 末尾命令退出码检查 | ✅ check_ok（4.1 节） | ✅ check_ok | ✅ check_ok | ❌ wait_with_output 不调 check_ok（4.8 节） |
+| pipefail 检查（全部命令） | 默认关 / 开时 check_exit_status_future | 同左 | 同左 | ❌ original_exit.clear() + 结果为 Value → exit 向量只有 None |
+| LAST_EXIT_CODE 最终值 | 末尾命令退出码（A/B/C/D） | 同左 | 同左 | 恒为 `0`（4.4 节 complete 行，路径 C） |
+| 非零退出如何暴露 | 直接报错 + LAST_EXIT_CODE | 直接报错 + LAST_EXIT_CODE | 直接报错 + LAST_EXIT_CODE | 仅 `exit_code` 字段（4.8 节三重保护） |
 
 ### 7.6 stderr 管道边界问题
 
@@ -1342,41 +1098,41 @@ pub fn wait_with_output(self) -> Result<ProcessOutput, ShellError> {
 
 ### 6.2 退出码的边界
 
+> 本节内容是第四部分结论的摘要，所有结论均引用 4.2 节的 A/B/C/D 四个设置点和 4.1 节的 `check_ok` 调用链。
+
 1. **`LAST_EXIT_CODE` 与 pipefail 的关系**
-   - `LAST_EXIT_CODE` 先被 `drain()` 设为 0（如果 stream.drain 成功）
-   - 如果 pipefail 检查发现中间命令失败，错误传播到 `eval_source()` 后更新
-   - ✅ 最终反映的是**导致失败的命令**的退出码，不会被覆盖
+   - Drain 指令：先被路径 B 设为 `0`（末尾命令成功），若 pipefail 发现中间命令失败，再被路径 D 覆盖为失败命令的退出码
+   - 非 Drain 路径（赋值、drain_if_end、complete）：只有路径 C（成功→0）或路径 D（失败→错误码）
+   - ✅ 最终反映的是**导致失败的命令**的退出码，不会被错误覆盖
 
 2. **`LAST_EXIT_CODE` 的设置路径差异**
-   - `drain()` 函数：显式设置 LAST_EXIT_CODE（成功=0，失败=错误码）
-   - `drain_if_end()` 函数：**不**设置 LAST_EXIT_CODE，依赖 `eval_source()`
-   - `collect()` 函数：**不**设置 LAST_EXIT_CODE，依赖 `eval_source()`
-   - `collect_reg()` 函数：**不**设置 LAST_EXIT_CODE，依赖 `eval_source()`
+   - `drain()` 函数：设置（路径 A/B）
+   - `drain_if_end()`、`collect()`、`collect_reg()`：**不**设置，依赖 `eval_source()` 的路径 C/D
+   - `eval_source()`：最终设置（路径 C/D）
 
 3. **赋值语句中末尾命令的检查**
-   - `collect_reg` 的注释 "doesn't check exit status" 只指 pipefail
-   - `into_value()` 仍会调用 `check_ok()` 检查末尾命令
+   - `collect_reg` 的注释 "doesn't check exit status" 仅指 pipefail 的 exit 向量
+   - `into_value()` → `into_bytes()` → `check_ok()` 仍会检查末尾命令
    - `let x = ^false` 会失败，`let x = (^false | ^echo ok)` 会成功
 
 4. **错误提取逻辑：external_exit_code()**
    - `NonZeroExitCode` → 提取 `exit_code` 字段
    - `TerminatedBySignal` / `CoreDumped` → 提取 `-signal`
-   - 其他错误 → 返回 `None`，`exit_code()` 回退到 `Some(1)`
+   - 其他错误 → `external_exit_code()` 返回 None，`exit_code()` 回退到 `Some(1)`
 
 5. **ignore_error 的传播**
-   - `ignore_error` 是每个命令独立的标志，通过 `Arc<Mutex<bool>>` 共享
-   - `ignore` 命令设置后续命令的 ignore_error
-   - `complete` 命令通过 `child.ignore_error(true)` 标记忽略
+   - `ignore_error` 是每个命令独立的 `Arc<Mutex<bool>>`
+   - 在 `check_ok()` 和 `check_exit_status_future_ok()` 两处生效
+   - 设置方：`ignore` 命令、`complete.child.ignore_error(true)`
 
-6. **三种收集指令的差异**
-   - `collect_reg`：清空 exit，不检查 pipefail，但检查末尾命令（`into_value`）
-   - `Collect`：`ignore_error=true`，不检查 pipefail，但检查末尾命令
-   - `TryCollect`：`ignore_error=false`，检查 pipefail 和所有命令
+6. **三种收集指令的差异（见 4.7.2 节完整表）**
+   - `collect_reg`：清空 exit → 不检查 pipefail，但检查末尾命令
+   - `Collect`：`ignore_error=true` → 不检查 pipefail，但检查末尾命令
+   - `TryCollect`：`ignore_error=false` → 检查 pipefail + 末尾命令
 
 7. **信号退出码**
-   - Unix 下信号终止的进程，退出码为 `-signal`
-   - 如 `SIGINT=2` → 退出码 `-2`
-   - `SIGPIPE` 特殊处理：不视为错误
+   - Unix 信号终止 → 退出码为 `-signal`（如 SIGINT=2 → -2）
+   - `SIGPIPE` 特殊处理：不视为错误（check_ok 中返回 Ok）
 
 ### 6.3 stderr 管道的边界
 
@@ -1408,8 +1164,9 @@ pub fn wait_with_output(self) -> Result<ProcessOutput, ShellError> {
 | wait_with_output 并发收集 | 避免 stdout/stderr 死锁 | 额外线程开销 |
 | stderr_pipe_separate 错误包装 | 错误可以通过管道传递 | 下游需要处理 Value::Error |
 | e>\| swap 机制 | 零拷贝支持，语义清晰 | 内部 stdout/stderr 语义反转 |
-| drain 不设 LAST_EXIT_CODE | 逻辑集中在 eval_source | 中间状态可能不一致 |
-| external_exit_code 从错误提取 | 统一的退出码提取逻辑 | 部分错误返回 None |
+| drain() 直接设 LAST_EXIT_CODE | 管道中间即可反映末尾命令退出码 | Drain 指令下 pipefail 失败会被 eval_source 覆盖，存在短暂不一致 |
+| drain_if_end/collect/collect_reg 不设 LAST_EXIT_CODE | 逻辑集中在 eval_source，避免重复设置 | 中间阶段 LAST_EXIT_CODE 不变 |
+| external_exit_code 从错误提取 | 统一的退出码提取逻辑 | 部分错误返回 None，回退到 1 |
 
 ---
 
